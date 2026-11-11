@@ -1,13 +1,12 @@
-//! Milestone 6: the same two-node test as `triad`'s, run against
-//! `triad-spaces` (p2panda encrypted spaces, no OpenMLS).
+//! Two nodes on one machine: create, join, ten messages each way in order,
+//! kill -9, catch up on exactly the five missed, no plaintext in storage.
 
 use std::time::{Duration, Instant};
 
-#[path = "../../triad-cli/tests/support/mod.rs"]
 mod support;
 use support::*;
 
-const BIN: &str = env!("CARGO_BIN_EXE_triad-spaces");
+const BIN: &str = env!("CARGO_BIN_EXE_triad");
 
 #[test]
 fn spaces_two_node_chat_and_catch_up() {

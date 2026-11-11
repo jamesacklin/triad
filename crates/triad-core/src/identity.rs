@@ -10,13 +10,13 @@ use crate::envelope::{cbor_decode, cbor_encode};
 
 pub const CREDENTIALS_FILE: &str = "credentials.cbor";
 
-/// A 32-byte Ed25519 public key, used as node ID and MLS identity.
+/// A 32-byte Ed25519 public key, used as the node ID.
 pub type NodeId = [u8; 32];
 
 /// The local identity. Wraps p2panda credentials without exposing their type.
 #[derive(Clone)]
 pub struct Identity {
-    pub(crate) credentials: p2panda::Credentials,
+    credentials: p2panda::Credentials,
 }
 
 impl Identity {
@@ -42,8 +42,7 @@ impl Identity {
         *self.credentials.verifying_key().as_bytes()
     }
 
-    /// The raw p2panda credentials. Only for the `triad-spaces` comparison
-    /// binary, which builds on p2panda directly; `triad` itself never needs it.
+    /// The p2panda credentials, for building the node.
     pub fn p2panda_credentials(&self) -> p2panda::Credentials {
         self.credentials.clone()
     }

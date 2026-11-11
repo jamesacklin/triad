@@ -20,11 +20,10 @@ use serde_json::Value;
 use triad_core::envelope::Invite;
 use triad_core::net::DEFAULT_RELAY;
 
-#[path = "../../triad-cli/tests/support/mod.rs"]
 mod support;
 use support::*;
 
-const BIN: &str = env!("CARGO_BIN_EXE_triad-spaces");
+const BIN: &str = env!("CARGO_BIN_EXE_triad");
 
 /// How long to watch for messages that must not arrive.
 const QUIET: Duration = Duration::from_secs(10);

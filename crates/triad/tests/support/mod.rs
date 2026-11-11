@@ -1,5 +1,5 @@
-//! Helpers shared by the integration tests of `triad` and `triad-spaces`.
-//! Each test crate defines `const BIN` at its root.
+//! Helpers shared by the integration tests. Each test crate defines
+//! `const BIN` at its root.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};

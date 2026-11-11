@@ -1,103 +1,17 @@
-//! Wire formats: [`Envelope`] (one per p2panda operation), [`ChatBody`] (the
-//! plaintext inside an MLS application message) and [`Invite`].
+//! Wire formats: [`ChatBody`] (one chat message, the payload of a space
+//! operation) and [`Invite`].
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
 
 /// Wire format version used everywhere.
 pub const VERSION: u8 = 1;
 /// Maximum UTF-8 text length of one chat message.
 pub const MAX_TEXT_BYTES: usize = 2_000;
-/// Every encoded envelope must stay under this size.
-pub const MAX_ENVELOPE_BYTES: usize = 3_500;
 /// Invite prefix.
 pub const INVITE_PREFIX: &str = "triad1-";
 
-/// One p2panda operation on the group topic holds exactly one envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Envelope {
-    /// Joiner to creator. Public. An MLS KeyPackage.
-    KeyPackage { v: u8, key_package: ByteBuf },
-    /// Creator to one joiner. An MLS Welcome, addressed by node ID.
-    Welcome {
-        v: u8,
-        to: [u8; 32],
-        welcome: ByteBuf,
-    },
-    /// Creator to existing members. An MLS Commit. Used from 3 members up.
-    Commit { v: u8, commit: ByteBuf },
-    /// Any member to the group. An MLS PrivateMessage.
-    App { v: u8, ciphertext: ByteBuf },
-}
-
-impl Envelope {
-    pub fn key_package(bytes: Vec<u8>) -> Self {
-        Envelope::KeyPackage {
-            v: VERSION,
-            key_package: ByteBuf::from(bytes),
-        }
-    }
-
-    pub fn welcome(to: [u8; 32], bytes: Vec<u8>) -> Self {
-        Envelope::Welcome {
-            v: VERSION,
-            to,
-            welcome: ByteBuf::from(bytes),
-        }
-    }
-
-    pub fn commit(bytes: Vec<u8>) -> Self {
-        Envelope::Commit {
-            v: VERSION,
-            commit: ByteBuf::from(bytes),
-        }
-    }
-
-    pub fn app(bytes: Vec<u8>) -> Self {
-        Envelope::App {
-            v: VERSION,
-            ciphertext: ByteBuf::from(bytes),
-        }
-    }
-
-    pub fn version(&self) -> u8 {
-        match self {
-            Envelope::KeyPackage { v, .. }
-            | Envelope::Welcome { v, .. }
-            | Envelope::Commit { v, .. }
-            | Envelope::App { v, .. } => *v,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Envelope::KeyPackage { .. } => "key_package",
-            Envelope::Welcome { .. } => "welcome",
-            Envelope::Commit { .. } => "commit",
-            Envelope::App { .. } => "app",
-        }
-    }
-
-    /// CBOR-encoded size, as p2panda will serialize it.
-    pub fn encoded_len(&self) -> usize {
-        cbor_encode(self).map(|b| b.len()).unwrap_or(usize::MAX)
-    }
-
-    /// Refuses envelopes over [`MAX_ENVELOPE_BYTES`].
-    pub fn check_size(&self) -> Result<()> {
-        let len = self.encoded_len();
-        if len >= MAX_ENVELOPE_BYTES {
-            bail!(
-                "{} envelope is {len} bytes, limit is {MAX_ENVELOPE_BYTES}",
-                self.kind()
-            );
-        }
-        Ok(())
-    }
-}
-
-/// Plaintext inside the MLS application message, CBOR encoded.
+/// One chat message, CBOR encoded. p2panda encrypts it as a whole.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatBody {
     pub v: u8,
@@ -143,6 +57,10 @@ pub struct Invite {
     pub topic: [u8; 32],
     pub creator: [u8; 32],
     pub relay: String,
+    /// The channel name the inviter uses. A suggestion: the joiner may pick
+    /// another. Invites written before channels had names carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl Invite {
@@ -152,7 +70,13 @@ impl Invite {
             topic,
             creator,
             relay: relay.to_string(),
+            name: None,
         }
+    }
+
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
     }
 
     pub fn render(&self) -> Result<String> {
@@ -206,6 +130,17 @@ mod tests {
     }
 
     #[test]
+    fn invite_name_is_optional() {
+        let plain = Invite::new([1; 32], [2; 32], "https://relay.example./");
+        let named = plain.clone().with_name("general");
+        let parsed = Invite::parse(&named.render().unwrap()).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("general"));
+        // A nameless invite keeps the bytes it had before names existed.
+        assert!(named.render().unwrap().len() > plain.render().unwrap().len());
+        assert_eq!(Invite::parse(&plain.render().unwrap()).unwrap().name, None);
+    }
+
+    #[test]
     fn chat_body_round_trip_and_cap() {
         let body = ChatBody::new("hello", 42).unwrap();
         assert_eq!(ChatBody::decode(&body.encode().unwrap()).unwrap(), body);
@@ -228,18 +163,5 @@ mod tests {
         assert!(ChatBody::decode(&bytes).is_err());
         let invite = Invite::new([1; 32], [2; 32], "https://relay.example/");
         assert!(Invite::parse(&(invite.render().unwrap() + "00")).is_err());
-    }
-
-    #[test]
-    fn envelope_round_trip_and_size() {
-        let env = Envelope::app(vec![7; 100]);
-        let bytes = cbor_encode(&env).unwrap();
-        assert_eq!(cbor_decode::<Envelope>(&bytes).unwrap(), env);
-        assert!(env.check_size().is_ok());
-        assert!(
-            Envelope::app(vec![0; MAX_ENVELOPE_BYTES])
-                .check_size()
-                .is_err()
-        );
     }
 }
