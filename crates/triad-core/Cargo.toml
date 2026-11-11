@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 p2panda = { workspace = true }
+p2panda-core = { workspace = true }
 openmls = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 openmls_basic_credential = { workspace = true }
