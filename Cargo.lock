@@ -5964,6 +5964,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

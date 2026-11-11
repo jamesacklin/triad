@@ -131,6 +131,15 @@ impl Proc {
     }
 }
 
+impl Drop for Proc {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 pub fn is_event(v: &Value, name: &str) -> bool {
     v["event"] == name
 }

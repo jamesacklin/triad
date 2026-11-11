@@ -20,7 +20,6 @@ REMOTE_TRIAD=${REMOTE_TRIAD:-triad}
 
 WORK=$(mktemp -d)
 LOCAL_DIR="$WORK/a"
-trap 'cleanup' EXIT
 
 remote() {
   if [ "$REMOTE" = local ]; then
@@ -51,13 +50,29 @@ start_b() { # args...
   exec 5>"$WORK/b.in" 6<"$WORK/b.out"
 }
 
-stop_a() { echo /quit >&3 || true; exec 3>&- ; wait "$A_PID" || true; exec 4<&- ; A_PID=""; }
-stop_b() { echo /quit >&5 || true; exec 5>&- ; wait "$B_PID" || true; exec 6<&- ; B_PID=""; }
+stop_a() { echo /quit >&3 || true; exec 3>&- ; drain_events 4 a; wait "$A_PID" || fail "creator exited unsuccessfully"; exec 4<&- ; A_PID=""; }
+stop_b() { echo /quit >&5 || true; exec 5>&- ; drain_events 6 b; wait "$B_PID" || fail "joiner exited unsuccessfully"; exec 6<&- ; B_PID=""; }
 
 cleanup() {
   [ -n "$A_PID" ] && kill "$A_PID" 2>/dev/null || true
   [ -n "$B_PID" ] && kill "$B_PID" 2>/dev/null || true
   log "logs and data: $WORK (remote data: $REMOTE:$REMOTE_DIR)"
+}
+
+trap 'cleanup' EXIT
+
+# Consume remaining output while the process shuts down, including duplicates.
+drain_events() {
+  local fd=$1 name=$2 line status
+  while true; do
+    if IFS= read -r -t "$TIMEOUT" line <&"$fd"; then
+      printf '%s\n' "$line" >>"$WORK/$name.events"
+    else
+      status=$?
+      [ "$status" -eq 1 ] || fail "$name: timed out draining output during shutdown"
+      return 0
+    fi
+  done
 }
 
 # wait_for <fd> <name> <grep-pattern>: reads JSON lines until one matches; prints it.
@@ -139,9 +154,9 @@ grep -q '"event":"sync_started"' "$WORK/b.events" && log "7. sync observed" || l
 
 # --- 8. quit both, inspect for plaintext ---
 sleep 5
-EXTRA=$(grep -c "\"mine\":false" "$WORK/b.events" || true)
 stop_b
 stop_a
+EXTRA=$(grep -c "\"mine\":false" "$WORK/b.events" || true)
 for needle in "$LOCAL_TAG-01" "$REMOTE_TAG-01"; do
   "$TRIAD" --data-dir "$LOCAL_DIR" inspect --grep "$needle" >/dev/null || fail "8. plaintext $needle in creator's p2panda.sqlite"
   remote "$REMOTE_TRIAD --data-dir '$REMOTE_DIR' inspect --grep '$needle'" >/dev/null || fail "8. plaintext $needle in joiner's p2panda.sqlite"

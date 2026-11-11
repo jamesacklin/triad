@@ -147,10 +147,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
         init_logging(&data_dir)?;
     }
     let rt = tokio::runtime::Runtime::new()?;
-    let verbose = cli.verbose;
-    match cli.cmd {
+    let result = run_command(cli.cmd, &data_dir, cli.verbose, &rt);
+    // Bound shutdown on errors and early returns as well as normal exits.
+    rt.shutdown_timeout(std::time::Duration::from_millis(500));
+    result
+}
+
+fn run_command(
+    cmd: Cmd,
+    data_dir: &Path,
+    verbose: bool,
+    rt: &tokio::runtime::Runtime,
+) -> Result<ExitCode> {
+    match cmd {
         Cmd::Whoami => {
-            let id = Identity::load_or_create(&data_dir)?;
+            let id = Identity::load_or_create(data_dir)?;
             println!("{}", id.node_hex());
         }
         Cmd::Create {
@@ -164,10 +175,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat::create(&data_dir, &relay, opts))?;
+            rt.block_on(chat::create(data_dir, &relay, opts))?;
         }
         Cmd::Invite => {
-            let state = State::open(&data_dir)?;
+            let state = State::open(data_dir)?;
             let meta = state.meta()?.context("no group in this data directory")?;
             if meta.role != Role::Creator {
                 bail!("only the creator can print the invite");
@@ -184,7 +195,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat::join(&data_dir, invite, opts))?;
+            rt.block_on(chat::join(data_dir, invite, opts))?;
         }
         Cmd::Chat { auto_accept, json } => {
             let opts = chat::Options {
@@ -192,11 +203,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat::resume(&data_dir, opts))?;
+            rt.block_on(chat::resume(data_dir, opts))?;
         }
         Cmd::History { limit } => {
-            let state = State::open(&data_dir)?;
-            let me = Identity::load_or_create(&data_dir)?.node_id();
+            let state = State::open(data_dir)?;
+            let me = Identity::load_or_create(data_dir)?.node_id();
             for m in state.history(limit)? {
                 let who = if m.author == me {
                     "me".to_string()
@@ -208,8 +219,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Status => {
-            let state = State::open(&data_dir)?;
-            let me = Identity::load_or_create(&data_dir)?;
+            let state = State::open(data_dir)?;
+            let me = Identity::load_or_create(data_dir)?;
             let Some(meta) = state.meta()? else {
                 println!("node    {}", me.node_hex());
                 println!("status  none (no group in this data directory)");
@@ -221,7 +232,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("status  {}", meta.status.as_str());
             println!("topic   {}", hex::encode(meta.topic));
             println!("creator {}", hex_id(&meta.creator));
-            match chat::mls_summary(&data_dir, &me, &meta) {
+            match chat::mls_summary(data_dir, &me, &meta) {
                 Ok(Some((epoch, members))) => {
                     println!("epoch   {epoch}");
                     println!("members {}", members.len());
@@ -241,7 +252,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Inspect { grep } => {
-            return inspect::run(&data_dir, &grep);
+            return inspect::run(data_dir, &grep);
         }
         Cmd::Probe { cmd } => match cmd {
             ProbeCmd::Listen { relay } => {
@@ -265,7 +276,5 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         },
     }
-    // Do not wait for background tasks (p2panda keeps some alive).
-    rt.shutdown_timeout(std::time::Duration::from_millis(500));
     Ok(ExitCode::SUCCESS)
 }

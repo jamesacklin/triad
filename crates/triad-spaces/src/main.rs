@@ -204,12 +204,16 @@ fn inspect(data_dir: &Path, needle: &str) -> Result<ExitCode> {
     }
     let mut found = 0;
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        if let Ok(bytes) = std::fs::read(data_dir.join(format!("{P2PANDA_FILE}{suffix}"))) {
-            found += bytes
-                .windows(needle.len())
-                .filter(|w| *w == needle.as_bytes())
-                .count();
-        }
+        let path = data_dir.join(format!("{P2PANDA_FILE}{suffix}"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if !suffix.is_empty() && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        found += bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle.as_bytes())
+            .count();
     }
     if found == 0 {
         println!("absent: {needle:?}");

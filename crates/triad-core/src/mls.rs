@@ -74,6 +74,18 @@ pub struct Decrypted {
     pub plaintext: Vec<u8>,
 }
 
+/// A parsed MLS object failed an application acceptance rule.
+#[derive(Debug)]
+pub struct RejectedMessage(pub &'static str);
+
+impl std::fmt::Display for RejectedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RejectedMessage {}
+
 /// Why a decrypt failed: the message predates what we can read, or something else.
 #[derive(Debug)]
 pub enum DecryptError {
@@ -298,7 +310,12 @@ impl Mls {
     }
 
     /// Joins a group from a Welcome. The group ID must match.
-    pub fn join(&mut self, welcome: &[u8], expected_group_id: &[u8]) -> Result<()> {
+    pub fn join(
+        &mut self,
+        welcome: &[u8],
+        expected_group_id: &[u8],
+        creator: &NodeId,
+    ) -> Result<()> {
         if self.group.is_some() {
             bail!("a group is already loaded");
         }
@@ -310,7 +327,18 @@ impl Mls {
             StagedWelcome::new_from_welcome(&self.provider, &Self::join_config(), welcome, None)
                 .map_err(|e| anyhow!("staging Welcome: {e}"))?;
         if staged.group_context().group_id().as_slice() != expected_group_id {
-            bail!("Welcome is for a different group");
+            return Err(RejectedMessage("Welcome is for a different group").into());
+        }
+        // Validate the authenticated Welcome before installing its group state.
+        if credential_identity(staged.welcome_sender()?.credential())? != *creator {
+            return Err(RejectedMessage("Welcome MLS sender is not the invited creator").into());
+        }
+        let members = staged
+            .members()
+            .map(|m| credential_identity(&m.credential))
+            .collect::<Result<Vec<_>>>()?;
+        if !members.contains(creator) || !members.contains(&self.identity) {
+            return Err(RejectedMessage("Welcome is missing the creator or our identity").into());
         }
         let group = staged
             .into_group(&self.provider)
@@ -320,8 +348,11 @@ impl Mls {
     }
 
     /// Processes and merges a commit from another member.
-    pub fn process_commit(&mut self, commit: &[u8]) -> Result<NodeId> {
+    pub fn process_commit(&mut self, commit: &[u8], expected_sender: &NodeId) -> Result<NodeId> {
         let protocol = parse_protocol_message(commit)?;
+        if protocol.content_type() != ContentType::Commit {
+            bail!("expected a commit");
+        }
         let provider = &self.provider;
         let group = self
             .group
@@ -331,6 +362,11 @@ impl Mls {
             .process_message(provider, protocol)
             .map_err(|e| anyhow!("processing commit: {e}"))?;
         let sender = credential_identity(processed.credential())?;
+        if sender != *expected_sender {
+            return Err(
+                RejectedMessage("Commit MLS sender does not match the operation author").into(),
+            );
+        }
         match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 group
@@ -360,6 +396,13 @@ impl Mls {
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Decrypted, DecryptError> {
         let protocol =
             parse_protocol_message(ciphertext).map_err(|e| DecryptError::Other(e.to_string()))?;
+        if protocol.wire_format() != WireFormat::PrivateMessage
+            || protocol.content_type() != ContentType::Application
+        {
+            return Err(DecryptError::Other(
+                "expected a private application message".into(),
+            ));
+        }
         let message_epoch = protocol.epoch().as_u64();
         let provider = &self.provider;
         let group = self
@@ -370,7 +413,7 @@ impl Mls {
         let processed = match group.process_message(provider, protocol) {
             Ok(p) => p,
             Err(e) => {
-                if message_epoch + (MAX_PAST_EPOCHS as u64) < current {
+                if message_epoch.saturating_add(MAX_PAST_EPOCHS as u64) < current {
                     return Err(DecryptError::TooOld { message_epoch });
                 }
                 return Err(DecryptError::Other(e.to_string()));
@@ -440,7 +483,7 @@ mod tests {
         assert_eq!(added.joiner, b.id);
         assert_eq!(added.members_before, 1);
         assert_eq!(added.epoch, 1);
-        b.mls.join(&added.welcome, &[7; 32]).unwrap();
+        b.mls.join(&added.welcome, &[7; 32], &a.id).unwrap();
         (a, b)
     }
 
@@ -482,7 +525,7 @@ mod tests {
         let mut b = member(2);
         a.mls.create_group(&[7; 32]).unwrap();
         let added = a.mls.add_member(&b.mls.new_key_package().unwrap()).unwrap();
-        assert!(b.mls.join(&added.welcome, &[8; 32]).is_err());
+        assert!(b.mls.join(&added.welcome, &[8; 32], &a.id).is_err());
     }
 
     #[test]
@@ -496,7 +539,7 @@ mod tests {
             let mut b = Mls::open_dir(dir_b.path(), idb).unwrap();
             a.create_group(&gid).unwrap();
             let added = a.add_member(&b.new_key_package().unwrap()).unwrap();
-            b.join(&added.welcome, &gid).unwrap();
+            b.join(&added.welcome, &gid, &ida).unwrap();
             let ct = a.encrypt(b"before").unwrap();
             assert_eq!(b.decrypt(&ct).unwrap().plaintext, b"before");
         }
@@ -529,7 +572,7 @@ mod tests {
         a.mls.create_group(&[3; 32]).unwrap();
         let added = a.mls.add_member(&kp).unwrap();
         let mut b = Mls::open_dir(dir_b.path(), idb).unwrap();
-        b.join(&added.welcome, &[3; 32]).unwrap();
+        b.join(&added.welcome, &[3; 32], &a.id).unwrap();
         let ct = a.mls.encrypt(b"hi").unwrap();
         assert_eq!(b.decrypt(&ct).unwrap().plaintext, b"hi");
     }
@@ -543,8 +586,8 @@ mod tests {
         let added = a.mls.add_member(&c.mls.new_key_package().unwrap()).unwrap();
         assert_eq!(added.members_before, 2);
         assert_eq!(added.epoch, 2);
-        assert_eq!(b.mls.process_commit(&added.commit).unwrap(), a.id);
-        c.mls.join(&added.welcome, &[7; 32]).unwrap();
+        assert_eq!(b.mls.process_commit(&added.commit, &a.id).unwrap(), a.id);
+        c.mls.join(&added.welcome, &[7; 32], &a.id).unwrap();
         // The epoch-1 message still decrypts at A thanks to max_past_epochs.
         assert_eq!(
             a.mls.decrypt(&late).unwrap().plaintext,
@@ -562,6 +605,52 @@ mod tests {
     }
 
     #[test]
+    fn commit_author_is_checked_before_merging() {
+        let (mut a, mut b) = pair();
+        let c = member(3);
+        let added = a.mls.add_member(&c.mls.new_key_package().unwrap()).unwrap();
+        let before = b.mls.members().unwrap();
+        assert!(b.mls.process_commit(&added.commit, &c.id).is_err());
+        assert_eq!(b.mls.epoch().unwrap(), 1);
+        assert_eq!(b.mls.members().unwrap(), before);
+        // The rejected commit must not change the persisted epoch either.
+        let mut reopened = Mls::open_dir(b._dir.path(), b.id).unwrap();
+        assert!(reopened.load_group(&[7; 32]).unwrap());
+        assert_eq!(reopened.epoch().unwrap(), 1);
+        assert_eq!(reopened.members().unwrap(), before);
+    }
+
+    #[test]
+    fn welcome_creator_is_checked_before_installing_group() {
+        let mut a = member(1);
+        let mut b = member(2);
+        a.mls.create_group(&[7; 32]).unwrap();
+        let added = a.mls.add_member(&b.mls.new_key_package().unwrap()).unwrap();
+        assert!(b.mls.join(&added.welcome, &[7; 32], &[3; 32]).is_err());
+        assert!(!b.mls.has_group());
+        assert!(!b.mls.load_group(&[7; 32]).unwrap());
+    }
+
+    #[test]
+    fn misrouted_commit_does_not_consume_its_message_key() {
+        let (mut a, mut b) = pair();
+        let c = member(3);
+        let added = a.mls.add_member(&c.mls.new_key_package().unwrap()).unwrap();
+        assert!(b.mls.decrypt(&added.commit).is_err());
+        assert_eq!(b.mls.epoch().unwrap(), 1);
+        b.mls.process_commit(&added.commit, &a.id).unwrap();
+        assert_eq!(b.mls.epoch().unwrap(), 2);
+    }
+
+    #[test]
+    fn misrouted_application_does_not_consume_its_message_key() {
+        let (mut a, mut b) = pair();
+        let ct = a.mls.encrypt(b"still readable").unwrap();
+        assert!(b.mls.process_commit(&ct, &a.id).is_err());
+        assert_eq!(b.mls.decrypt(&ct).unwrap().plaintext, b"still readable");
+    }
+
+    #[test]
     fn envelope_sizes_stay_under_limit() {
         use crate::envelope::{ChatBody, Envelope, MAX_TEXT_BYTES};
         let mut a = member(1);
@@ -570,7 +659,7 @@ mod tests {
         a.mls.create_group(&[7; 32]).unwrap();
         let kp = Envelope::key_package(b.mls.new_key_package().unwrap());
         let added = a.mls.add_member(&b.mls.new_key_package().unwrap()).unwrap();
-        b.mls.join(&added.welcome, &[7; 32]).unwrap();
+        b.mls.join(&added.welcome, &[7; 32], &a.id).unwrap();
         let welcome2 = Envelope::welcome([2; 32], added.welcome);
         let body = ChatBody::new(&"x".repeat(MAX_TEXT_BYTES), u64::MAX).unwrap();
         let app_max = Envelope::app(a.mls.encrypt(&body.encode().unwrap()).unwrap());

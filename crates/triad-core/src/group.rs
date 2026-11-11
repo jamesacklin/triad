@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::envelope::{ChatBody, Envelope, VERSION};
 use crate::identity::NodeId;
-use crate::mls::{AddResult, DecryptError, Decrypted, Mls};
+use crate::mls::{AddResult, DecryptError, Decrypted, Mls, RejectedMessage};
 use crate::state::{JoinStatus, Outcome, Role, StoredMessage};
 
 /// The MLS operations the rules need.
@@ -19,8 +19,8 @@ pub trait GroupCrypto {
     fn members(&self) -> Vec<NodeId>;
     fn epoch(&self) -> u64;
     fn add_member(&mut self, key_package: &[u8]) -> Result<AddResult>;
-    fn join(&mut self, welcome: &[u8], group_id: &[u8]) -> Result<()>;
-    fn process_commit(&mut self, commit: &[u8]) -> Result<NodeId>;
+    fn join(&mut self, welcome: &[u8], group_id: &[u8], creator: &NodeId) -> Result<()>;
+    fn process_commit(&mut self, commit: &[u8], expected_sender: &NodeId) -> Result<NodeId>;
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Decrypted, DecryptError>;
     fn message_epoch(&self, ciphertext: &[u8]) -> Option<u64>;
 }
@@ -41,11 +41,11 @@ impl GroupCrypto for Mls {
     fn add_member(&mut self, key_package: &[u8]) -> Result<AddResult> {
         Mls::add_member(self, key_package)
     }
-    fn join(&mut self, welcome: &[u8], group_id: &[u8]) -> Result<()> {
-        Mls::join(self, welcome, group_id)
+    fn join(&mut self, welcome: &[u8], group_id: &[u8], creator: &NodeId) -> Result<()> {
+        Mls::join(self, welcome, group_id, creator)
     }
-    fn process_commit(&mut self, commit: &[u8]) -> Result<NodeId> {
-        Mls::process_commit(self, commit)
+    fn process_commit(&mut self, commit: &[u8], expected_sender: &NodeId) -> Result<NodeId> {
+        Mls::process_commit(self, commit, expected_sender)
     }
     fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Decrypted, DecryptError> {
         Mls::decrypt(self, ciphertext)
@@ -98,6 +98,8 @@ pub enum Effect {
         reason: Option<String>,
         message: Option<StoredMessage>,
     },
+    /// Keep a future-epoch application unacknowledged until a commit arrives.
+    Defer,
     /// Acknowledge the operation to p2panda.
     Ack,
 }
@@ -144,6 +146,9 @@ pub fn handle(
             "unsupported envelope version {}",
             op.envelope.version()
         ));
+    }
+    if let Err(e) = op.envelope.check_size() {
+        return skip(e.to_string());
     }
     match op.envelope {
         Envelope::KeyPackage { key_package, .. } => {
@@ -247,7 +252,10 @@ fn on_welcome(
     if view.status != JoinStatus::Pending {
         return skip("Welcome while not pending");
     }
-    if let Err(e) = crypto.join(welcome, &view.group_id) {
+    if let Err(e) = crypto.join(welcome, &view.group_id, &view.creator) {
+        if e.is::<RejectedMessage>() {
+            return skip(e.to_string());
+        }
         return fail(format!("joining from Welcome failed: {e}"));
     }
     let members = crypto.members();
@@ -279,9 +287,10 @@ fn on_commit(
     if view.status != JoinStatus::Joined {
         return skip("Commit while not joined");
     }
-    match crypto.process_commit(commit) {
+    match crypto.process_commit(commit, &op.author) {
         Ok(sender) if sender == op.author => {}
         Ok(_) => return fail("Commit's MLS sender does not match the operation author"),
+        Err(e) if e.is::<RejectedMessage>() => return skip(e.to_string()),
         Err(e) => return fail(format!("processing commit failed: {e}")),
     }
     let mut effects = vec![Effect::EpochChanged {
@@ -300,6 +309,14 @@ fn on_app(
 ) -> Vec<Effect> {
     if view.status != JoinStatus::Joined {
         return skip("App message while not joined");
+    }
+    // Different author logs can arrive before the creator's commit log.
+    // Do not consume or acknowledge a message whose epoch is still ahead.
+    if crypto
+        .message_epoch(ciphertext)
+        .is_some_and(|epoch| epoch > crypto.epoch())
+    {
+        return vec![Effect::Defer];
     }
     let joined_epoch = view.joined_epoch.unwrap_or(0);
     let decrypted = match crypto.decrypt(ciphertext) {
@@ -391,8 +408,8 @@ mod tests {
                 epoch: self.epoch,
             })
         }
-        fn join(&mut self, welcome: &[u8], group_id: &[u8]) -> Result<()> {
-            if welcome != b"wel" || group_id != GID {
+        fn join(&mut self, welcome: &[u8], group_id: &[u8], creator: &NodeId) -> Result<()> {
+            if welcome != b"wel" || group_id != GID || *creator != CREATOR {
                 bail!("bad welcome");
             }
             self.joined = true;
@@ -401,8 +418,11 @@ mod tests {
             self.join_epoch = 1;
             Ok(())
         }
-        fn process_commit(&mut self, commit: &[u8]) -> Result<NodeId> {
-            if commit != b"commit" {
+        fn process_commit(&mut self, commit: &[u8], expected_sender: &NodeId) -> Result<NodeId> {
+            if commit == b"spoofed" {
+                return Err(RejectedMessage("Commit MLS sender differs from author").into());
+            }
+            if commit != b"commit" || *expected_sender != CREATOR {
                 bail!("bad commit");
             }
             self.commits += 1;
@@ -709,6 +729,23 @@ mod tests {
     }
 
     #[test]
+    fn commit_with_mismatched_mls_sender_is_skipped_without_merging() {
+        let mut fake = joined_fake();
+        let env = Envelope::commit(b"spoofed".to_vec());
+        let effects = run(
+            &member_view(JoinStatus::Joined),
+            CREATOR,
+            &env,
+            &mut fake,
+            false,
+        );
+        assert_eq!(outcome(&effects), Some(Outcome::Skipped));
+        assert!(acked(&effects));
+        assert_eq!(fake.epoch, 1);
+        assert_eq!(fake.commits, 0);
+    }
+
+    #[test]
     fn commit_skipped_when_not_from_creator() {
         let mut fake = joined_fake();
         let env = Envelope::commit(b"commit".to_vec());
@@ -817,6 +854,42 @@ mod tests {
             outcome(&run(&view, CREATOR, &env, &mut fake, false)),
             Some(Outcome::Failed)
         );
+    }
+
+    #[test]
+    fn future_epoch_waits_for_commit_without_consuming_or_acking() {
+        let mut fake = joined_fake();
+        let view = member_view(JoinStatus::Joined);
+        let env = app(2, OTHER, "after commit");
+        let effects = run(&view, OTHER, &env, &mut fake, false);
+        assert_eq!(effects, vec![Effect::Defer]);
+        assert!(!acked(&effects));
+        assert!(fake.consumed.is_empty());
+        let commit = Envelope::commit(b"commit".to_vec());
+        assert_eq!(
+            outcome(&run(&view, CREATOR, &commit, &mut fake, false)),
+            Some(Outcome::Ok)
+        );
+        let effects = run(&view, OTHER, &env, &mut fake, false);
+        assert_eq!(outcome(&effects), Some(Outcome::Ok));
+        assert!(acked(&effects));
+        assert_eq!(fake.consumed.len(), 1);
+    }
+
+    #[test]
+    fn oversized_envelope_is_skipped_before_mls() {
+        let mut fake = joined_fake();
+        let env = Envelope::app(vec![0; crate::envelope::MAX_ENVELOPE_BYTES]);
+        let effects = run(
+            &member_view(JoinStatus::Joined),
+            CREATOR,
+            &env,
+            &mut fake,
+            false,
+        );
+        assert_eq!(outcome(&effects), Some(Outcome::Skipped));
+        assert!(acked(&effects));
+        assert!(fake.consumed.is_empty());
     }
 
     #[test]

@@ -7,6 +7,11 @@ p2panda keeps a signed append-only log per author and syncs it, and MLS
 exploration: the code is disposable, and [FINDINGS.md](FINDINGS.md) is the
 deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
 
+The [spec review](FINDINGS.md#review-against-specmd-2026-11-11) records the
+correctness fixes, test results and remaining crash windows. Cross-network
+acceptance is still pending; rerun the peer tests on a network-capable host
+before treating this prototype as a reliable chat system.
+
 ```
 App (triad) ── plaintext ──▶ OpenMLS ── ciphertext ──▶ p2panda ──▶ iroh ──▶ relay / peer
 ```

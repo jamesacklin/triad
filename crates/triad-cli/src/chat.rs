@@ -114,6 +114,7 @@ struct Session {
     printer: Printer,
     opts: Options,
     asks: VecDeque<PendingJoin>,
+    deferred: VecDeque<Incoming>,
     started: Instant,
     hinted: bool,
 }
@@ -152,6 +153,7 @@ async fn run(
         printer,
         opts,
         asks: VecDeque::new(),
+        deferred: VecDeque::new(),
         started: Instant::now(),
         hinted: false,
     };
@@ -252,17 +254,21 @@ impl Session {
                     match self.handle_line(&line).await {
                         Ok(true) => {}
                         Ok(false) => break,
-                        Err(e) => self.printer.error(&format!("{e:#}")),
+                        Err(e) => {
+                            self.printer.error(&format!("{e:#}"));
+                            return Err(e);
+                        }
                     }
                 }
                 event = events.next() => {
                     let Some(event) = event else {
                         self.printer.error("topic stream closed");
-                        break;
+                        bail!("topic stream closed");
                     };
                     if let Err(e) = self.handle_event(event).await {
                         tracing::error!("event handling failed: {e:#}");
                         self.printer.error(&format!("{e:#}"));
+                        return Err(e);
                     }
                 }
                 _ = tokio::signal::ctrl_c() => break,
@@ -288,10 +294,9 @@ impl Session {
 
     /// Returns false when the session should end.
     async fn handle_line(&mut self, line: &str) -> Result<bool> {
-        let line = line.trim();
         if !self.asks.is_empty() && !line.starts_with('/') {
             let ask = self.asks.pop_front().expect("non-empty");
-            let yes = matches!(line.to_ascii_lowercase().as_str(), "y" | "yes");
+            let yes = matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes");
             self.answer(ask, yes).await?;
             return Ok(true);
         }
@@ -310,6 +315,10 @@ impl Session {
         if self.meta.status != JoinStatus::Joined {
             self.printer
                 .error("not joined yet; messages are disabled until the creator's Welcome arrives");
+            return Ok(true);
+        }
+        if let Err(e) = ChatBody::new(line, 0) {
+            self.printer.error(&e.to_string());
             return Ok(true);
         }
         self.send(line).await?;
@@ -382,7 +391,13 @@ impl Session {
 
     async fn handle_event(&mut self, event: NetEvent) -> Result<()> {
         match event {
-            NetEvent::Op(op) => self.handle_op(*op).await?,
+            NetEvent::Op(op) => {
+                let before = self.mls.epoch().ok();
+                self.handle_op(*op).await?;
+                if self.mls.epoch().ok() != before {
+                    self.retry_deferred().await?;
+                }
+            }
             NetEvent::SyncStarted {
                 peer,
                 incoming_ops,
@@ -422,6 +437,9 @@ impl Session {
             ack(&op).await?;
             return Ok(());
         }
+        if self.deferred.iter().any(|pending| pending.hash == op.hash) {
+            return Ok(());
+        }
         // A join request already waiting for an answer (delivered twice).
         if self.asks.iter().any(|a| a.op.hash == op.hash) {
             return Ok(());
@@ -442,6 +460,15 @@ impl Session {
             envelope: &op.envelope,
         };
         let effects = group::handle(&view, &input, &mut self.mls, self.opts.auto_accept);
+        if effects == [Effect::Defer] {
+            if self.deferred.len() >= 256 {
+                bail!(
+                    "too many messages waiting for an MLS commit; restart to replay unacknowledged operations"
+                );
+            }
+            self.deferred.push_back(op);
+            return Ok(());
+        }
         if let Some(Effect::AskUser { member }) = effects.first() {
             let member = *member;
             let Envelope::KeyPackage { key_package, .. } = &op.envelope else {
@@ -464,6 +491,14 @@ impl Session {
         self.apply(&op, effects).await
     }
 
+    async fn retry_deferred(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.deferred);
+        for op in pending {
+            self.handle_op(op).await?;
+        }
+        Ok(())
+    }
+
     async fn answer(&mut self, ask: PendingJoin, yes: bool) -> Result<()> {
         let effects = if yes {
             let view = self.view();
@@ -473,7 +508,8 @@ impl Session {
                 .info(&format!("declined {}", short_id(&ask.member)));
             group::decline_join()
         };
-        self.apply(&ask.op, effects).await
+        self.apply(&ask.op, effects).await?;
+        self.retry_deferred().await
     }
 
     /// Applies effects in order: publish, persist, tell the user, acknowledge.
@@ -490,6 +526,7 @@ impl Session {
                     self.state.record(&hash, Outcome::Ok, Some("own"), None)?;
                 }
                 Effect::AskUser { .. } => {}
+                Effect::Defer => bail!("deferred operation reached effect execution"),
                 Effect::SetJoined { epoch } => {
                     self.state.set_joined(epoch)?;
                     self.meta.status = JoinStatus::Joined;

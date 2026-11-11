@@ -94,19 +94,21 @@ fn two_node_chat_and_catch_up() {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 25, "{name} history has duplicates");
-        let macs: Vec<&str> = texts
-            .iter()
-            .copied()
-            .filter(|t| t.starts_with("mac-"))
-            .collect();
-        let mut sorted = macs.clone();
-        sorted.sort();
-        assert_eq!(macs, sorted, "{name}: A's messages in order");
+        for prefix in ["mac-", "linux-"] {
+            let sender_texts: Vec<&str> = texts
+                .iter()
+                .copied()
+                .filter(|t| t.starts_with(prefix))
+                .collect();
+            let mut sorted = sender_texts.clone();
+            sorted.sort();
+            assert_eq!(sender_texts, sorted, "{name}: {prefix} messages in order");
+        }
     }
 
     // Plaintext inspection of what p2panda stored.
     for dir in [dir_a.path(), dir_b.path()] {
-        for needle in ["mac-01", "linux-01", "mac-15"] {
+        for needle in a_msgs.iter().chain(&b_msgs).chain(&a_late) {
             let (code, out) = run_cmd(dir, &["inspect", "--grep", needle]);
             let expected = if ENCRYPTED { 0 } else { 1 };
             assert_eq!(code, expected, "inspect {needle}: {out}");
@@ -162,6 +164,7 @@ fn unacked_operations_replay_after_kill() {
         is_event(v, "info") && v["text"].as_str().unwrap_or("").starts_with("replaying")
     });
     eprintln!("REPLAY: {}", replay["text"]);
+    assert_eq!(replay["text"], "replaying 5 unacknowledged operations");
     let after = b.drain(Duration::from_secs(5));
     let dup: Vec<String> = after.iter().filter_map(foreign_text).collect();
     assert!(
@@ -179,7 +182,10 @@ fn unacked_operations_replay_after_kill() {
             is_event(v, "info") && v["text"].as_str().unwrap_or("").starts_with("replaying")
         })
         .collect();
-    eprintln!("SECOND RESTART replay events: {replays:?}");
+    assert!(
+        replays.is_empty(),
+        "acked operations replayed again: {replays:?}"
+    );
     b.quit();
 
     let (_, out) = run_cmd(dir_b.path(), &["history"]);
@@ -280,4 +286,62 @@ fn three_members_with_commit() {
         assert!(status.contains("members 3"), "{name}:\n{status}");
         assert!(status.contains("failed=0"), "{name}:\n{status}");
     }
+}
+
+#[test]
+fn input_preserves_spaces_and_rejects_oversized_utf8_without_exiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Proc::spawn("A", dir.path(), &["create", "--json"]);
+    a.wait_for("ready", |v| is_event(v, "ready"));
+    a.send(&"é".repeat(1_001));
+    a.wait_for("size error", |v| {
+        is_event(v, "error") && v["text"].as_str().unwrap_or("").contains("2002")
+    });
+    a.send("  keep spaces  ");
+    a.wait_for("untrimmed message", |v| {
+        own_text(v).as_deref() == Some("  keep spaces  ")
+    });
+    a.quit();
+    let (code, history) = run_cmd(dir.path(), &["history"]);
+    assert_eq!(code, 0);
+    assert!(history.ends_with(":   keep spaces  \n"), "{history:?}");
+    assert_eq!(history.lines().count(), 1);
+}
+
+#[test]
+fn history_write_failure_ends_session_without_acknowledging() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Proc::spawn("A", dir.path(), &["create", "--json"]);
+    a.wait_for("ready", |v| is_event(v, "ready"));
+    let conn = rusqlite::Connection::open(dir.path().join("state.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_message BEFORE INSERT ON messages
+                        BEGIN SELECT RAISE(FAIL, 'injected history write failure'); END;",
+    )
+    .unwrap();
+    a.send("must not report success");
+    a.wait_for("persistence error", |v| {
+        is_event(v, "error")
+            && v["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("injected history write failure")
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = a.child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(1));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session kept running after persistence failed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let processed: u64 = conn
+        .query_row("SELECT COUNT(*) FROM processed_ops", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(processed, 0);
+    assert!(a.seen.iter().all(|v| !is_event(v, "message")));
 }

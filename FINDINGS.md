@@ -3,12 +3,80 @@
 Findings from building `triad`, a two-member command-line chat on p2panda 0.8,
 iroh 1.4 and OpenMLS 0.9. Written as the work happened, on 2026-11-11.
 
-**Status:** Milestones 0 to 4, 6 and 7 pass on one Linux machine. Milestone 5
+## Review against SPEC.md (2026-11-11)
+
+Reviewed repository revision `28827445334509a6ed93978269acf20d054f7968`.
+The milestone results and measurements below describe the original author's
+runs, not fresh measurements from this review. The implementation follows the
+intended layering and keeps dependency pins, ciphertext transport, explicit
+acks and persisted plaintext history. It is still an exploration, with the
+cross-network acceptance criteria outstanding.
+
+### Revisions
+
+| Priority | Finding | Revision and regression coverage |
+| --- | --- | --- |
+| P1 | `process_commit` merged a commit before the caller checked the MLS sender against the operation author. A rejected envelope could already have changed membership. Welcome validation likewise installed the group before checking its creator. | Validate the commit sender before merging; validate the Welcome's group, authenticated sender and member identities before installing its group. Semantic identity rejections are skipped and acknowledged. Tests check that rejected input leaves both the live and persisted epoch unchanged. |
+| P1 | In the three-member extension, another author's new-epoch App can arrive before the creator's Commit. The old code recorded a permanent failure and acknowledged a message that would decrypt after the commit. | Keep future-epoch Apps unacknowledged, deduplicate them in a bounded queue, and retry after epoch changes. At 256 waiting operations the session exits with an error, leaving them for replay. A deterministic rule test delivers App before Commit and then successfully processes it. This does not introduce a total order across authors. |
+| P1 | An App containing a Commit, or the reverse, reached `process_message` before its content type was checked and could consume the legitimate message's single-use key. | Check the protocol content type first, and require a PrivateMessage for App. Real OpenMLS tests route each message through the wrong handler, then verify the correct handler can still consume it. |
+| P1 | Chat logged storage, publication and acknowledgement errors and kept processing. The topic stream could also close and still return exit code 0. | Stop the session on these errors, return code 1 and bound runtime shutdown on error paths. A SQLite trigger injects a history-write failure: the process exits, records no processed operation and emits no successful message event. Input validation errors remain recoverable. |
+| P1 | `inspect` ignored read errors. The spaces variant even reported success for a missing database. | Require the database to be readable and ignore only missing optional SQLite sidecars. Tests cover a missing database, plaintext present only in WAL, and an unreadable sidecar represented by a directory. |
+| P2 | The 2,000-byte text cap and envelope cap were enforced only on sending; CBOR decoding accepted trailing data. | Enforce the text cap on decoding, the envelope cap before receive-side MLS calls, and exact CBOR consumption. Tests include multibyte UTF-8 boundaries. |
+| P2 | Chat trimmed leading and trailing whitespace before validating and sending. | Preserve text as entered. A process test verifies exact whitespace and recovery after oversized UTF-8 input. |
+| P2 | The replay test printed the second restart's events without asserting that replay was empty. The cross-machine script stopped reading after five catch-up messages, then counted only the output it had already read. | Assert the five-operation first replay and empty second replay; drain stdout through shutdown before counting duplicates and reject failed process exits. A shell regression with a delayed sixth message confirms the drain counts it. The two-node test now checks both authors' history order and scans every sent message for plaintext. Test subprocesses are reaped on failure. |
+
+### Validation in this review
+
+Review host: Linux x86_64, kernel 6.18.57, Rust 1.98.1. No dependency
+versions changed. The CLI tests add a dev-dependency on the already pinned
+`rusqlite` to inject a real persistence failure.
+
+- `cargo test --workspace --lib --locked`: 44 core tests pass, including real
+  MLS create/join, bidirectional encryption, persistence, three-member epochs,
+  identity rejection and message-type routing.
+- `cargo test --workspace --locked -- --skip two_node_chat_and_catch_up
+  --skip unacked_operations_replay_after_kill --skip three_members_with_commit`:
+  passes. This runs the inspection test and both single-process CLI regressions.
+  The filters also omit the core three-member test, which is covered by the
+  separate library run. The existing two relay measurement tests stay ignored.
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked
+  -- -D warnings`, `git diff --check` and `bash -n scripts/cross-test.sh`: pass.
+- Full `cargo test --workspace --locked` was attempted. All three peer-based
+  CLI tests timed out before joining. Node logs show `Network is unreachable`
+  for mDNS and connection/discovery timeouts in this restricted environment.
+  `cross-test.sh local` likewise timed out before the join. No data-loss result
+  was observed because the peers never established a chat session. Neither run
+  is a pass; the end-to-end revisions need a rerun on a network-capable host.
+- The cross-test output-drain regression uses synthetic JSON through a FIFO.
+  It verifies the script's late-duplicate check, not network delivery.
+
+No milestone tag was added or moved. In particular, these checks do not satisfy
+Milestone 5 or establish cross-network behavior for spaces.
+
+### Remaining limitations
+
+The spec explicitly leaves the MLS/state.sqlite crash gap open. It also affects
+handshake progress: a crash after the creator merges an add but before publishing
+the Welcome can leave the joiner pending; a crash after the joiner installs its
+MLS group but before updating app metadata can leave the stores inconsistent.
+The KeyPackage publish and its metadata flag are separate writes too, so the
+"exactly one KeyPackage across any crash" claim is stronger than the code.
+These windows need a durable handshake/outbox design in a subsequent iteration;
+this review does not silently claim to make them atomic.
+
+`group.rs` still invokes mutable MLS through `GroupCrypto`, so it is testable
+without a network or clock but is not the spec's strictly pure state machine.
+The existing deviation below describes that choice. The spaces recommendation
+remains provisional until cross-network and offline-membership tests pass.
+
+## Original implementation results
+
+**Reported status:** Milestones 0 to 4, 6 and 7 pass on one Linux machine. Milestone 5
 needs the second machine (macOS) and is handed over: the acceptance run is in
 [README.md](README.md#acceptance-run-two-machines) and automated by
 `scripts/cross-test.sh`. Milestones 6 and 7 were built before 5 because they
 need no second machine; their two-machine runs belong to the handover too.
-Every "same machine" number below is from separate processes on one host.
+The measurements below identify process-based and in-process tests on one host.
 
 ## Environment
 

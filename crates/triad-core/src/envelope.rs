@@ -126,6 +126,12 @@ impl ChatBody {
         if body.v != VERSION {
             bail!("unsupported chat body version {}", body.v);
         }
+        if body.text.len() > MAX_TEXT_BYTES {
+            bail!(
+                "message is {} bytes, limit is {MAX_TEXT_BYTES}",
+                body.text.len()
+            );
+        }
         Ok(body)
     }
 }
@@ -177,7 +183,12 @@ pub fn cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 pub fn cbor_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    Ok(ciborium::from_reader(bytes)?)
+    let mut remaining = bytes;
+    let value = ciborium::from_reader(&mut remaining)?;
+    if !remaining.is_empty() {
+        bail!("trailing bytes after CBOR value");
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -200,6 +211,23 @@ mod tests {
         assert_eq!(ChatBody::decode(&body.encode().unwrap()).unwrap(), body);
         assert!(ChatBody::new(&"x".repeat(MAX_TEXT_BYTES), 0).is_ok());
         assert!(ChatBody::new(&"x".repeat(MAX_TEXT_BYTES + 1), 0).is_err());
+    }
+
+    #[test]
+    fn received_body_enforces_utf8_byte_limit() {
+        let mut body = ChatBody::new(&"é".repeat(1_000), 0).unwrap();
+        assert!(ChatBody::decode(&body.encode().unwrap()).is_ok());
+        body.text.push('é');
+        assert!(ChatBody::decode(&body.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_cbor_data() {
+        let mut bytes = ChatBody::new("hello", 0).unwrap().encode().unwrap();
+        bytes.push(0);
+        assert!(ChatBody::decode(&bytes).is_err());
+        let invite = Invite::new([1; 32], [2; 32], "https://relay.example/");
+        assert!(Invite::parse(&(invite.render().unwrap() + "00")).is_err());
     }
 
     #[test]
