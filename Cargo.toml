@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Pinned by the spec (exact versions).
+p2panda = "=0.8.0"
+iroh = "=1.4.1"
+openmls = "=0.9.2"
+openmls_rust_crypto = "=0.6.0"
+openmls_basic_credential = "=0.6.0"
+openmls_sqlite_storage = "=0.3.0"
+
+# Supporting crates.
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+serde_json = "1"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+tokio-stream = "0.1"
+tempfile = "3"
+
+triad-core = { path = "crates/triad-core" }
+triad-probe = { path = "crates/triad-probe" }

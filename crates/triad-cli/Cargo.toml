@@ -1,0 +1,18 @@
+[package]
+name = "triad-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "triad"
+path = "src/main.rs"
+
+[dependencies]
+triad-core = { workspace = true }
+triad-probe = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

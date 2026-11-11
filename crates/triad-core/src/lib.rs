@@ -1,0 +1,1 @@
+//! triad core library.
