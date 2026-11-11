@@ -3,11 +3,12 @@
 Findings from building `triad`, a two-member command-line chat on p2panda 0.8,
 iroh 1.4 and OpenMLS 0.9. Written as the work happened, on 2026-11-11.
 
-**Status:** Milestones 0 to 4 pass on one Linux machine. Milestone 5 needs the
-second machine (macOS) and is handed over: the acceptance run is in
+**Status:** Milestones 0 to 4, 6 and 7 pass on one Linux machine. Milestone 5
+needs the second machine (macOS) and is handed over: the acceptance run is in
 [README.md](README.md#acceptance-run-two-machines) and automated by
-`scripts/cross-test.sh`. Milestones 6 and 7 come after 5 and have not started.
-Every "same machine" number below is from two processes on one host.
+`scripts/cross-test.sh`. Milestones 6 and 7 were built before 5 because they
+need no second machine; their two-machine runs belong to the handover too.
+Every "same machine" number below is from separate processes on one host.
 
 ## Environment
 
@@ -34,8 +35,8 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | 3 | MLS in memory | pass | `m3` | 7 unit tests in `mls.rs`: create, KeyPackage, add, Welcome, join, 10 messages each way, reopen `mls.sqlite` mid-conversation, KeyPackage kept across restart, 3 members with a commit and a late epoch-1 message. |
 | 4 | Integration | pass | `m4` | `two_node.rs` passes with encryption on; `triad inspect --grep` exits 0 on both data directories for every probed message; 23 unit tests in `group.rs` cover every acceptance-rule row. |
 | 5 | Two machines | handed over | — | No SSH access to a Mac from this session. README install steps verified from a fresh clone on Linux (clone, `cargo install --locked`, `triad whoami` with an empty HOME). |
-| 6 | Stretch: p2panda spaces | not started | — | Comes after 5. |
-| 7 | Stretch: three members | not started as a milestone | — | `mls.rs` already tests 3 members, a Commit and `max_past_epochs` without the network. |
+| 6 | Stretch: p2panda spaces | pass on one machine | `m6` | `triad-spaces` binary, no OpenMLS. The same two-node test passes (`crates/triad-spaces/tests/spaces_two_node.rs`). Two-machine run is part of the handover. |
+| 7 | Stretch: three members | pass | `m7` | `two_node.rs::three_members_with_commit`: Commit before Welcome, B processes it, a message B sent at epoch 1 during A's commit decrypts at A; all three at epoch 2 with 3 members, zero failed. |
 
 ## Measurements
 
@@ -49,6 +50,8 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | Join latency, same machine, MLS (M4) | 2.4 s from `join` start to `joined` | `two_node.rs` and `cross-test.sh local`; KeyPackage and Welcome each travel by sync |
 | 20 messages exchanged, same machine | 2.6–2.7 s | `two_node.rs`, includes process start |
 | Catch-up of 5 after kill -9, same machine | 1.25–1.34 s from restart to the fifth message | `two_node.rs`, 3 runs plaintext, 1 run encrypted |
+| Same, p2panda spaces (M6) | join 2.42–2.45 s; catch-up of 5 in 0.40–0.51 s | `spaces_two_node.rs`, 3 runs |
+| Three members join and exchange (M7) | 3.9–4.4 s for the whole test | `three_members_with_commit`, 4 runs |
 | Time to first connection, two machines | _pending M5_ | |
 | Path type and RTT, two machines | _pending M5_ | `triad probe` |
 
@@ -239,10 +242,33 @@ What the three libraries duplicate:
 
 ## OpenMLS and p2panda spaces
 
-_Not started: Milestone 6 follows Milestone 5._ p2panda's own `group_chat.rs`
-example (spaces API, with no OpenMLS) is about 280 lines including its CLI,
-which suggests the spaces version of triad would be much smaller than the
-OpenMLS integration (`mls.rs` plus `group.rs`: 1,439 lines, of which roughly half are tests).
+Milestone 6 built `triad-spaces` (`crates/triad-spaces`): the same commands,
+invite format, JSON events and `state.sqlite` history, with p2panda 0.8's
+encrypted spaces doing key agreement and encryption. The joiner subscribes to
+the space, which publishes its key bundle; the creator treats that as a join
+request and calls `Space::add`. Both versions pass the same two-node test on
+one machine (create, join, 10 each way in order, kill -9, exactly 5 caught up,
+no plaintext in `p2panda.sqlite`).
+
+| | OpenMLS (`triad`) | p2panda spaces (`triad-spaces`) |
+| --- | --- | --- |
+| Standardization | MLS is RFC 9420; OpenMLS is a mature implementation with a validation suite. Interoperable with other MLS clients in principle. | p2panda's own protocol (`p2panda-encryption`, a decentralized group key agreement with key bundles and pre-keys). Not standardized; pre-1.0 and documented as subject to change. |
+| Membership changes while members are offline | Needs a single committer (the creator) online to admit anyone, because MLS cannot merge concurrent commits and p2panda gives no cross-author order (Answer 4). A member offline for more than `max_past_epochs` (2) commits loses late messages from older epochs. | Designed for it: managers add and remove members without a central committer, and changes are causally ordered in the space's own operations. Only adds with both nodes online were tested here. The joiner still needs the adder to see its key bundle once. |
+| App code for encryption and membership | `mls.rs` 414 lines + `group.rs` 341 lines (non-test), plus the KeyPackage/Welcome/Commit envelopes, `processed_ops` idempotency against single-use keys, and a custom OpenMLS provider and codec. `chat.rs` is 552 lines. | None beyond the join prompt: about 60 lines handle `Member` and `Space` events and call `Space::add`. The whole binary, CLI included, is 674 lines. |
+| Join latency, same machine | 2.4 s | 2.4 s |
+| Catch-up of 5, same machine | 1.25–1.34 s | 0.40–0.51 s |
+| What storage reveals | Envelope type names (`KeyPackage`, `Welcome`, `App`), field names, joiner identity in the KeyPackage, `to` of each Welcome, MLS group ID and epoch (Answer 7). | No application field names: message payloads are encrypted as a whole (`sent_at_ms`, `ChatBody` and message text all absent). The spaces control messages still show CBOR field names such as `ciphertext`, `PreKey` and `key_used`. Authors, timestamps and sizes are visible in both. |
+| Failure cases left open | The crash gap (a key consumed before the state write loses that message). The creator is a single point of failure for membership. Multi-committer groups are impossible without a sequencer. Metadata leaks above. | Publishing does not return the operation hash, so the app stores its own message only when it comes back through the stream. No epoch or key state is visible to the app, so "why can't I read this" is hard to diagnose. Anyone holding the space ID can announce a key bundle (the app's prompt is the only filter). On restart the app re-announces the member list. API stability before 1.0. |
+
+**Recommendation:** for this two-person, local-first use case, p2panda
+spaces. They remove the most code and the hardest problems found here (single
+committer, cross-author ordering, single-use keys against at-least-once
+delivery), catch up faster in this test, and leak less envelope metadata.
+Choose OpenMLS only if interoperability with other MLS clients or a
+standardized, audited protocol is a requirement. Even then, the
+single-committer limit should be treated as a design constraint, not a
+temporary shortcut. The two-machine run (Milestone 5) should confirm spaces
+behave the same across networks before deciding.
 
 ## Library issues
 
@@ -274,11 +300,10 @@ No upstream issues were filed from this session.
 
 - **Run Milestone 5** on the Mac and Linux machine, fill in the pending rows,
   and Answer 2.
-- **Milestone 6:** the same chat on p2panda spaces, then the comparison
-  table.
-- **Milestone 7:** three data directories through the network, exercising
-  `Envelope::Commit` and `max_past_epochs` end to end (already covered by an
-  MLS unit test).
+- **Two-machine runs of Milestones 6 and 7:** `triad-spaces` with the
+  README's acceptance steps, and a third member on either machine.
+- **Spaces under offline membership changes:** add a member while another is
+  offline, and remove one, to test the claim in the comparison table.
 - **Hide metadata:** encode `Envelope` as an integer-tagged CBOR array (or
   wrap all of it in MLS) so type names stop leaking; add MLS padding.
 - **Merge identities:** use the p2panda signing key as the MLS signature key

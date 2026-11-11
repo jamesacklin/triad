@@ -127,6 +127,18 @@ and catch-up time.
 
 Logs go to `triad.log` in the data directory (`RUST_LOG=debug` for more).
 
+## p2panda spaces variant (Milestone 6)
+
+`triad-spaces` is the same chat with p2panda's built-in encrypted spaces
+instead of OpenMLS. Install it the same way and run the same acceptance steps
+with `triad-spaces` in place of `triad` (its default data directory is
+`…/triad-spaces`). It has `whoami`, `create`, `join`, `chat`, `history`,
+`status` and `inspect`; `status` shows no epoch, since spaces expose none.
+
+```sh
+cargo install --path crates/triad-spaces --locked
+```
+
 ## Development
 
 ```sh
@@ -137,7 +149,8 @@ cargo test -p triad-core --test payload_sizes -- --ignored --nocapture   # M2 pa
 cargo test -p triad-core --test shared_sqlite -- --ignored --nocapture   # one-file SQLite experiment
 ```
 
-Layout: `crates/triad-core` (envelopes, identity, MLS, p2panda, state, the
+Layout: `crates/triad-spaces` (the Milestone 6 comparison binary),
+`crates/triad-core` (envelopes, identity, MLS, p2panda, state, the
 acceptance rules in `group.rs`), `crates/triad-probe` (raw iroh echo, the only
 crate that names iroh), `crates/triad-cli` (the `triad` binary and
 `tests/two_node.rs`).

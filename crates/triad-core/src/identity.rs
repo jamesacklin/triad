@@ -42,6 +42,12 @@ impl Identity {
         *self.credentials.verifying_key().as_bytes()
     }
 
+    /// The raw p2panda credentials. Only for the `triad-spaces` comparison
+    /// binary, which builds on p2panda directly; `triad` itself never needs it.
+    pub fn p2panda_credentials(&self) -> p2panda::Credentials {
+        self.credentials.clone()
+    }
+
     pub fn node_hex(&self) -> String {
         hex::encode(self.node_id())
     }
