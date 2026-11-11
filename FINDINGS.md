@@ -112,21 +112,23 @@ remains provisional until cross-network and offline-membership tests pass.
 
 ## Milestone 5: two machines on different networks (2026-11-11)
 
-**Result: pass.** Acceptance steps 1 to 9 pass on both machines, with the
-machines on different networks and Tailscale off on the Mac. The Linux binary
-was installed from `0013f14`, whose code matches the review's `d2b362d`. The
-Mac's revision was not recorded. Steps 10 (roles swapped) and
-the full same-LAN chat run are still to do. Milestones 6 and 7 have not been
+**Result: pass, in both directions.** Acceptance steps 1 to 9 pass with the Mac
+creating and Linux joining (run 1, by hand), and again with the roles swapped
+(run 2, `scripts/cross-test.sh` over SSH). The swapped run covers step 10.
+Both machines ran code at `0013f14`, which matches the review's `d2b362d`. Only
+the full same-LAN chat run is still to do. Milestones 6 and 7 have not been
 run on two machines.
 
 | | Mac | Linux |
 | --- | --- | --- |
-| Machine | MacBook Air, Apple silicon (macOS version not recorded) | Ubuntu 26.04.1, Linux 7.0.0-43, x86_64 |
-| Network | Phone hotspot, Tailscale off | Home LAN behind NAT (`192.168.1.216`). Tailscale was running, but the Mac had no tailnet route. |
-| Role | Creator, node `16197d43` | Joiner, node `77f7cdc2` |
+| Machine | MacBook Air, Apple silicon, macOS 26.6.2 (25G83) | Ubuntu 26.04.1, Linux 7.0.0-43, x86_64 |
+| Network | 5G phone hotspot (`172.20.10.3`, carrier IPv4 `174.209.184.31`, plus global IPv6). Tailscale stopped. | Wired home LAN behind NAT (`192.168.1.216`, public `108.32.35.114`), no global IPv6. Tailscale running, but the Mac had no tailnet route. |
+| Run 1 role | Creator, node `16197d43` | Joiner, node `77f7cdc2` |
+| Run 2 role | Joiner, node `03bb1ca0` | Creator, node `eb231add` |
 
-The run was by hand, with `--data-dir ~/triad-m5` on both machines, group
-topic `5033c0d9`.
+### Run 1: Mac creates, Linux joins (by hand)
+
+Run with `--data-dir ~/triad-m5` on both machines, group topic `5033c0d9`.
 
 | Step | Check | Result |
 | --- | --- | --- |
@@ -136,36 +138,68 @@ topic `5033c0d9`.
 | 8 | No plaintext in `p2panda.sqlite` | Pass. `mac-01` and `linux-01` are absent on both machines, and `mac-15` on Linux. The scanned files were 1.86 MB on the Mac and 1.94 MB on Linux, including the WAL. |
 | 9 | Same epoch and members, nothing failed | Pass. Both show epoch 1, the same two members and `ok=27 skipped=0 failed=0`. |
 
-Measurements, from the Linux `triad.log`:
+### Run 2: Linux creates, the Mac joins (scripted)
 
-| Measurement | Value |
-| --- | --- |
-| Join, from KeyPackage publish to `joined` | 1.37 s (1.67 s from process start) |
-| Catch-up of 5, from `triad chat` start to the 5 operations received | 1.0 s |
-| Sync sessions per connection | 2 for the join, 2 for the catch-up. Both catch-up sessions reported `received_ops=5`, but each operation was processed once. |
+`scripts/cross-test.sh` ran on Linux with the Mac as the SSH remote, reached
+through a Cloudflare quick tunnel from the hotspot (see the README). The tunnel
+carries only the SSH session that drives the Mac's `triad`, and iroh does not
+see it. Fresh data directories were used on both sides. The script reported
+PASS in 21 s:
 
-The spec's step 7 expects one sync. There were two concurrent sessions, each
-carrying all five operations. The likely cause is that each side opened one.
-p2panda and `processed_ops` deduplicated them, so the user saw exactly five
-messages. The second session wastes bandwidth but does no harm at this scale.
+- The Mac joined 9 s after the creator started, with 2 members at epoch 1 on both
+  sides.
+- Each side received the other's 10 messages in order, and both histories had 20.
+- The Mac went offline, Linux sent 5, and the Mac caught up on exactly 5 in 2 s
+  of script time, with a sync observed.
+- Neither `p2panda.sqlite` contained plaintext.
+- Both showed the same epoch and members, and the Mac received no duplicates
+  (10 + 5 messages from Linux).
 
-**Path.** `triad` does not log the path a connection uses, so the chat run's
-path is not recorded. The probe between the same two machines, minutes before,
-gives the best evidence:
+### Measurements
+
+| Measurement | Run 1 (Linux joins from the LAN) | Run 2 (the Mac joins from the hotspot) |
+| --- | --- | --- |
+| KeyPackage publish to first sync with the creator | 1.11 s | 7.64 s |
+| KeyPackage publish to `joined` | 1.37 s | 7.77 s |
+| Catch-up of 5, from restart to all 5 received | 1.0 s | 0.45 s from the restarted node choosing its relay |
+| Sync sessions per connection | 2 for the join, 2 for the catch-up | Same |
+
+The joiner's own logs give these figures. The difference in join time is
+discovery: once the two nodes had a connection, the join took 0.13 s in run 2.
+Run 2 measured 7.6 s before the hotspot joiner and the LAN creator found each
+other. One run in each direction can't separate the joiner's network from noise
+in discovery.
+
+The spec's step 7 expects one sync. Both runs show two concurrent sessions
+per connection, each carrying all five operations. The likely cause is that
+each side opened one. p2panda and `processed_ops` deduplicated them, so exactly
+five messages appeared. The second session wastes bandwidth but does no harm at
+this scale.
+
+### Path
+
+`triad` does not log the path a connection uses, so the chat runs' paths are
+not recorded directly. Probes between the same two machines give the evidence:
 
 | Probe | Path | Connect | Last echo | QUIC path RTT |
 | --- | --- | --- | --- | --- |
 | Same LAN | direct (`Ip(192.168.1.216:47935)`) | 27 ms | 6.5 ms | 5.7 ms |
-| Mac on hotspot, Linux on home LAN | relayed (`use1-1.relay.n0.iroh.link`) | 171 ms | 88 ms | 153 ms |
+| Hotspot, Mac connects (before run 1) | relayed | 171 ms | 88 ms | 153 ms |
+| Hotspot, Mac connects to Linux (after run 2, 2 runs) | relayed, both | 117–120 ms | 99–106 ms | 106–123 ms |
+| Hotspot, Linux connects to the Mac (after run 2, 2 runs) | relayed, both | 98–105 ms | 79–120 ms | 109–119 ms |
 
-On the hotspot, iroh did not find a direct path within the probe's 2 seconds
-of echoes. Carrier NAT on phone hotspots commonly blocks hole punching. One
-relayed probe is a single sample, not a rate.
+All five probes between the hotspot and the LAN were relayed through
+`use1-1.relay.n0.iroh.link`, in both directions. The Mac advertised its
+carrier IPv4 address and two global IPv6 addresses. Linux has no global IPv6,
+so an IPv6 path was not available. The carrier's IPv4 NAT did not allow hole
+punching within the probe's 2 seconds of echoes. The chat worked well over the
+relay: messages arrived within the 2-second gaps between sends, and catch-up
+took about a second.
 
-One observation from the log: the joiner's iroh endpoint picked its home relay
-after its sync sessions had finished. That was 1.6 s after `joined` in the join
-run, and 2.0 s after the last sync session ended in the catch-up run. So
-connecting did not wait for this side's home relay.
+The joiner in run 1 picked its home relay after its sync sessions had
+finished. That was 1.6 s after `joined` in the join, and 2.0 s after the last
+sync session ended in the catch-up. So connecting did not wait for that side's
+home relay.
 
 ## Original implementation results
 
@@ -183,7 +217,7 @@ The measurements below identify process-based and in-process tests on one host.
 
 | | Machine A (this one) | Machine B |
 | --- | --- | --- |
-| OS | Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic | macOS, Apple silicon (version not recorded) |
+| OS | Ubuntu 26.04.1 LTS, Linux 7.0.0-43-generic | macOS 26.6.2 (25G83), arm64 |
 | Hardware | AMD Ryzen 7 3700X, 16 threads, 121 GB RAM | MacBook Air |
 | Rust | 1.98.1 stable (pinned in `rust-toolchain.toml`) | same |
 | Network | Home LAN behind NAT | Phone hotspot for Milestone 5, Tailscale off |
@@ -199,11 +233,11 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | # | Milestone | Result | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | 0 | Compatibility spike | pass | `m0` | One iroh (1.4.1) and one libsqlite3-sys (0.35.0) in `Cargo.lock`. `cargo tree -d` lists libsqlite3-sys twice, both 0.35.0 (two feature sets of one version). |
-| 1 | iroh probe | pass | `m1` | One machine: direct path, 23 ms connect, 1.3 ms echo RTT. Mac to Linux: direct on the same LAN (6.5 ms echo), relayed from the Mac's hotspot (88 ms echo). |
+| 1 | iroh probe | pass | `m1` | One machine: direct path, 23 ms connect, 1.3 ms echo RTT. Mac and Linux: direct on the same LAN (6.5 ms echo), relayed between the Mac's hotspot and the LAN in 5 of 5 probes (80–120 ms echo). |
 | 2 | p2panda stream, no encryption | pass | `m2` | 10 each way in order; after kill -9 and 5 missed messages the restart receives exactly 5; no duplicates. All payload sizes up to 64 KB arrive. |
 | 3 | MLS in memory | pass | `m3` | 7 unit tests in `mls.rs`: create, KeyPackage, add, Welcome, join, 10 messages each way, reopen `mls.sqlite` mid-conversation, KeyPackage kept across restart, 3 members with a commit and a late epoch-1 message. |
 | 4 | Integration | pass | `m4` | `two_node.rs` passes with encryption on; `triad inspect --grep` exits 0 on both data directories for every probed message; 23 unit tests in `group.rs` cover every acceptance-rule row. |
-| 5 | Two machines | pass | `m5` | Mac on a phone hotspot creates, Linux on home LAN joins. Acceptance steps 1 to 9 pass on both: 20 messages in order, catch-up of exactly 5, no plaintext, `failed=0`. Step 10 (roles swapped) and the same-LAN chat run are not done. |
+| 5 | Two machines | pass | `m5` | Mac on a 5G hotspot, Linux on a wired home LAN. Acceptance steps 1 to 9 pass in both directions: by hand with the Mac creating, then `cross-test.sh` over SSH with Linux creating (step 10). 20 messages in order, catch-up of exactly 5, no plaintext, `failed=0`. The same-LAN chat run is not done. |
 | 6 | Stretch: p2panda spaces | pass on one machine | `m6` | `triad-spaces` binary, no OpenMLS. The same two-node test passes (`crates/triad-spaces/tests/spaces_two_node.rs`). Two-machine run not done. |
 | 7 | Stretch: three members | pass | `m7` | `two_node.rs::three_members_with_commit`: Commit before Welcome, B processes it, a message B sent at epoch 1 during A's commit decrypts at A; all three at epoch 2 with 3 members, zero failed. |
 
@@ -221,10 +255,10 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | Catch-up of 5 after kill -9, same machine | 1.25–1.34 s from restart to the fifth message | `two_node.rs`, 3 runs plaintext, 1 run encrypted |
 | Same, p2panda spaces (M6) | join 2.42–2.45 s; catch-up of 5 in 0.40–0.51 s | `spaces_two_node.rs`, 3 runs |
 | Three members join and exchange (M7) | 3.9–4.4 s for the whole test | `three_members_with_commit`, 4 runs |
-| Probe connect time, two machines | 27 ms same LAN; 171 ms from hotspot | `triad probe listen` / `connect` |
-| Path type and RTT, two machines | Same LAN: direct, echo 6.5 ms, QUIC 5.7 ms. Hotspot: relayed, echo 88 ms, QUIC 153 ms | `triad probe` |
-| Join latency, two networks, MLS (M5) | 1.37 s from KeyPackage publish to `joined` | Linux `triad.log`, one run |
-| Catch-up of 5, two networks (M5) | 1.0 s from `triad chat` start | Linux `triad.log`, one run |
+| Probe connect time, two machines | 27 ms same LAN; 98–171 ms between the hotspot and the LAN | `triad probe listen` / `connect` |
+| Path type and RTT, two machines | Same LAN: direct, echo 6.5 ms, QUIC 5.7 ms. Hotspot to LAN: relayed in 5 of 5, echo 79–120 ms, QUIC 106–153 ms | `triad probe`, both directions |
+| Join latency, two networks, MLS (M5) | 1.37 s (Linux joins from the LAN), 7.77 s (the Mac joins from the hotspot), from KeyPackage publish to `joined` | Joiner's `triad.log`, one run each |
+| Catch-up of 5, two networks (M5) | 1.0 s (Linux), 0.45 s (the Mac, measured from choosing its relay) | Joiner's `triad.log`, one run each |
 
 ### Envelope sizes
 
@@ -310,11 +344,13 @@ p2panda's log sync in live mode, and gossip is not on this path.
 
 2. **On these two networks, how often is the path direct and how often
    relayed?** On the same home LAN, direct (`Ip(192.168.1.216:…)`, 6.5 ms
-   echo). With the Mac on a phone hotspot and Linux on the home LAN, relayed
-   through `use1-1.relay.n0.iroh.link` (88 ms echo, 153 ms QUIC estimate): no
-   direct path within 2 seconds. That is one sample per network pair, not a
-   rate. The chat run's own path is not logged by `triad`. The chat worked
-   either way, with join in 1.4 s and catch-up in 1.0 s.
+   echo). With the Mac on a 5G phone hotspot and Linux on the wired home LAN,
+   relayed every time: 5 of 5 probes, in both directions, went through
+   `use1-1.relay.n0.iroh.link` with 80–120 ms echoes. Hole punching through
+   the carrier's IPv4 NAT never succeeded within the probe's 2 seconds. IPv6
+   was not an option, because only the Mac had a global IPv6 address. The chat
+   runs' own paths are not logged by `triad`, but both passed over this pair of
+   networks. Joins took 1.4 s and 7.8 s, and catch-ups about 1 s.
 
 3. **After kill -9, does `StreamFrom::Frontier` with explicit acknowledgement
    replay exactly the unacknowledged operations?** Yes, on this evidence.
@@ -473,9 +509,12 @@ No upstream issues were filed from this session.
 
 ## Proposed follow-ups
 
-- **Finish the acceptance run:** step 10 (Linux creates, the Mac joins) and
-  steps 1 to 5 on the same LAN. Log the selected path in `triad -v`, so the
-  chat run's path is recorded rather than inferred from the probe.
+- **Finish the acceptance run:** steps 1 to 5 on the same LAN. Log the
+  selected path in `triad -v`, so a chat run's path is recorded rather than
+  inferred from the probe.
+- **Slow discovery from the hotspot:** in run 2 the Mac took 7.6 s to find the
+  creator, against 1.1 s the other way. Repeat both directions a few times to
+  see whether this is the network or noise.
 - **One sync session per peer:** the Milestone 5 log shows two concurrent
   sessions per connection, each carrying the same operations.
 - **Two-machine runs of Milestones 6 and 7:** `triad-spaces` with the

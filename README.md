@@ -10,7 +10,7 @@ deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
 The [spec review](FINDINGS.md#review-against-specmd-2026-11-11) records the
 correctness fixes, test results and remaining crash windows. The cross-network
 acceptance run (Milestone 5, a Mac on a phone hotspot and Linux on a home LAN)
-passes steps 1 to 9. The crash windows remain, so treat this as a prototype,
+passes steps 1 to 9 in both directions. The crash windows remain, so treat this as a prototype,
 not a reliable chat system.
 
 ```
@@ -116,7 +116,41 @@ path (direct or relayed) and the round-trip time.
 `scripts/cross-test.sh user@other-host` automates steps 1 to 9 over SSH using
 `--json` output, with fresh data directories on both sides. Set
 `LOCAL_TAG`/`REMOTE_TAG` to name the messages; `scripts/cross-test.sh local`
-runs both sides on one machine as a smoke test.
+runs both sides on one machine as a smoke test. If `triad` is not on the
+remote's PATH for non-interactive SSH (usual for `~/.cargo/bin`), set
+`REMOTE_TRIAD='~/.cargo/bin/triad'`.
+
+### Reaching a machine behind carrier NAT
+
+A machine on a phone hotspot can't accept incoming SSH. A Cloudflare quick
+tunnel works around that without an account. Don't use Tailscale for this. It
+gives iroh a tailnet path, so the run no longer tests two separate networks.
+
+On the machine behind the hotspot (here, the Mac), turn on Remote Login,
+add the other machine's public key to `~/.ssh/authorized_keys`, and run:
+
+```sh
+brew install cloudflared
+caffeinate -dims cloudflared tunnel --url ssh://localhost:22   # prints <name>.trycloudflare.com
+```
+
+On the machine that runs the script, install `cloudflared` and add this to
+`~/.ssh/config`:
+
+```
+Host *.trycloudflare.com
+  ProxyCommand cloudflared access ssh --hostname %h
+```
+
+Then, for example, with Linux creating and the Mac joining:
+
+```sh
+REMOTE_TRIAD='~/.cargo/bin/triad' LOCAL_TAG=linux REMOTE_TAG=mac \
+  scripts/cross-test.sh you@<name>.trycloudflare.com
+```
+
+The tunnel carries only the SSH session. iroh can't see it, so the chat still
+connects across the two real networks.
 
 Record the results in FINDINGS.md: path type, round-trip time, join latency
 and catch-up time.
