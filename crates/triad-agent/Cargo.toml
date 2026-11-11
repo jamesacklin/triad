@@ -1,0 +1,18 @@
+[package]
+name = "triad-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Personal and channel bots for triad: policy, context, brain, tools"
+
+[dependencies]
+rig-core = { workspace = true }
+rig-reqwest = { workspace = true }
+rmcp = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+webpki-root-certs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

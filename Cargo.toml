@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/triad-core", "crates/triad-probe", "crates/triad"]
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,5 +27,17 @@ rusqlite = { version = "=0.37.0", features = ["bundled"] }
 tokio-stream = "0.1"
 tempfile = "3"
 
+# Bots (HARNESS-PLAN.md). Pinned exactly. `rig-core` and `rig-reqwest` may
+# only be named in triad-agent's brain.rs and `rmcp` only in its mcp.rs.
+rig-core = { version = "=0.46.0", default-features = false }
+rig-reqwest = { version = "=0.46.0", default-features = false }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+# TLS for the bots without a second crypto provider: reqwest with no provider,
+# rustls on ring (as iroh already uses), bundled roots for hosts with no store.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-root-certs = "1"
+
 triad-core = { path = "crates/triad-core" }
 triad-probe = { path = "crates/triad-probe" }
+triad-agent = { path = "crates/triad-agent" }
