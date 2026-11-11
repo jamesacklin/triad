@@ -343,6 +343,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H1 | Wire format and display | pass | `h1` | plain bodies keep today's bytes |
 | H2 | The personal bot | pass | `h2` | one-member space works; strangers declined |
 | H3 | The channel bot, talking only | pass | `h3` | including a join prompt held open across a reply |
+| H4 | Tools and permissions | pass | `h4` | gate applied twice; no bypass found |
 
 ### H0: dependencies
 
@@ -458,6 +459,51 @@ Places the plan did not say or was wrong:
   the age limit, it answered once. In a second run A came back after the
   age limit (`TRIAD_AGENT_MAX_AGE_SECS=5`, 7 s later): A recorded the job as
   `refused` (`too old`), and B never saw anything.
+
+### H4: tools and permissions
+
+Unit tests in `triad-agent/src/policy.rs` cover every row of "What an asker
+may do" (host, admin, member with grants, member, blocked, not a member),
+plus a granted member who is then promoted or removed, limits, age, once and
+the DM. `tools.rs` tests the gate on its own: a tool outside the asker's set
+that is called anyway is refused before it is sent, and the step limit.
+
+`tests/bots_tools.rs` (fake tools): host A, admin B (promoted), member C,
+each asking for `calendar.create_event` through the mock script. A's and
+B's calls reached the fake tool's log; C's did not, the mock log shows C's
+turn was offered `[]`, and C was told "I can't use calendar for you. Ask
+<A> for access." After `/grant C calendar.create_event`, C's turn was
+offered exactly that tool and its call went through; `linear.create_issue`
+was still refused. After `/revoke C`, refused again. `/audit` lists six
+rows with asker, tool and state (`ok`, `ok`, `denied`, `ok`, `denied`,
+`denied`). Members get "only the host" for `/audit` and `/grant`.
+
+**No path from a turn to a tool skips the gate.** The brain is handed a
+`&dyn ToolCaller`, which is the turn's `Gate`; it never sees the `Tools`
+object. The gate checks the asker's tool set and the step limit on every
+call, writes `bot_tool_calls` (`sent`) before the call goes out and the
+outcome after, and records refusals as `denied`. What the model is offered
+is filtered by the same tool set before the turn starts.
+
+Two things the plan did not say:
+
+- **The "ask the host" reply is written by code, not the model.** When the
+  gate refuses a tool the asker was not offered, `run_turn` replaces the
+  reply with "I can't use <servers> for you. Ask <host> for access." This
+  names server names, never other members. A real model given no tools
+  will usually not attempt a call at all; for that case the system prompt
+  lists the servers the asker cannot use and tells the model to say so and
+  name the host.
+- **Tool names on the wire.** Anthropic allows only `[a-zA-Z0-9_-]` in a
+  tool name, so `server.tool` is sent as `server__tool` and mapped back.
+
+**Latency on one machine (mock brain, fake tools).** From B's `@bot` line
+to the reply on C's screen: 101 ms. About 27 ms is B to A (sync and
+processing until the job is queued), 44 ms is A's turn (job bookkeeping and
+the mock; model and tool time are both 0 ms here), and about 30 ms is A to C.
+The figures come from the `job` event's `since_ask_ms`, `turn_ms`,
+`model_ms` and `tool_ms`, printed by the test as `LATENCY`. A real model's
+share is in H7.
 
 ## Agent harness options (2026-11-11)
 
