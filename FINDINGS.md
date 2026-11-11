@@ -341,6 +341,8 @@ and fake or fixture tools; none calls a model or a third-party service.
 | --- | --- | --- | --- | --- |
 | H0 | Dependency spike | pass | `h0` | rig-core 0.46.0, rmcp 3.9.0; pins held; no aws-lc |
 | H1 | Wire format and display | pass | `h1` | plain bodies keep today's bytes |
+| H2 | The personal bot | pass | `h2` | one-member space works; strangers declined |
+| H3 | The channel bot, talking only | pass | `h3` | including a join prompt held open across a reply |
 
 ### H0: dependencies
 
@@ -389,6 +391,73 @@ field set into the old struct (serde ignores unknown fields; the old struct
 never used `deny_unknown_fields`). `messages` gains `bot`. The `message`
 event gains `bot` (true only when shown as the channel's bot) and `ask`, and
 `bot_claim: "not accepted"` when a bot flag is not accepted.
+
+### H2: the personal bot
+
+`tests/bots_dm.rs`. `chat --agent` on a fresh data directory creates a space
+named `agent` with the node as its only member, stores its ID in `settings`,
+and focuses it. Three lines got three replies, in order, once each. With the
+mock brain held for 8 s (`TRIAD_AGENT_MOCK_DELAY_MS`, a knob the plan did
+not list), the process was killed with SIGKILL after `job started`; on
+restart the job was reported `abandoned`, never started again, and its reply
+never appeared, while a new line was answered. A second node given an invite
+to the DM's space ID ran `join --auto-accept`: the owner's node saw its key
+bundle (a `Member` event) and declined it without asking (`join_declined`,
+a new event), and the joiner never saw itself added. `/invite` and the CLI
+`invite` refuse the DM; `/add` and `/promote` too. `inspect` finds neither
+the lines nor the replies in `p2panda.sqlite`.
+
+**A one-member space works.** Nothing odd: create, publish and the stream
+behave as in any space. For a DM holding two lines and two replies,
+p2panda stored one space, one topic with four logs (seven operations, one of
+429 bytes, likely the key bundle), one key secret and no peers for the topic
+(`topics2node_infos_v1` empty). The topic is joinable by anyone who learns
+its 32-byte ID: the stranger's key bundle reached the owner. The ID only
+leaves the owner's machine if the owner shares it, and the owner's client is
+what keeps the stranger out, not p2panda.
+
+Places the plan did not say or was wrong:
+
+- **`chat --agent` with no channels** used to be an error ("run `create` or
+  `join`"); with `--agent` it now creates the DM and starts.
+- **Restarts.** After a restart a channel's space opens shortly after
+  `ready`, and a line typed before that is refused (as for every channel,
+  before bots). The test waits for the node's own `joined` event.
+- **Count limits do not apply to the DM.** Only the age and once rules
+  do: the per-asker limit of 10 an hour would cap the owner's own assistant.
+- **Spaces publish returns no operation hash** (the risk the plan listed),
+  so a job is marked `done` right after its reply is published. A crash
+  between the two leaves it `started`, so it is abandoned on restart: a
+  reply can be lost, never sent twice.
+- Further knobs beyond the plan's list: `TRIAD_AGENT_BURST_PER_MINUTE` (6)
+  and `TRIAD_AGENT_MAX_STEPS` (8).
+
+### H3: the channel bot, talking only
+
+`tests/bots_channel.rs`, host A and members B and C, all passing:
+
+- B and C see `bot_on` from A on joining (the `BotOn` operation syncs with
+  the history). B's `@bot` line gets one reply, shown as the bot's (`bot:
+  true`, author A); a line without `@bot` makes no job at A.
+- **The held-open join prompt.** A ran without `--auto-accept`. While C's
+  join request waited at A's prompt, B asked and A's bot replied; A's next
+  typed `y` still answered C's request. Replies never pass through stdin.
+- After `/block B`, B's ask is a `refused` job (`blocked`), C's is
+  answered. With `TRIAD_AGENT_ASKER_PER_HOUR=2`, C's third ask is refused
+  (`asker limit`). Refused asks make no model call and no reply.
+- `/bot on` typed by B fails locally ("only the channel's creator").
+- C (no `Manage`) published a forged `BotOn` through a test hook
+  (`/debug-bot-on`, only with `TRIAD_AGENT_TEST_HOOKS` set). A and B emit
+  `bot_rejected`, and `/bot` on B still names A as the host. A message with
+  the bot flag from C shows as an ordinary message with
+  `bot_claim: "not accepted"`.
+- After `/bot off`, every client refuses `@bot` locally ("#garden has no
+  bot"), the host's included, so nobody is answered.
+- **Host offline.** A quit; B asked. B's line shows on B's screen as usual
+  and nothing tells B that the bot's host is away. When A came back inside
+  the age limit, it answered once. In a second run A came back after the
+  age limit (`TRIAD_AGENT_MAX_AGE_SECS=5`, 7 s later): A recorded the job as
+  `refused` (`too old`), and B never saw anything.
 
 ## Agent harness options (2026-11-11)
 
