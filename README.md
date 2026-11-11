@@ -179,6 +179,13 @@ with `triad-spaces` in place of `triad` (its default data directory is
 cargo install --path crates/triad-spaces --locked
 ```
 
+`scripts/cross-test.sh` drives it too:
+
+```sh
+TRIAD=triad-spaces REMOTE_TRIAD='~/.cargo/bin/triad-spaces' EXPECT_EPOCH=null \
+  scripts/cross-test.sh user@other-host
+```
+
 ## Development
 
 ```sh

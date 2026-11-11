@@ -7,6 +7,8 @@
 #   scripts/cross-test.sh user@linux-box            # this machine creates
 #   LOCAL_TAG=linux REMOTE_TAG=mac scripts/cross-test.sh user@mac
 #   scripts/cross-test.sh local                     # both on this machine (smoke test)
+#   TRIAD=triad-spaces REMOTE_TRIAD=triad-spaces EXPECT_EPOCH=null scripts/cross-test.sh user@host
+#                                                   # the p2panda spaces variant (no MLS epoch)
 #
 # Works with the bash 3.2 that ships with macOS (no coproc, no jq).
 set -euo pipefail
@@ -17,6 +19,7 @@ REMOTE_TAG=${REMOTE_TAG:-linux}
 TIMEOUT=${TIMEOUT:-180}
 TRIAD=${TRIAD:-triad}
 REMOTE_TRIAD=${REMOTE_TRIAD:-triad}
+EXPECT_EPOCH=${EXPECT_EPOCH:-1}   # "null" for triad-spaces, which has no epoch
 
 WORK=$(mktemp -d)
 LOCAL_DIR="$WORK/a"
@@ -126,8 +129,8 @@ JA=$(wait_for 4 a '"event":"joined"')
 log "2. joined after $((SECONDS - T0))s"
 
 # --- 3. two members at epoch 1 ---
-expect_eq "$(field "$JA" members)/$(field "$JA" epoch)" "2/1" "3. creator sees 2 members at epoch 1"
-expect_eq "$(field "$JB" members)/$(field "$JB" epoch)" "2/1" "3. joiner sees 2 members at epoch 1"
+expect_eq "$(field "$JA" members)/$(field "$JA" epoch)" "2/$EXPECT_EPOCH" "3. creator sees 2 members at epoch $EXPECT_EPOCH"
+expect_eq "$(field "$JB" members)/$(field "$JB" epoch)" "2/$EXPECT_EPOCH" "3. joiner sees 2 members at epoch $EXPECT_EPOCH"
 
 # --- 4. 10 messages each way ---
 for m in $(seq_names "$LOCAL_TAG" 1 10); do echo "$m" >&3; done
@@ -168,8 +171,14 @@ SA=$("$TRIAD" --data-dir "$LOCAL_DIR" status)
 SB=$(remote "$REMOTE_TRIAD --data-dir '$REMOTE_DIR' status")
 printf '%s\n' "$SA" | grep -q 'failed=0' || fail "9. creator has failed operations"
 printf '%s\n' "$SB" | grep -q 'failed=0' || fail "9. joiner has failed operations"
-expect_eq "$(printf '%s\n' "$SA" | grep '^epoch')" "$(printf '%s\n' "$SB" | grep '^epoch')" "9. same epoch"
+if [ "$EXPECT_EPOCH" != null ]; then
+  expect_eq "$(printf '%s\n' "$SA" | grep '^epoch')" "$(printf '%s\n' "$SB" | grep '^epoch')" "9. same epoch"
+fi
 members_of() { printf '%s\n' "$1" | sed -n '/^members/,/^ops/p' | grep -v '^ops'; }
-expect_eq "$(members_of "$SA")" "$(members_of "$SB")" "9. same members"
+if [ -n "$(members_of "$SA")" ]; then
+  expect_eq "$(members_of "$SA")" "$(members_of "$SB")" "9. same members"
+else
+  log "9. status lists no members (spaces); member count was checked at step 3"
+fi
 expect_eq "$EXTRA" "15" "no duplicate deliveries to the joiner (10 + 5 foreign messages)"
 log "PASS ($((SECONDS - T0))s total)"

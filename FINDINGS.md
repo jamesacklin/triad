@@ -107,8 +107,9 @@ change it.
 
 `group.rs` still invokes mutable MLS through `GroupCrypto`, so it is testable
 without a network or clock but is not the spec's strictly pure state machine.
-The existing deviation below describes that choice. The spaces recommendation
-remains provisional until cross-network and offline-membership tests pass.
+The existing deviation below describes that choice. Spaces have since passed
+the cross-network run (Milestone 6). The spaces recommendation is still
+provisional until offline-membership tests pass.
 
 ## Milestone 5: two machines on different networks (2026-11-11)
 
@@ -116,8 +117,10 @@ remains provisional until cross-network and offline-membership tests pass.
 creating and Linux joining (run 1, by hand), and again with the roles swapped
 (run 2, `scripts/cross-test.sh` over SSH). The swapped run covers step 10.
 Both machines ran code at `0013f14`, which matches the review's `d2b362d`. Only
-the full same-LAN chat run is still to do. Milestones 6 and 7 have not been
-run on two machines.
+the full same-LAN chat run is still to do. Milestone 6 (spaces) has since
+passed on the same two machines (see
+[Milestone 6](#milestone-6-p2panda-spaces-on-two-machines-2026-11-11)).
+Milestone 7 needs only one machine, by the spec.
 
 | | Mac | Linux |
 | --- | --- | --- |
@@ -201,6 +204,49 @@ finished. That was 1.6 s after `joined` in the join, and 2.0 s after the last
 sync session ended in the catch-up. So connecting did not wait for that side's
 home relay.
 
+## Milestone 6: p2panda spaces on two machines (2026-11-11)
+
+**Result: pass.** `triad-spaces` passes acceptance steps 1 to 9 between the
+same two machines as Milestone 5. The Mac was on the 5G hotspot with Tailscale
+stopped, and Linux was on the wired LAN. `scripts/cross-test.sh` ran on Linux
+with `TRIAD=triad-spaces EXPECT_EPOCH=null`, and drove the Mac over the same
+Cloudflare SSH tunnel. Linux created the space and the Mac joined. Both binaries
+were built from `0013f14`. The script change only adapts its checks, as follows:
+
+- Spaces report `"epoch": null`, so step 3 checks the member count and that the
+  epoch is null.
+- `status` lists neither an epoch nor members, so step 9 checks `failed=0` and
+  says that there is no member list to compare. The member count was already
+  checked at step 3. Without this change, step 9 would have compared two empty
+  values and passed without checking anything.
+
+Before the real run, a one-machine smoke test (`cross-test.sh local`) passed in
+8 s.
+
+To separate the two variants from noise, the OpenMLS and spaces runs alternated
+over the same tunnel, all with Linux creating and the Mac joining from the
+hotspot. All six passed:
+
+| Variant | Join (script time, from creator start) | Catch-up of 5 | Total |
+| --- | --- | --- | --- |
+| OpenMLS (`triad`) | 9 s, 7 s, 8 s | 2 s, 2 s, 2 s | 21 s, 19 s, 20 s |
+| p2panda spaces (`triad-spaces`) | 4 s, 6 s, 7 s | 3 s, 2 s, 2 s | 16 s, 19 s, 20 s |
+
+The script measures in whole seconds, and its join time includes starting the
+joiner over SSH, about 1 s through the tunnel. Across networks the two variants
+are close. Spaces joined a little sooner in each pair, but the ranges overlap
+at 7 s, and both catch up in about 2 s. The one-machine gap (spaces caught up in
+0.4–0.5 s against 1.25–1.34 s for OpenMLS) does not show up at this
+resolution. Discovery and the relay dominate both.
+
+Every spaces run had exactly 15 messages from the other member at the joiner,
+with no duplicates. Neither database contained `linux-01` or `mac-01` as
+plaintext.
+
+What this run does not test: membership changes while a member is offline,
+which is the main remaining claim in the comparison table, and spaces with the
+Mac as the creator.
+
 ## Original implementation results
 
 **Reported status:** Milestones 0 to 4, 6 and 7 pass on one Linux machine.
@@ -210,7 +256,9 @@ passed (see
 The acceptance run is in
 [README.md](README.md#acceptance-run-two-machines) and automated by
 `scripts/cross-test.sh`. Milestones 6 and 7 were built before 5 because they
-need no second machine. Their two-machine runs have not been done yet.
+could be developed on one machine. Milestone 6's two-machine run has since
+passed. Milestone 7's test uses three data directories on one machine, as the
+spec says.
 The measurements below identify process-based and in-process tests on one host.
 
 ## Environment
@@ -238,7 +286,7 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | 3 | MLS in memory | pass | `m3` | 7 unit tests in `mls.rs`: create, KeyPackage, add, Welcome, join, 10 messages each way, reopen `mls.sqlite` mid-conversation, KeyPackage kept across restart, 3 members with a commit and a late epoch-1 message. |
 | 4 | Integration | pass | `m4` | `two_node.rs` passes with encryption on; `triad inspect --grep` exits 0 on both data directories for every probed message; 23 unit tests in `group.rs` cover every acceptance-rule row. |
 | 5 | Two machines | pass | `m5` | Mac on a 5G hotspot, Linux on a wired home LAN. Acceptance steps 1 to 9 pass in both directions: by hand with the Mac creating, then `cross-test.sh` over SSH with Linux creating (step 10). 20 messages in order, catch-up of exactly 5, no plaintext, `failed=0`. The same-LAN chat run is not done. |
-| 6 | Stretch: p2panda spaces | pass on one machine | `m6` | `triad-spaces` binary, no OpenMLS. The same two-node test passes (`crates/triad-spaces/tests/spaces_two_node.rs`). Two-machine run not done. |
+| 6 | Stretch: p2panda spaces | pass | `m6` | `triad-spaces` binary, no OpenMLS. `spaces_two_node.rs` passes on one machine. `cross-test.sh` passes 3 of 3 runs with the Mac joining from the 5G hotspot and Linux creating on the LAN. |
 | 7 | Stretch: three members | pass | `m7` | `two_node.rs::three_members_with_commit`: Commit before Welcome, B processes it, a message B sent at epoch 1 during A's commit decrypts at A; all three at epoch 2 with 3 members, zero failed. |
 
 ## Measurements
@@ -254,6 +302,7 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | 20 messages exchanged, same machine | 2.6–2.7 s | `two_node.rs`, includes process start |
 | Catch-up of 5 after kill -9, same machine | 1.25–1.34 s from restart to the fifth message | `two_node.rs`, 3 runs plaintext, 1 run encrypted |
 | Same, p2panda spaces (M6) | join 2.42–2.45 s; catch-up of 5 in 0.40–0.51 s | `spaces_two_node.rs`, 3 runs |
+| Two networks, the Mac joins from the hotspot | OpenMLS: join 7–9 s, catch-up 2 s. Spaces: join 4–7 s, catch-up 2–3 s | `cross-test.sh` script time, 3 runs each, alternating |
 | Three members join and exchange (M7) | 3.9–4.4 s for the whole test | `three_members_with_commit`, 4 runs |
 | Probe connect time, two machines | 27 ms same LAN; 98–171 ms between the hotspot and the LAN | `triad probe listen` / `connect` |
 | Path type and RTT, two machines | Same LAN: direct, echo 6.5 ms, QUIC 5.7 ms. Hotspot to LAN: relayed in 5 of 5, echo 79–120 ms, QUIC 106–153 ms | `triad probe`, both directions |
@@ -478,8 +527,10 @@ delivery), catch up faster in this test, and leak less envelope metadata.
 Choose OpenMLS only if interoperability with other MLS clients or a
 standardized, audited protocol is a requirement. Even then, the
 single-committer limit should be treated as a design constraint, not a
-temporary shortcut. The two-machine run (Milestone 5) should confirm spaces
-behave the same across networks before deciding.
+temporary shortcut. Across two networks (Milestone 6), spaces behaved like
+the OpenMLS version: every run passed, joins were slightly faster and catch-up
+took the same time. Spaces' advantage for membership changes while members are
+offline is still untested.
 
 ## Library issues
 
@@ -512,13 +563,15 @@ No upstream issues were filed from this session.
 - **Finish the acceptance run:** steps 1 to 5 on the same LAN. Log the
   selected path in `triad -v`, so a chat run's path is recorded rather than
   inferred from the probe.
-- **Slow discovery from the hotspot:** in run 2 the Mac took 7.6 s to find the
-  creator, against 1.1 s the other way. Repeat both directions a few times to
-  see whether this is the network or noise.
+- **Slow discovery from the hotspot:** with the Mac joining from the hotspot,
+  joins took 4–9 s in six runs (both variants). With Linux joining from the LAN,
+  the one run took 1.4 s. Repeat the Mac-creates direction under the script to
+  compare like with like. That needs SSH into Linux, for example a second
+  tunnel. Then look at which discovery mechanism finds the peer.
 - **One sync session per peer:** the Milestone 5 log shows two concurrent
   sessions per connection, each carrying the same operations.
-- **Two-machine runs of Milestones 6 and 7:** `triad-spaces` with the
-  README's acceptance steps, and a third member on either machine.
+- **Spaces with the Mac as creator,** and a three-member run across machines.
+  Neither is required by the spec.
 - **Spaces under offline membership changes:** add a member while another is
   offline, and remove one, to test the claim in the comparison table.
 - **Hide metadata:** encode `Envelope` as an integer-tagged CBOR array (or
