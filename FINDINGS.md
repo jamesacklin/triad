@@ -314,6 +314,95 @@ design around:
   depends on the product. It means adding someone exposes the space's past
   messages to them.
 
+## Agent harness options (2026-11-11)
+
+Desk research on giving an AI agent access to a triad group. Nothing here was
+built. The only test run was dependency resolution, described below.
+
+### What is encrypted at rest today
+
+Only p2panda's store. The spec leaves the rest open ("No key protection").
+
+| File | Contents | Encrypted at rest |
+| --- | --- | --- |
+| `p2panda.sqlite` | Operations as synced | Yes, ciphertext only |
+| `state.sqlite` | Decrypted message history | No |
+| `mls.sqlite` | Group secrets and the MLS signature key | No |
+| `credentials.cbor` | Node identity key | No, file mode 0600 only |
+
+So an agent design has to add encryption at rest, not retain it. The likely
+shape is SQLCipher for `state.sqlite` and `mls.sqlite`, the same key wrapping
+`credentials.cbor`, and the key held in the OS keychain or passed by the
+harness over a file descriptor. Whether rusqlite's SQLCipher build feature
+works alongside p2panda's sqlx, which shares the same libsqlite3-sys, is
+untested.
+
+### Shape of the integration
+
+The agent should be its own group member, with its own data directory and node
+ID, and reach triad through an interface, not the files. `triad chat --json`
+already serves: one JSON event per line out, lines in on stdin. A removable
+agent needs the spaces variant, since the OpenMLS variant has no removal.
+
+Two limits hold for every option below:
+
+- **The model provider sees plaintext.** Whatever the agent reads goes to its
+  configured provider, which ends end-to-end confidentiality for the group
+  unless the model runs locally.
+- **The harness is a second plaintext store.** Its transcript, memory and logs
+  hold what the agent read, outside anything triad encrypts.
+
+### ZeroClaw as a bundled sidecar
+
+ZeroClaw 0.9.0 fits as a second binary with triad as one of its channels (a
+channel implements roughly `name`, `listen` and `send`). It does not fit linked
+into the triad binary:
+
+- Its manifest depends on `rusqlite` 0.40. triad pins `rusqlite` 0.37 with
+  libsqlite3-sys 0.35, and p2panda's sqlx 0.9 accepts libsqlite3-sys only below
+  0.38. Cargo links one native SQLite per build. Which libsqlite3-sys
+  `rusqlite` 0.40 needs was not confirmed.
+- It presents itself as a single binary. Nothing read says its internal crates
+  are a supported library API.
+
+Its toolchain (Rust 1.96), tokio and rustls with ring match triad's. As a
+channel it would need to deduplicate on the `op` hash (delivery is at least
+once), leave join requests to a human member (no `--auto-accept`), and run one
+triad process per group. Its memory is SQLite with embeddings; whether that is
+encrypted at rest was not checked. Only its manifest and README were read.
+
+### Crates that link into the same binary
+
+Each crate was added to `triad-cli` in a scratch copy of the repository at
+`de3f814`, and the resolved tree inspected with `cargo tree`. Nothing was
+compiled or run, so this shows the dependencies fit, not that the binary works.
+
+| Crate | Version resolved | What it is | Crates added to triad-cli's 454 |
+| --- | --- | --- | --- |
+| `rig-core` | 0.44.0 (0.46.0 is the latest; not investigated) | Agent library: providers, typed tools, agent loop | 17 |
+| `swiftide-agents` | 0.34.0 | Agent loop with tools and hooks, from a retrieval pipeline framework | 55 |
+| `rmcp` (features `client`, `transport-child-process`) | 3.9.0 | The official MCP SDK; not an agent | 13 |
+
+In all three the pins held: iroh 1.4.1, p2panda 0.8.0, openmls 0.9.2, rusqlite
+0.37.0, sqlx 0.9.0 and one libsqlite3-sys 0.35.0. TLS stayed on rustls 0.23
+with ring; no OpenSSL or aws-lc appeared. Adding `rig-core` rewrote nine
+existing lock entries, which were not examined beyond the pinned crates.
+
+`rig-core` is the preferred candidate. It adds the least and has no storage of
+its own, so it creates no second database. `rmcp` is the alternative shape:
+triad serves MCP tools in-process and an external harness connects.
+
+Two that do not fit: Block's goose (its core crate uses sqlx 0.9.0 with SQLite
+and would probably unify, but the `goose` name on crates.io is an unrelated
+load-testing tool, so it would be a git dependency, which the spec forbids),
+and ZeroClaw, as above.
+
+Sources: [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and its
+[manifest](https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/Cargo.toml),
+[rig](https://github.com/0xPlaygrounds/rig),
+[swiftide's manifest](https://raw.githubusercontent.com/bosun-ai/swiftide/master/Cargo.toml),
+[goose's core manifest](https://raw.githubusercontent.com/block/goose/main/crates/goose/Cargo.toml).
+
 ## Original implementation results
 
 **Reported status:** Milestones 0 to 4, 6 and 7 pass on one Linux machine.
