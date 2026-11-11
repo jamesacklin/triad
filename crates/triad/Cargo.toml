@@ -1,8 +1,9 @@
 [package]
-name = "triad-cli"
+name = "triad"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Multi-channel chat on p2panda encrypted spaces"
 
 [[bin]]
 name = "triad"
@@ -11,7 +12,9 @@ path = "src/main.rs"
 [dependencies]
 triad-core = { workspace = true }
 triad-probe = { workspace = true }
+p2panda = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -22,4 +25,3 @@ hex = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }

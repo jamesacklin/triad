@@ -3,6 +3,19 @@
 Findings from building `triad`, a two-member command-line chat on p2panda 0.8,
 iroh 1.4 and OpenMLS 0.9. Written as the work happened, on 2026-11-11.
 
+**The OpenMLS code is no longer in the repository.** Following the
+[recommendation below](#openmls-and-p2panda-spaces), the `triad` binary
+(`crates/triad-cli`) and the OpenMLS and acceptance-rule modules of
+`triad-core` (`mls.rs`, `group.rs`, the p2panda wrapper in `net.rs`, the
+envelope types) were removed
+on 2026-11-11. The spaces binary, called `triad-spaces` throughout this
+document, is the only one left. It was then renamed `triad` (`crates/triad`,
+default data directory `…/triad`) and took over `triad probe`. So below,
+`triad` means the removed OpenMLS binary and `triad-spaces` means today's
+`triad`. Everything about OpenMLS, epochs, KeyPackages and Welcomes records
+work at or before commit `de3f814`, where that code can still be read and
+run. Today's `triad` refuses a data directory that holds an `mls.sqlite`.
+
 ## Review against SPEC.md (2026-11-11)
 
 Reviewed repository revision `28827445334509a6ed93978269acf20d054f7968`.
@@ -655,6 +668,41 @@ What the three libraries duplicate:
   `processed_ops` both track what was handled. The app's table is needed
   because MLS cannot decrypt the same ciphertext twice; p2panda's is needed to
   avoid replaying everything.
+
+## Several spaces per node (2026-11-11)
+
+`triad-spaces` now holds any number of spaces in one data directory, as named
+channels. One p2panda node subscribes to all of them. This needed no library
+change: `Node::create_space`, `Node::space` and `Node::insert_bootstrap` all
+work on a running node, so channels can be created and joined from inside
+chat mode. The app change was in two places. `state.sqlite` files every
+message and operation under its space ID, and the session keeps one event
+stream and one member list per space.
+
+`crates/triad/tests/spaces_channels.rs` passes on one machine in about
+15 s, with three processes. A and B share three channels, two hosted by A and
+one by B. C is in one of them. The test checks that:
+
+- a channel created or joined inside chat mode works like one from the
+  command line, in both directions between the same two nodes;
+- messages arrive tagged with the right channel, and C is never shown
+  anything from the two channels it is not in;
+- B, killed and restarted, catches up on the message it missed in each of its
+  three channels;
+- each channel has its own history, and no plaintext is in `p2panda.sqlite`.
+
+The existing two-node test, the four offline-membership tests and
+`cross-test.sh local` still pass. Not tested: several channels across two
+networks, a node whose channels use different relays, and many channels at
+once (the test uses three). Not built: leaving a channel, and unread markers.
+
+Two things an app has to know:
+
+- **A node is reached through whoever invited it.** Each joined channel adds
+  its inviter as a bootstrap node. Two members of one channel who were each
+  invited by a third find each other only through that third node or mDNS.
+- **The relay is per node, not per channel.** A node listens on the relay of
+  its first channel and uses it for the channels it creates later.
 
 ## OpenMLS and p2panda spaces
 

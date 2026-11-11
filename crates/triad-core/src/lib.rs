@@ -1,9 +1,7 @@
-//! triad core library: envelopes, identity, MLS, p2panda networking, local
-//! state and the group acceptance rules. No terminal I/O.
+//! triad core library: wire formats, identity and local state. No terminal
+//! I/O and no networking; the binary builds on p2panda directly.
 
 pub mod envelope;
-pub mod group;
 pub mod identity;
-pub mod mls;
 pub mod net;
 pub mod state;

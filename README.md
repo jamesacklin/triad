@@ -1,43 +1,55 @@
 # triad
 
-A small command-line chat for two people, built to check whether three
-libraries fit together into one stack. iroh dials peers by public key,
-p2panda keeps a signed append-only log per author and syncs it, and MLS
-(OpenMLS) encrypts every message before p2panda sees it. This is an
-exploration: the code is disposable, and [FINDINGS.md](FINDINGS.md) is the
-deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
+A command-line chat built to check whether p2panda and iroh fit together into
+one stack for encrypted group chat. One user holds any number of encrypted
+spaces, each a named channel, as in an IRC client. iroh dials peers by public
+key. p2panda keeps a signed append-only log per author, syncs it, and
+encrypts every message with its built-in spaces. This is an exploration: the
+code is disposable, and [FINDINGS.md](FINDINGS.md) is the deliverable.
+
+An earlier `triad` encrypted with OpenMLS (RFC 9420), following
+[SPEC.md](SPEC.md). That code was removed after the comparison in FINDINGS.md
+came out in favour of spaces, and the spaces binary, until then
+`triad-spaces`, took the name. The OpenMLS code is in the git history up to
+`de3f814`, and the findings about it are kept. A data directory written by
+the OpenMLS version (it has an `mls.sqlite`) is refused: move it away or pass
+a fresh `--data-dir`.
 
 ## What the implementation is
 
-One binary, one group per data directory, two members (three in a stretch
-test). The app talks only to p2panda for networking. iroh runs inside p2panda,
-and every payload is encrypted before p2panda sees it.
+One binary, `triad`. One data directory is one user: one identity and
+one p2panda node, in any number of spaces. The app talks only to p2panda.
+iroh runs inside p2panda, and p2panda encrypts every message before storing
+or sending it.
 
 ```mermaid
 flowchart LR
   subgraph plain["Sees plaintext"]
-    app["<b>triad app</b><br/>CLI, chat prompt"] --> mls["<b>OpenMLS</b><br/>encrypts per epoch"]
+    app["<b>triad</b><br/>CLI, channels, history"] --> spaces["<b>p2panda spaces</b><br/>group keys, encryption"]
   end
   subgraph cipher["Sees ciphertext only"]
     p2p["<b>p2panda</b><br/>signs, logs, syncs"] --> iroh["<b>iroh</b><br/>QUIC by public key"] --> peer["<b>relay / peer</b><br/>hole punch or relay"]
   end
-  mls -. ciphertext .-> p2p
+  spaces -. ciphertext .-> p2p
 ```
 
 | Layer | Library | Owns |
 | --- | --- | --- |
-| Group core | `triad-core` | Envelope codec, join state machine, acceptance rules, acknowledgement |
-| Encryption | OpenMLS 0.9.2 (RFC 9420) | Group keys, epochs, member list |
+| App | `triad`, `triad-core` | Channels and their names, invites, join prompts, readable history |
+| Encryption and membership | p2panda 0.8.0 spaces | Group key agreement, encryption, member list and access levels |
 | Log and sync | p2panda 0.8.0 | Signed append-only log per author, SQLite storage, discovery, catch-up |
 | Transport | iroh 1.4.1 | QUIC connections dialed by public key, hole punching, relay fallback |
 
 ## Status
 
-The [spec review](FINDINGS.md#review-against-specmd-2026-11-11) records the
-correctness fixes, test results and remaining crash windows. The cross-network
-acceptance run (Milestone 5, a Mac on a phone hotspot and Linux on a home LAN)
-passes steps 1 to 9 in both directions. The crash windows remain, so treat this as a prototype,
-not a reliable chat system.
+A prototype, not a reliable chat system. The two-machine acceptance run
+passes across two networks
+([Milestone 6](FINDINGS.md#milestone-6-p2panda-spaces-on-two-machines-2026-11-11)).
+Several channels per user are tested on one machine only. FINDINGS.md lists
+what an app still has to handle itself: a removed member is not told, a
+removed member who reconnects looks like a new join request, and new members
+can read messages from before they joined. p2panda's encryption is its own
+protocol, not a standard, and is documented as subject to change before 1.0.
 
 ## Prerequisites
 
@@ -59,12 +71,12 @@ The same command on both machines:
 
 ```sh
 git clone https://github.com/jamesacklin/triad.git && cd triad
-cargo install --path crates/triad-cli --locked
+cargo install --path crates/triad --locked
 triad whoami
 ```
 
-`triad whoami` creates this install's identity and prints its node ID. A
-clean build takes a few minutes.
+`triad whoami` creates this install's identity and prints its node ID.
+A clean build takes a few minutes.
 
 ## Use
 
@@ -74,44 +86,75 @@ On machine A:
 triad create
 ```
 
-It prints an invite (`triad1-…`) and enters chat mode. On machine B:
+It creates the channel `#general`, prints an invite (`triad1-…`) and enters
+chat mode. On machine B:
 
 ```sh
 triad join triad1-…
 ```
 
-A is asked `join request from 7c1d09ee. Accept? [y/N]`. After `y`, both sides
-print `joined (epoch 1, 2 members)`. Then type a line and press Enter to send
-it. Lines starting with `/` are commands: `/quit`, `/status`, `/members`.
+A is asked `join request for #general from 7c1d09ee. Accept? [y/N]`. After
+`y`, both sides print that B joined. Then type a line and press Enter to send
+it. Lines starting with `/` are commands.
 
-Later, `triad chat` resumes the group. A must be online for B to catch up,
-because there is no always-on third node.
+Later, `triad chat` opens every channel again. Someone who has the
+missed messages must be online for a member to catch up, because there is no
+always-on node.
 
 | Command | Behavior |
 | --- | --- |
-| `triad whoami` | Print the node ID. Create credentials if the data directory is new. |
-| `triad create` | Create the group, print the invite, enter chat mode. |
-| `triad invite` | Print the invite again. Creator only. |
-| `triad join <invite>` | Save the invite, publish a KeyPackage, enter chat mode. |
-| `triad chat` | Resume the existing group in chat mode. |
-| `triad history [--limit N]` | Print stored decrypted messages, oldest first. |
-| `triad status` | Print role, join status, MLS epoch, member IDs and operation counts by outcome. |
-| `triad inspect --grep <text>` | Scan the raw bytes of `p2panda.sqlite` for the text. Exit 0 if absent, 1 if found. |
-| `triad probe listen` | Start a raw iroh echo endpoint and print its address. |
-| `triad probe connect <addr>` | Connect, echo one line, report whether the path was direct or relayed. |
+| `whoami` | Print the node ID. Create credentials if the data directory is new. |
+| `create [--name <name>]` | Create a channel (default `general`), print its invite, enter chat mode. |
+| `join <invite> [--name <name>]` | Add a channel from an invite, enter chat mode, wait to be added. |
+| `chat [--channel <name>]` | Open every channel in chat mode, focused on the named or first one. |
+| `channels` | List the channels in this data directory. |
+| `invite [--channel <name>]` | Print an invite to a channel this node has joined. |
+| `history [--channel <name>] [--limit N]` | Print stored messages, oldest first: one channel, or all in one timeline. |
+| `status` | Print role, join status and operation counts for every channel. |
+| `inspect --grep <text>` | Scan the raw bytes of `p2panda.sqlite` for the text. Exit 0 if absent, 1 if found. |
+| `probe listen` | Start a raw iroh echo endpoint and print its address. |
+| `probe connect <addr>` | Connect, echo one line, report whether the path was direct or relayed. |
 
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
 | `--data-dir <path>` | All | Use this data directory (default `~/Library/Application Support/triad` on macOS, `~/.local/share/triad` on Linux). |
 | `--relay <url>` | `create`, `probe` | Override the default relay (`https://use1-1.relay.n0.iroh.link./`). Joiners take the relay from the invite. |
-| `--auto-accept` | `create`, `chat` | Accept every valid join request without asking. |
-| `--json` | chat mode | Print one JSON object per event (`ready`, `join_request`, `joined`, `message`, `sync_started`, `sync_ended`, `error`). |
+| `--auto-accept` | `create`, `join`, `chat` | Accept every join request, in every channel this node manages, without asking. |
+| `--json` | chat mode | Print one JSON object per event (`ready`, `channel`, `switched`, `join_request`, `joined`, `removed`, `promoted`, `message`, `sync_started`, `sync_ended`, `error`). |
 | `-v` | All | Also print sync and connection events. |
 
 Exit codes: 0 success, 1 runtime error, 2 usage error.
 
-One data directory holds one group. To run two instances on one machine, give
-each its own `--data-dir`.
+One data directory is one user. To run two users on one machine, give each
+its own `--data-dir`.
+
+### Channels: several spaces per user
+
+Each channel is its own p2panda space, with its own members, keys and
+history. Chat mode opens all of them at once and tags every line with its
+channel.
+
+| In chat mode | Behavior |
+| --- | --- |
+| plain text | Send to the focused channel. |
+| `/create <name>` | Create a channel, focus it, print its invite. |
+| `/join <invite> [name]` | Join a channel and focus it. Messages there stay disabled until a manager adds you. |
+| `/switch <name>` (`/s`) | Focus another channel. |
+| `/msg <name> <text>` | Send to a channel without switching. |
+| `/channels` (`/list`) | List channels; `*` marks the focused one. |
+| `/invite [name]` | Print an invite to the focused or named channel. |
+| `/members`, `/status` | Show the focused channel's members and counts. |
+| `/add <node>`, `/remove <node>`, `/promote <node>` | Change the focused channel's membership. Needs `Manage` access. |
+| `/quit` | Leave chat mode. |
+
+Names are local labels: 1 to 32 characters of `a-z`, `0-9`, `-` and `_`, with
+an optional leading `#`. An invite carries the inviter's name as a suggestion.
+If that name is taken, the joiner gets it with the space ID appended, or
+passes its own. Every JSON event about a channel has a `channel` field.
+`ready` describes the focused channel and lists all of them in `channels`.
+
+There is no `/leave` yet. A `state.sqlite` from before channels is migrated
+on first open, and its group becomes `#main`.
 
 ## Acceptance run (two machines)
 
@@ -121,25 +164,25 @@ the Linux machine on a cloud VM or a phone hotspot. Both machines need
 
 1. Mac: `triad create --auto-accept -v`. Copy the invite.
 2. Linux: `triad join <invite> -v`.
-3. Both: confirm the output shows 2 members at epoch 1.
+3. Both: confirm the output shows 2 members.
 4. Mac: send `mac-01` through `mac-10`. Linux: send `linux-01` through `linux-10`.
 5. Both: `triad history` lists 20 messages, with each sender's messages in order.
 6. Linux: `/quit`. Mac: send `mac-11` through `mac-15`.
 7. Linux: `triad chat -v`. Expect one sync and exactly five new messages.
 8. Both: `/quit`, then `triad inspect --grep mac-01` and `triad inspect --grep linux-01`. Both must exit 0.
-9. Both: `triad status` shows the same epoch, the same two members and `failed=0`.
+9. Both: `triad status` shows `failed=0`.
 10. Repeat steps 1 to 5 with fresh data directories (`--data-dir`) and the roles swapped, so Linux creates and the Mac joins.
 11. Run steps 1 to 5 once more with both machines on the same LAN, and note whether the connection path changes.
 
-Before step 1, a raw connectivity check is useful: `triad probe listen` on
-one machine, then `triad probe connect <addr>` on the other. It reports the
-path (direct or relayed) and the round-trip time.
+Before step 1, a raw connectivity check is useful: `triad probe listen`
+on one machine, then `triad probe connect <addr>` on the other. It
+reports the path (direct or relayed) and the round-trip time.
 
 `scripts/cross-test.sh user@other-host` automates steps 1 to 9 over SSH using
 `--json` output, with fresh data directories on both sides. Set
 `LOCAL_TAG`/`REMOTE_TAG` to name the messages; `scripts/cross-test.sh local`
-runs both sides on one machine as a smoke test. If `triad` is not on the
-remote's PATH for non-interactive SSH (usual for `~/.cargo/bin`), set
+runs both sides on one machine as a smoke test. If `triad` is not on
+the remote's PATH for non-interactive SSH (usual for `~/.cargo/bin`), set
 `REMOTE_TRIAD='~/.cargo/bin/triad'`.
 
 ### Reaching a machine behind carrier NAT
@@ -182,52 +225,22 @@ and catch-up time.
 | Symptom | First check |
 | --- | --- |
 | The two nodes never see each other | Run `triad probe` between the machines. If the probe fails, the problem is the network or relay, not p2panda. |
-| The joiner stays `pending` | Confirm the creator is online and printed a join request. Run both sides with `-v`. After 120 s the joiner prints a hint and keeps waiting. |
-| `triad inspect` finds plaintext | Check that both data directories are fresh (Milestone 2 stored plaintext). |
+| The joiner stays `pending` | Confirm a member with `Manage` access is online and printed a join request. Run both sides with `-v`. |
+| `inspect` finds plaintext | Message text should never be in `p2panda.sqlite`. Keep the data directory and record the steps in FINDINGS.md. |
 | The Linux build fails in a `-sys` crate | The C toolchain is missing. |
 | macOS asks about incoming connections or local network access | Allow it; p2panda's mDNS discovery is on by default. |
 
 Logs go to `triad.log` in the data directory (`RUST_LOG=debug` for more).
 
-## p2panda spaces variant (Milestone 6)
-
-`triad-spaces` is the same chat with p2panda's built-in encrypted spaces
-instead of OpenMLS. Install it the same way and run the same acceptance steps
-with `triad-spaces` in place of `triad` (its default data directory is
-`…/triad-spaces`). It has `whoami`, `create`, `join`, `chat`, `history`,
-`status` and `inspect`; `status` shows no epoch, since spaces expose none.
-
-```sh
-cargo install --path crates/triad-spaces --locked
-```
-
-In chat mode, a member with `Manage` access can also use `/add <node>`,
-`/remove <node>` and `/promote <node>`. These exist for the offline-membership
-experiment, which takes about a minute per test:
-
-```sh
-cargo test -p triad-spaces --test spaces_membership -- --ignored
-```
-
-`scripts/cross-test.sh` drives it too:
-
-```sh
-TRIAD=triad-spaces REMOTE_TRIAD='~/.cargo/bin/triad-spaces' EXPECT_EPOCH=null \
-  scripts/cross-test.sh user@other-host
-```
-
 ## Development
 
 ```sh
-cargo test                       # unit tests and the two-process integration test
+cargo test                       # unit tests, the two-node test and the channels test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test -p triad-core --test payload_sizes -- --ignored --nocapture   # M2 payload measurement
-cargo test -p triad-core --test shared_sqlite -- --ignored --nocapture   # one-file SQLite experiment
+cargo test -p triad --test spaces_membership -- --ignored   # offline membership, about a minute each
 ```
 
-Layout: `crates/triad-spaces` (the Milestone 6 comparison binary),
-`crates/triad-core` (envelopes, identity, MLS, p2panda, state, the
-acceptance rules in `group.rs`), `crates/triad-probe` (raw iroh echo, the only
-crate that names iroh), `crates/triad-cli` (the `triad` binary and
-`tests/two_node.rs`).
+Layout: `crates/triad` (the binary and its integration tests),
+`crates/triad-core` (message and invite formats, identity, `state.sqlite`),
+`crates/triad-probe` (raw iroh echo, the only crate that names iroh).
