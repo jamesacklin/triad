@@ -346,6 +346,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H4 | Tools and permissions | pass | `h4` | gate applied twice; no bypass found |
 | H5 | Isolation | pass | `h5` | nothing crossed between DM and channels |
 | H6 | Real MCP | pass | `h6` | rmcp client over stdio and HTTP against a fixture server |
+| H7 | A real model | built; live run handed over | `h7` | rig wiring checked offline; no API key on this host |
 
 ### H0: dependencies
 
@@ -552,6 +553,45 @@ out of `BotOn`'s server list, and the bot answers as usual.
 The interrupted session here left truncated build artifacts in `target/`
 (zero-length `.rmeta` files, a malformed `.rlib`); `cargo clean --profile
 dev` fixed it. Nothing in the code was involved.
+
+### H7: a real model
+
+`AnthropicBrain` (`triad-agent/src/brain.rs`, the only file naming `rig`)
+runs a manual tool loop on `rig-core` 0.46: one `CompletionRequest` per
+round with the system prompt as preamble, the transcript and the ask as one
+user message (the transcript fenced and labeled as context), and the
+offered tools as `ToolDefinition`s. Each tool call goes through the gate;
+results go back as tool results (errors with `is_error`). A round with no
+tool call ends the turn. Token counts and model time are summed across
+rounds and reported in the `job` event. `BotOn` announces the provider as
+`anthropic (claude-opus-5-5)`. Starting with `--agent`, the `anthropic`
+brain and no key exits with code 2 (`tests/bots_dm.rs`).
+
+**Not run against the real model.** This host has no `ANTHROPIC_API_KEY`,
+so the live tests (`tests/bots_live.rs`, `#[ignore]`d) were compiled but not
+run. They cover the H2 exchange, one tool call against the fixture server
+over stdio, and the planted-instruction experiment, and print `TURN` lines
+with model time, tool time and token counts:
+
+```sh
+ANTHROPIC_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture
+```
+
+What was checked instead: `triad-agent/tests/anthropic_wire.rs` points the
+brain at a local stand-in for `POST /v1/messages` (no key, no network) that
+answers a `tool_use` and then text. The turn sends the system prompt and the
+tool as `calendar__create_event`, the call reaches the fake tool through the
+gate, the second request carries the `tool_result`, the reply is the final
+text, and tokens sum to 250 in and 30 out over two requests. For an asker
+with no tools, no tools are sent. The mock tests all pass with no key set.
+
+So the latency split's model share, the token counts per turn and the
+planted-instruction result are open; they need the run above.
+
+A test fix on the way: `bots_tools.rs` matched "any bot reply" after an ask,
+so under load another member's late reply could be taken for the asker's
+(it failed once in a full parallel run). Mock replies can now include
+`{ask}`, and the test matches on it.
 
 ## Agent harness options (2026-11-11)
 
