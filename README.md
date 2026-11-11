@@ -5,7 +5,7 @@ libraries fit together into one stack. iroh dials peers by public key,
 p2panda keeps a signed append-only log per author and syncs it, and MLS
 (OpenMLS) encrypts every message before p2panda sees it. This is an
 exploration: the code is disposable, and [FINDINGS.md](FINDINGS.md) is the
-deliverable.
+deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
 
 ```
 App (triad) ── plaintext ──▶ OpenMLS ── ciphertext ──▶ p2panda ──▶ iroh ──▶ relay / peer
@@ -30,7 +30,7 @@ direct paths and outbound HTTPS to the relay.
 The same command on both machines:
 
 ```sh
-git clone <repo-url> triad && cd triad
+git clone https://github.com/jamesacklin/triad.git && cd triad
 cargo install --path crates/triad-cli --locked
 triad whoami
 ```
