@@ -350,3 +350,96 @@ fn unacked_operations_replay_after_kill() {
     eprintln!("STATUS B:\n{status}");
     assert!(status.contains("failed=0"));
 }
+
+/// Milestone 7: a third member. Exercises `Envelope::Commit` and
+/// `max_past_epochs`: B sends while A is committing C's add, and A still
+/// decrypts it after moving to the next epoch.
+#[test]
+fn three_members_with_commit() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_c = tempfile::tempdir().unwrap();
+
+    // A answers join requests by hand so the test controls the commit timing.
+    let mut a = Proc::spawn("A", dir_a.path(), &["create", "--json"]);
+    let ready = a.wait_for("ready", |v| is_event(v, "ready"));
+    let invite = ready["invite"].as_str().unwrap().to_string();
+
+    let mut b = Proc::spawn("B", dir_b.path(), &["join", &invite, "--json"]);
+    b.wait_for("ready", |v| is_event(v, "ready"));
+    a.wait_for("B's join request", |v| is_event(v, "join_request"));
+    a.send("y");
+    let jb = b.wait_for("B joined", |v| is_event(v, "joined"));
+    assert_eq!(
+        (jb["epoch"].as_u64(), jb["members"].as_u64()),
+        (Some(1), Some(2))
+    );
+
+    let mut c = Proc::spawn("C", dir_c.path(), &["join", &invite, "--json"]);
+    let node_c = c.wait_for("ready", |v| is_event(v, "ready"))["node"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let req = a.wait_for("C's join request", |v| is_event(v, "join_request"));
+    assert_eq!(req["member"], node_c.as_str());
+
+    // B sends at epoch 1, then A commits C's add (epoch 2) right away.
+    b.send("during-commit");
+    b.wait_for("B's own message", |v| {
+        own_text(v).as_deref() == Some("during-commit")
+    });
+    a.send("y");
+    let ja = a.wait_for("C joined on A", |v| is_event(v, "joined"));
+    assert_eq!(
+        (ja["epoch"].as_u64(), ja["members"].as_u64()),
+        (Some(2), Some(3))
+    );
+    let jc = c.wait_for("C joined", |v| is_event(v, "joined"));
+    assert_eq!(
+        (jc["epoch"].as_u64(), jc["members"].as_u64()),
+        (Some(2), Some(3))
+    );
+    b.wait_for("B processed the commit", |v| {
+        is_event(v, "info")
+            && v["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("epoch 2 with 3 members")
+    });
+
+    // A decrypts B's epoch-1 message even though A is at epoch 2.
+    assert_eq!(receive(&mut a, 1), ["during-commit"]);
+
+    // All three exchange messages at epoch 2.
+    a.send("from-a");
+    b.send("from-b");
+    c.send("from-c");
+    let mut got_a = receive(&mut a, 3);
+    let mut got_b = receive(&mut b, 2);
+    let mut got_c = receive(&mut c, 2);
+    got_a.sort();
+    got_b.sort();
+    got_c.sort();
+    assert_eq!(got_a, ["during-commit", "from-b", "from-c"]);
+    assert_eq!(got_b, ["from-a", "from-c"]);
+    assert_eq!(
+        got_c,
+        ["from-a", "from-b"],
+        "C cannot read B's pre-join message"
+    );
+
+    c.quit();
+    b.quit();
+    a.quit();
+    for (dir, name) in [
+        (dir_a.path(), "A"),
+        (dir_b.path(), "B"),
+        (dir_c.path(), "C"),
+    ] {
+        let (_, status) = run_cmd(dir, &["status"]);
+        eprintln!("STATUS {name}:\n{status}");
+        assert!(status.contains("epoch   2"), "{name}:\n{status}");
+        assert!(status.contains("members 3"), "{name}:\n{status}");
+        assert!(status.contains("failed=0"), "{name}:\n{status}");
+    }
+}
