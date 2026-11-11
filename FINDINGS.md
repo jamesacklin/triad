@@ -10,7 +10,9 @@ The milestone results and measurements below describe the original author's
 runs, not fresh measurements from this review. The implementation follows the
 intended layering and keeps dependency pins, ciphertext transport, explicit
 acks and persisted plaintext history. It is still an exploration, with the
-cross-network acceptance criteria outstanding.
+cross-network acceptance criteria outstanding. The peer tests the review could
+not run were later rerun on a network-capable host and pass (see
+[Rerun on a network-capable host](#rerun-on-a-network-capable-host-2026-11-11)).
 
 ### Revisions
 
@@ -53,6 +55,32 @@ versions changed. The CLI tests add a dev-dependency on the already pinned
 No milestone tag was added or moved. In particular, these checks do not satisfy
 Milestone 5 or establish cross-network behavior for spaces.
 
+### Rerun on a network-capable host (2026-11-11)
+
+Revision `d2b362df4af8af1c4ed81ba1ac7b5e1e0b826735` (the review's revisions),
+run on the original author's host: Linux x86_64, kernel 7.0.0-43, Rust 1.98.1,
+with the public relay reachable. The review could not run the peer tests in its
+sandbox; this run covers them.
+
+- `cargo fmt --all --check` and `cargo clippy --workspace --all-targets
+  --locked -- -D warnings`: pass.
+- Full `cargo test --workspace --locked`: pass, with no tests skipped beyond the
+  two relay measurements, which stay ignored. That is 44 `triad-core` unit tests,
+  5 `two_node.rs` process tests and 1 spaces process test. The 5 process tests
+  include the three peer tests that timed out in the review:
+  `two_node_chat_and_catch_up`, `unacked_operations_replay_after_kill` and
+  `three_members_with_commit`. The same 5 tests also pass with
+  `--test-threads=1`.
+- `scripts/cross-test.sh local`, with `target/debug` on `PATH`: PASS in 9 s.
+  Both members reached the same epoch with the same two members. Both histories
+  had 20 messages. The joiner caught up on exactly 5 messages in 1 s with a sync
+  observed. Neither `p2panda.sqlite` contained plaintext, and the joiner received
+  no duplicates (10 + 5 messages from the other member).
+
+So the review's end-to-end revisions hold between separate processes on one
+host. This is still not Milestone 5: both processes share one network, and the
+path type, join latency and catch-up time across networks remain unmeasured.
+
 ### Remaining limitations
 
 The spec explicitly leaves the MLS/state.sqlite crash gap open. It also affects
@@ -63,6 +91,17 @@ The KeyPackage publish and its metadata flag are separate writes too, so the
 "exactly one KeyPackage across any crash" claim is stronger than the code.
 These windows need a durable handshake/outbox design in a subsequent iteration;
 this review does not silently claim to make them atomic.
+
+When the session stops on a persistence error, shutdown is not clean. In about
+half the runs of `history_write_failure_ends_session_without_acknowledging`
+(3 of 6 consecutive runs), the triad process prints a panic from p2panda's store
+during shutdown. The panic is at `p2panda-store-0.8.0/src/sqlite.rs:356`, the
+assertion "can't have an already existing transaction after an just-acquired
+permit". The test still passes because the exit code is 1 and nothing was
+acknowledged. The likely cause is that the bounded runtime shutdown drops a task
+while it still has a p2panda store transaction open. Ending the p2panda node
+before tearing down the runtime should remove the panic. This rerun did not
+change it.
 
 `group.rs` still invokes mutable MLS through `GroupCrypto`, so it is testable
 without a network or clock but is not the spec's strictly pure state machine.

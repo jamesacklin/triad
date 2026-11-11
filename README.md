@@ -8,9 +8,10 @@ exploration: the code is disposable, and [FINDINGS.md](FINDINGS.md) is the
 deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
 
 The [spec review](FINDINGS.md#review-against-specmd-2026-11-11) records the
-correctness fixes, test results and remaining crash windows. Cross-network
-acceptance is still pending; rerun the peer tests on a network-capable host
-before treating this prototype as a reliable chat system.
+correctness fixes, test results and remaining crash windows. The peer tests
+pass between separate processes on one networked Linux host, but cross-network
+acceptance (Milestone 5) is still pending. Don't treat this prototype as a
+reliable chat system until that run passes.
 
 ```
 App (triad) ── plaintext ──▶ OpenMLS ── ciphertext ──▶ p2panda ──▶ iroh ──▶ relay / peer
