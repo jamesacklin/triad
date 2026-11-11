@@ -64,7 +64,6 @@ impl Printer {
         }
     }
 
-    #[allow(dead_code)] // Used once the join flow lands (Milestone 4).
     pub fn join_request(&self, member: &NodeId, ask: bool) {
         if self.json {
             self.emit(json!({"event": "join_request", "member": hex_id(member)}));
@@ -75,7 +74,6 @@ impl Printer {
         }
     }
 
-    #[allow(dead_code)] // Used once the join flow lands (Milestone 4).
     pub fn joined(&self, member: &NodeId, epoch: u64, members: usize) {
         if self.json {
             self.emit(json!({
@@ -176,7 +174,6 @@ impl Printer {
         }
     }
 
-    #[allow(dead_code)]
     pub fn raw(&self, value: Value) {
         self.emit(value);
     }

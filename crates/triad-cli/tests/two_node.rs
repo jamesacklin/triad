@@ -15,7 +15,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_triad");
 const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether message bodies are encrypted before p2panda sees them.
-const ENCRYPTED: bool = false;
+const ENCRYPTED: bool = true;
 
 struct Proc {
     name: &'static str,
@@ -27,7 +27,12 @@ struct Proc {
 
 impl Proc {
     fn spawn(name: &'static str, dir: &Path, args: &[&str]) -> Proc {
+        Self::spawn_env(name, dir, args, &[])
+    }
+
+    fn spawn_env(name: &'static str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Proc {
         let mut child = Command::new(BIN)
+            .envs(env.iter().copied())
             .arg("--data-dir")
             .arg(dir)
             .args(args)
@@ -283,4 +288,65 @@ fn two_node_chat_and_catch_up() {
             );
         }
     }
+}
+
+/// After kill -9, does `StreamFrom::Frontier` with explicit acks replay exactly
+/// the unacknowledged operations? B processes everything but acks nothing,
+/// is killed, and restarts with acks on.
+#[test]
+fn unacked_operations_replay_after_kill() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+
+    let mut a = Proc::spawn("A", dir_a.path(), &["create", "--auto-accept", "--json"]);
+    let ready = a.wait_for("ready", |v| is_event(v, "ready"));
+    let invite = ready["invite"].as_str().unwrap().to_string();
+
+    let mut b = Proc::spawn_env(
+        "B",
+        dir_b.path(),
+        &["join", &invite, "--json", "-v"],
+        &[("TRIAD_TEST_SKIP_ACK", "1")],
+    );
+    let ready_b = b.wait_for("ready", |v| is_event(v, "ready"));
+    wait_joined(&mut b, &ready_b);
+    let msgs = ["r-1", "r-2", "r-3"];
+    for m in msgs {
+        a.send(m);
+    }
+    assert_eq!(receive(&mut b, 3), msgs);
+    b.kill9();
+
+    // Restart with acks on. Stop A first so nothing new can arrive by sync.
+    a.quit();
+    let mut b = Proc::spawn("B", dir_b.path(), &["chat", "--json", "-v"]);
+    let replay = b.wait_for("replay info", |v| {
+        is_event(v, "info") && v["text"].as_str().unwrap_or("").starts_with("replaying")
+    });
+    eprintln!("REPLAY: {}", replay["text"]);
+    let after = b.drain(Duration::from_secs(5));
+    let dup: Vec<String> = after.iter().filter_map(foreign_text).collect();
+    assert!(
+        dup.is_empty(),
+        "replayed operations must not be shown twice: {dup:?}"
+    );
+    b.quit();
+
+    // Everything is acked now: a second restart replays nothing.
+    let mut b = Proc::spawn("B", dir_b.path(), &["chat", "--json", "-v"]);
+    let events = b.drain(Duration::from_secs(5));
+    let replays: Vec<&Value> = events
+        .iter()
+        .filter(|v| {
+            is_event(v, "info") && v["text"].as_str().unwrap_or("").starts_with("replaying")
+        })
+        .collect();
+    eprintln!("SECOND RESTART replay events: {replays:?}");
+    b.quit();
+
+    let (_, out) = run_cmd(dir_b.path(), &["history"]);
+    assert_eq!(out.lines().count(), 3, "history:\n{out}");
+    let (_, status) = run_cmd(dir_b.path(), &["status"]);
+    eprintln!("STATUS B:\n{status}");
+    assert!(status.contains("failed=0"));
 }

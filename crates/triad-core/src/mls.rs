@@ -562,6 +562,37 @@ mod tests {
     }
 
     #[test]
+    fn envelope_sizes_stay_under_limit() {
+        use crate::envelope::{ChatBody, Envelope, MAX_TEXT_BYTES};
+        let mut a = member(1);
+        let mut b = member(2);
+        let c = member(3);
+        a.mls.create_group(&[7; 32]).unwrap();
+        let kp = Envelope::key_package(b.mls.new_key_package().unwrap());
+        let added = a.mls.add_member(&b.mls.new_key_package().unwrap()).unwrap();
+        b.mls.join(&added.welcome, &[7; 32]).unwrap();
+        let welcome2 = Envelope::welcome([2; 32], added.welcome);
+        let body = ChatBody::new(&"x".repeat(MAX_TEXT_BYTES), u64::MAX).unwrap();
+        let app_max = Envelope::app(a.mls.encrypt(&body.encode().unwrap()).unwrap());
+        let short = ChatBody::new("hello", 1).unwrap();
+        let app_short = Envelope::app(a.mls.encrypt(&short.encode().unwrap()).unwrap());
+        let added3 = a.mls.add_member(&c.mls.new_key_package().unwrap()).unwrap();
+        let commit3 = Envelope::commit(added3.commit);
+        let welcome3 = Envelope::welcome([3; 32], added3.welcome);
+        for (name, env) in [
+            ("key_package", &kp),
+            ("welcome_2_members", &welcome2),
+            ("welcome_3_members", &welcome3),
+            ("commit_3_members", &commit3),
+            ("app_5_bytes", &app_short),
+            ("app_2000_bytes", &app_max),
+        ] {
+            eprintln!("SIZE {name}: {} bytes", env.encoded_len());
+            env.check_size().unwrap();
+        }
+    }
+
+    #[test]
     fn invalid_key_package_is_rejected() {
         let a = member(1);
         assert!(a.mls.inspect_key_package(b"garbage").is_err());

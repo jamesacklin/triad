@@ -2,6 +2,7 @@
 //! state and the group acceptance rules. No terminal I/O.
 
 pub mod envelope;
+pub mod group;
 pub mod identity;
 pub mod mls;
 pub mod net;
