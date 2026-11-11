@@ -7,15 +7,37 @@ p2panda keeps a signed append-only log per author and syncs it, and MLS
 exploration: the code is disposable, and [FINDINGS.md](FINDINGS.md) is the
 deliverable. [SPEC.md](SPEC.md) is the implementation spec it follows.
 
+## What the implementation is
+
+One binary, one group per data directory, two members (three in a stretch
+test). The app talks only to p2panda for networking. iroh runs inside p2panda,
+and every payload is encrypted before p2panda sees it.
+
+```mermaid
+flowchart LR
+  subgraph plain["Sees plaintext"]
+    app["<b>triad app</b><br/>CLI, chat prompt"] --> mls["<b>OpenMLS</b><br/>encrypts per epoch"]
+  end
+  subgraph cipher["Sees ciphertext only"]
+    p2p["<b>p2panda</b><br/>signs, logs, syncs"] --> iroh["<b>iroh</b><br/>QUIC by public key"] --> peer["<b>relay / peer</b><br/>hole punch or relay"]
+  end
+  mls -. ciphertext .-> p2p
+```
+
+| Layer | Library | Owns |
+| --- | --- | --- |
+| Group core | `triad-core` | Envelope codec, join state machine, acceptance rules, acknowledgement |
+| Encryption | OpenMLS 0.9.2 (RFC 9420) | Group keys, epochs, member list |
+| Log and sync | p2panda 0.8.0 | Signed append-only log per author, SQLite storage, discovery, catch-up |
+| Transport | iroh 1.4.1 | QUIC connections dialed by public key, hole punching, relay fallback |
+
+## Status
+
 The [spec review](FINDINGS.md#review-against-specmd-2026-11-11) records the
 correctness fixes, test results and remaining crash windows. The cross-network
 acceptance run (Milestone 5, a Mac on a phone hotspot and Linux on a home LAN)
 passes steps 1 to 9 in both directions. The crash windows remain, so treat this as a prototype,
 not a reliable chat system.
-
-```
-App (triad) ── plaintext ──▶ OpenMLS ── ciphertext ──▶ p2panda ──▶ iroh ──▶ relay / peer
-```
 
 ## Prerequisites
 
