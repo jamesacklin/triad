@@ -5963,6 +5963,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5982,6 +5985,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_sqlite_storage",
  "p2panda",
+ "p2panda-core",
  "rusqlite",
  "serde",
  "serde_bytes",
