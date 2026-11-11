@@ -5415,6 +5415,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "triad-agent",
  "triad-core",
  "triad-probe",
 ]
@@ -5423,13 +5424,18 @@ dependencies = [
 name = "triad-agent"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "reqwest",
  "rig-core",
  "rig-reqwest",
  "rmcp",
  "rustls",
+ "serde",
+ "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
+ "triad-core",
  "webpki-root-certs",
 ]
 

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 triad-core = { workspace = true }
 triad-probe = { workspace = true }
+triad-agent = { workspace = true }
 p2panda = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
