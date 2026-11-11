@@ -344,6 +344,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H2 | The personal bot | pass | `h2` | one-member space works; strangers declined |
 | H3 | The channel bot, talking only | pass | `h3` | including a join prompt held open across a reply |
 | H4 | Tools and permissions | pass | `h4` | gate applied twice; no bypass found |
+| H5 | Isolation | pass | `h5` | nothing crossed between DM and channels |
 
 ### H0: dependencies
 
@@ -504,6 +505,23 @@ the mock; model and tool time are both 0 ms here), and about 30 ms is A to C.
 The figures come from the `job` event's `since_ask_ms`, `turn_ms`,
 `model_ms` and `tool_ms`, printed by the test as `LATENCY`. A real model's
 share is in H7.
+
+### H5: isolation
+
+`tests/bots_isolation.rs`: one host with its DM, `#garden` and `#other`, the
+mock brain logging every turn's full input. A string said only in the DM
+never appears in the `#garden` or `#other` turn; a string said only in
+`#garden` never appears in the `#other` turn or in a later DM turn. As
+controls, the `#garden` turn does contain the `#garden` string and the
+second DM turn contains the first DM line. The DM turn's tool list is
+exactly the host's two fake tools: triad offers no tool that reads or posts
+to a channel, so there is nothing to leave out.
+
+Isolation holds by construction: the worker reads history with
+`State::history(job.topic, ..)`, the job's own channel only, and
+`context::build` only trims what it is handed. **Nothing from outside a
+channel appeared in a channel turn's input in any test.** The one channel
+input the model does get beyond history is the member list with tiers.
 
 ## Agent harness options (2026-11-11)
 
