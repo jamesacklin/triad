@@ -26,3 +26,9 @@ hex = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+# The MCP fixture server (examples/mcp_fixture.rs) for the bot tests.
+rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"

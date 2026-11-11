@@ -345,6 +345,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H3 | The channel bot, talking only | pass | `h3` | including a join prompt held open across a reply |
 | H4 | Tools and permissions | pass | `h4` | gate applied twice; no bypass found |
 | H5 | Isolation | pass | `h5` | nothing crossed between DM and channels |
+| H6 | Real MCP | pass | `h6` | rmcp client over stdio and HTTP against a fixture server |
 
 ### H0: dependencies
 
@@ -522,6 +523,35 @@ Isolation holds by construction: the worker reads history with
 `context::build` only trims what it is handed. **Nothing from outside a
 channel appeared in a channel turn's input in any test.** The one channel
 input the model does get beyond history is the member list with tiers.
+
+### H6: real MCP
+
+`triad-agent/src/mcp.rs` reads `mcp.json` from the data directory and
+connects each server through `rmcp` 3.9: a child process over stdio
+(`TokioChildProcess`, stderr discarded) or streamable HTTP
+(`StreamableHttpClientTransport::with_client`, the shared ring-backed
+client, with `Authorization: Bearer <token>` from the variable `token_env`
+names). Each server gets 15 s to connect and list its tools; each call gets
+60 s. Tools are named `<server>.<tool>`; tool names outside
+`[A-Za-z0-9_-]` are skipped and reported.
+
+The fixture is `crates/triad/examples/mcp_fixture.rs`: one tool, a
+hand-written `ServerHandler` (the tool name is a flag, so the `#[tool]`
+macros do not fit), served over stdio or over HTTP with hyper, answering 401
+without the expected bearer token. Every call it receives is logged as the
+fake tools log. It is an example, not a binary, so its server-side `rmcp`
+features and hyper stay dev-dependencies and out of the `triad` build; the
+test builds it with `cargo build --example mcp_fixture` on first use.
+
+`tests/bots_tools.rs` runs the whole H4 test three times: fake tools, two
+fixture servers over stdio, and two over HTTP. All pass. Each `mcp.json`
+also names a server that is down at start (a missing command; a URL on a
+closed port): it is reported as an `info` line before `ready`, it is left
+out of `BotOn`'s server list, and the bot answers as usual.
+
+The interrupted session here left truncated build artifacts in `target/`
+(zero-length `.rmeta` files, a malformed `.rlib`); `cargo clean --profile
+dev` fixed it. Nothing in the code was involved.
 
 ## Agent harness options (2026-11-11)
 

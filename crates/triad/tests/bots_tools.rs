@@ -404,13 +404,11 @@ fn tools_and_permissions_with_fake_tools() {
 }
 
 #[test]
-#[ignore = "needs the MCP fixture server (H6)"]
 fn tools_and_permissions_over_mcp_stdio() {
     run(Backend::Stdio);
 }
 
 #[test]
-#[ignore = "needs the MCP fixture server (H6)"]
 fn tools_and_permissions_over_mcp_http() {
     run(Backend::Http);
 }
