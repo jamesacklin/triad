@@ -179,6 +179,14 @@ with `triad-spaces` in place of `triad` (its default data directory is
 cargo install --path crates/triad-spaces --locked
 ```
 
+In chat mode, a member with `Manage` access can also use `/add <node>`,
+`/remove <node>` and `/promote <node>`. These exist for the offline-membership
+experiment, which takes about a minute per test:
+
+```sh
+cargo test -p triad-spaces --test spaces_membership -- --ignored
+```
+
 `scripts/cross-test.sh` drives it too:
 
 ```sh

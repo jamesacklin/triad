@@ -4,9 +4,13 @@
 //!
 //! Join flow: the joiner subscribes to the space, which announces its key
 //! bundle on the space topic. The creator sees that as a join request and adds
-//! the member with `Space::add`.
+//! the member with `Space::add`. Any member with `Manage` access handles join
+//! requests the same way.
+//!
+//! Membership commands in chat mode, for the offline-membership tests:
+//! `/add <node>`, `/remove <node>`, `/promote <node>` (to `Manage`).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -255,6 +259,22 @@ impl Printer {
     }
 }
 
+fn parse_node(text: &str) -> Result<NodeId> {
+    let bytes = hex::decode(text.trim()).context("node ID must be hex")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
+}
+
+fn access_name(a: AccessLevel) -> &'static str {
+    match a {
+        AccessLevel::Pull => "pull",
+        AccessLevel::Read => "read",
+        AccessLevel::Write => "write",
+        AccessLevel::Manage => "manage",
+    }
+}
+
 fn key(id: &NodeId) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(id).context("invalid node ID")
 }
@@ -369,10 +389,11 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
         opts,
         // A joiner announces itself (and the creator) once it is in.
         members: if is_creator {
-            BTreeSet::from([me])
+            BTreeMap::from([(me, AccessLevel::Manage)])
         } else {
-            BTreeSet::new()
+            BTreeMap::new()
         },
+        seen_self: is_creator,
         asks: VecDeque::new(),
     };
     let joined = async move {
@@ -397,7 +418,9 @@ struct Session {
     space: Option<Space<ChatBody>>,
     printer: Printer,
     opts: Opts,
-    members: BTreeSet<NodeId>,
+    members: BTreeMap<NodeId, AccessLevel>,
+    /// True once this node has seen itself in the member list.
+    seen_self: bool,
     asks: VecDeque<NodeId>,
 }
 
@@ -469,6 +492,15 @@ impl Session {
     }
 
     async fn on_line(&mut self, line: &str) -> Result<bool> {
+        if !line.starts_with('/') && !self.asks.is_empty() {
+            // A key bundle can arrive just before the membership change that
+            // adds its owner (another manager added them). Drop requests from
+            // nodes that are members by now, so this line is not taken as an
+            // answer to a stale prompt.
+            self.refresh_members().await;
+            let members = &self.members;
+            self.asks.retain(|m| !members.contains_key(m));
+        }
         if let Some(member) = (!line.starts_with('/'))
             .then(|| self.asks.pop_front())
             .flatten()
@@ -486,11 +518,39 @@ impl Session {
             "/quit" => return Ok(false),
             "/members" => {
                 self.refresh_members().await;
-                let ids: Vec<String> = self.members.iter().map(hex_id).collect();
-                self.printer
-                    .emit(json!({"event": "members", "members": ids}), || {
-                        ids.join("\n")
-                    });
+                let ids: Vec<String> = self.members.keys().map(hex_id).collect();
+                let access: serde_json::Map<String, serde_json::Value> = self
+                    .members
+                    .iter()
+                    .map(|(id, a)| (hex_id(id), json!(access_name(*a))))
+                    .collect();
+                self.printer.emit(
+                    json!({"event": "members", "members": ids, "access": access}),
+                    || {
+                        self.members
+                            .iter()
+                            .map(|(id, a)| format!("{} {}", hex_id(id), access_name(*a)))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    },
+                );
+            }
+            l if l.starts_with("/add ") => self.add(parse_node(&l[5..])?).await?,
+            l if l.starts_with("/remove ") => {
+                let member = parse_node(&l[8..])?;
+                let Some(space) = &self.space else {
+                    bail!("space not ready");
+                };
+                space.remove(key(&member)?).await?;
+                tracing::info!(member = %short_id(&member), "removed member");
+            }
+            l if l.starts_with("/promote ") => {
+                let member = parse_node(&l[9..])?;
+                let Some(space) = &self.space else {
+                    bail!("space not ready");
+                };
+                space.promote(key(&member)?, AccessLevel::Manage).await?;
+                tracing::info!(member = %short_id(&member), "promoted member");
             }
             "/status" => {
                 let c = self.state.counts()?;
@@ -532,30 +592,66 @@ impl Session {
     async fn refresh_members(&mut self) {
         let Some(space) = &self.space else { return };
         if let Ok(list) = space.members().await {
-            let now: BTreeSet<NodeId> = list.iter().map(|(id, _)| *id.as_bytes()).collect();
+            let now: BTreeMap<NodeId, AccessLevel> =
+                list.iter().map(|(id, a)| (*id.as_bytes(), *a)).collect();
             self.announce(now);
         }
     }
 
-    /// Prints a `joined` event for every member not seen before.
-    fn announce(&mut self, now: BTreeSet<NodeId>) {
-        let fresh: Vec<NodeId> = now
-            .iter()
-            .filter(|m| !self.members.contains(*m))
-            .copied()
-            .collect();
+    /// Prints `joined` for every member not seen before, `promoted` for an
+    /// access change, and `removed` for every member that disappeared,
+    /// including this node.
+    fn announce(&mut self, now: BTreeMap<NodeId, AccessLevel>) {
+        if !self.seen_self && !now.contains_key(&self.me) {
+            // Not in yet: nothing to compare against.
+            return;
+        }
         let count = now.len();
-        self.members = now;
-        for m in fresh {
-            let who = if m == self.me {
-                "you".into()
+        let who = |m: &NodeId| {
+            if *m == self.me {
+                "you".to_string()
             } else {
-                short_id(&m)
-            };
-            self.printer.emit(
-                json!({"event": "joined", "member": hex_id(&m), "epoch": null, "members": count}),
-                || format!("{who} joined ({count} members)"),
-            );
+                short_id(m)
+            }
+        };
+        let mut lines = Vec::new();
+        for (m, a) in &now {
+            match self.members.get(m) {
+                None => lines.push((
+                    json!({"event": "joined", "member": hex_id(m), "epoch": null,
+                           "members": count, "access": access_name(*a)}),
+                    format!("{} joined ({count} members)", who(m)),
+                )),
+                Some(old) if old != a => lines.push((
+                    json!({"event": "promoted", "member": hex_id(m), "access": access_name(*a)}),
+                    format!("{} is now {}", who(m), access_name(*a)),
+                )),
+                _ => {}
+            }
+        }
+        for m in self.members.keys().filter(|m| !now.contains_key(*m)) {
+            lines.push((
+                json!({"event": "removed", "member": hex_id(m), "members": count}),
+                format!("{} removed ({count} members)", who(m)),
+            ));
+        }
+        self.seen_self = now.contains_key(&self.me);
+        self.members = now;
+        for (value, text) in lines {
+            self.printer.emit(value, || text);
+        }
+    }
+
+    /// Whether this node may add members (`Manage` access).
+    async fn can_manage(&self) -> bool {
+        let Some(space) = &self.space else {
+            return false;
+        };
+        match space.members().await {
+            Ok(list) => list
+                .iter()
+                .any(|(id, a)| *id.as_bytes() == self.me && *a == AccessLevel::Manage),
+            Err(_) => false,
         }
     }
 
@@ -588,11 +684,10 @@ impl Session {
             }
             StreamEvent::Member(vk) => {
                 let member = *vk.as_bytes();
-                if self.meta.role != Role::Creator
-                    || member == self.me
-                    || self.members.contains(&member)
+                if member == self.me
+                    || self.members.contains_key(&member)
                     || self.asks.contains(&member)
-                    || self.space.is_none()
+                    || !self.can_manage().await
                 {
                     return Ok(());
                 }
@@ -613,10 +708,10 @@ impl Session {
                 }
             }
             StreamEvent::Space { members, .. } => {
-                let now: BTreeSet<NodeId> = members.keys().map(|k| *k.as_bytes()).collect();
-                if now.contains(&self.me) {
-                    self.announce(now);
-                }
+                // `Ejected` arrives with an empty member list.
+                let now: BTreeMap<NodeId, AccessLevel> =
+                    members.iter().map(|(k, a)| (*k.as_bytes(), *a)).collect();
+                self.announce(now);
             }
             StreamEvent::SyncStarted {
                 remote_node_id,

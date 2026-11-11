@@ -108,8 +108,9 @@ change it.
 `group.rs` still invokes mutable MLS through `GroupCrypto`, so it is testable
 without a network or clock but is not the spec's strictly pure state machine.
 The existing deviation below describes that choice. Spaces have since passed
-the cross-network run (Milestone 6). The spaces recommendation is still
-provisional until offline-membership tests pass.
+the cross-network run (Milestone 6) and the offline-membership tests (see
+[Spaces under offline membership changes](#spaces-under-offline-membership-changes-2026-11-11)),
+which also found behaviours an app must design around.
 
 ## Milestone 5: two machines on different networks (2026-11-11)
 
@@ -246,6 +247,72 @@ plaintext.
 What this run does not test: membership changes while a member is offline,
 which is the main remaining claim in the comparison table, and spaces with the
 Mac as the creator.
+
+## Spaces under offline membership changes (2026-11-11)
+
+The comparison below credits spaces with handling membership changes while
+members are offline, with no single committer. These tests check that claim.
+They live in `crates/triad-spaces/tests/spaces_membership.rs` and are
+`#[ignore]`d, at about a minute each:
+
+```sh
+cargo test -p triad-spaces --test spaces_membership -- --ignored
+```
+
+They run separate processes on one machine, each with its own data directory.
+"Offline" means the process is stopped. Each node either starts from the
+space's invite or, for a member added by a second manager, from an invite that
+bootstraps through that manager.
+
+To drive these cases, `triad-spaces` gained chat commands for p2panda calls it
+already had access to: `/add`, `/remove` and `/promote` (to `Manage`). It also
+gained `removed` and `promoted` events, and access levels in `/members`. Any
+member with `Manage` access now handles join requests, not only the creator.
+Removing members is outside the spec's scope for the app itself. Here it serves
+only to test the library.
+
+All four tests pass, in two consecutive runs of the whole file (74 s each):
+
+| Test | Scenario | Result |
+| --- | --- | --- |
+| `add_while_member_offline` | B goes offline. A adds C, and A and C exchange messages. B returns. | Pass. B lists C as a member 1.0 s after restarting, has read both missed messages (A's and C's) by 1.1 s, and A and C read B's next message. |
+| `remove_while_members_offline` | C goes offline. A removes C while B watches, and writes. A and B go offline. C returns alone, unaware, and writes. Everyone reconnects. | Pass on the safety checks: A and B never show the messages C wrote after its removal, and C never reads anything A wrote after it. A converges at once. |
+| `concurrent_adds_by_two_managers` | A promotes B to `Manage`. From then on A and B are never online together. A adds D; B adds E through an invite that bootstraps through B. Everyone reconnects. | Pass. All four nodes list the same four members 1.5–4.3 s after reconnecting, and each reads the other three's new messages. |
+| `removing_a_manager_invalidates_its_concurrent_add` | A promotes B to `Manage` and adds C. B goes offline, and A removes B. B returns without A, unaware, and adds E. Everyone reconnects. | Pass. As p2panda-auth's "strong removal" rule says, B's addition of E is invalidated. A and C converge on {A, C} in 0.2–0.3 s, and B and E reach the same list within 2 s. A and C show neither B's nor E's messages from that period, and B and E cannot read A's next message. |
+
+So the claim holds for the scenarios that matter most here: no single
+committer is needed, and concurrent changes converge. The first test is what an
+OpenMLS group with a single committer cannot do: there, adding C needs the
+creator online and then a Welcome, and B must process the Commit before it can
+read C. Here it simply works. The tests also found four behaviours an app has to
+design around:
+
+- **A removed member is not told.** In `remove_while_members_offline`, C
+  reconnected for about 45 s and never received its own removal. It still
+  listed itself and both others as members, and its messages appeared to send
+  but reached no one. The likely reason is that A and B stop syncing with a
+  removed node. In the strong-removal test, by contrast, the removed B (and E)
+  did learn the outcome within 2 s. One run each cannot explain the difference.
+  An app that needs a removed member to know must tell it some other way, and
+  must not take "my message published" as "my message was delivered".
+- **A removed member who reconnects looks like a new join request.** Its key
+  bundle is announced again, and the manager's stream reports `Member` exactly
+  as for a newcomer. `triad-spaces` with `--auto-accept` would add C straight
+  back. These tests run the manager without auto-accept and decline the request.
+  An app must remember removals itself, or check the space's history, before
+  treating a key bundle as a request.
+- **Stale join requests.** A key bundle can arrive just before the membership
+  change that adds its owner, for example when another manager added them. The
+  first version of the prompt then took the next chat line as the answer. The
+  prompt now drops requests from nodes that are already members. This was an
+  app bug, not a library one, but the race comes from the library's event
+  order.
+- **New members can read history from before they joined.** C was added after
+  A sent `a-1`, but C shows `a-1`. In the concurrent-adds test, E shows `a-1`,
+  sent by A before E's addition, and A and D show `b-1`. MLS does not allow
+  this: a joiner reads only from its join epoch onward. Whether this is wanted
+  depends on the product. It means adding someone exposes the space's past
+  messages to them.
 
 ## Original implementation results
 
@@ -513,12 +580,12 @@ no plaintext in `p2panda.sqlite`).
 | | OpenMLS (`triad`) | p2panda spaces (`triad-spaces`) |
 | --- | --- | --- |
 | Standardization | MLS is RFC 9420; OpenMLS is a mature implementation with a validation suite. Interoperable with other MLS clients in principle. | p2panda's own protocol (`p2panda-encryption`, a decentralized group key agreement with key bundles and pre-keys). Not standardized; pre-1.0 and documented as subject to change. |
-| Membership changes while members are offline | Needs a single committer (the creator) online to admit anyone, because MLS cannot merge concurrent commits and p2panda gives no cross-author order (Answer 4). A member offline for more than `max_past_epochs` (2) commits loses late messages from older epochs. | Designed for it: managers add and remove members without a central committer, and changes are causally ordered in the space's own operations. Only adds with both nodes online were tested here. The joiner still needs the adder to see its key bundle once. |
-| App code for encryption and membership | `mls.rs` 414 lines + `group.rs` 341 lines (non-test), plus the KeyPackage/Welcome/Commit envelopes, `processed_ops` idempotency against single-use keys, and a custom OpenMLS provider and codec. `chat.rs` is 552 lines. | None beyond the join prompt: about 60 lines handle `Member` and `Space` events and call `Space::add`. The whole binary, CLI included, is 674 lines. |
+| Membership changes while members are offline | Needs a single committer (the creator) online to admit anyone, because MLS cannot merge concurrent commits and p2panda gives no cross-author order (Answer 4). A member offline for more than `max_past_epochs` (2) commits loses late messages from older epochs. | Works without a committer. Tested on one machine: adds and removals while members are offline, two managers adding concurrently without ever being online together, and a manager removed while adding (strong removal invalidates the add). All converge in 0.2–4.3 s. The joiner still needs a manager to see its key bundle once. A removed member is not told, and a removed member who reconnects looks like a new join request. |
+| App code for encryption and membership | `mls.rs` 414 lines + `group.rs` 341 lines (non-test), plus the KeyPackage/Welcome/Commit envelopes, `processed_ops` idempotency against single-use keys, and a custom OpenMLS provider and codec. `chat.rs` is 552 lines. | None beyond the join prompt: about 60 lines handle `Member` and `Space` events and call `Space::add`. The whole binary, CLI included, was 674 lines; the membership commands and events for the offline tests bring it to 773. |
 | Join latency, same machine | 2.4 s | 2.4 s |
 | Catch-up of 5, same machine | 1.25–1.34 s | 0.40–0.51 s |
 | What storage reveals | Envelope type names (`KeyPackage`, `Welcome`, `App`), field names, joiner identity in the KeyPackage, `to` of each Welcome, MLS group ID and epoch (Answer 7). | No application field names: message payloads are encrypted as a whole (`sent_at_ms`, `ChatBody` and message text all absent). The spaces control messages still show CBOR field names such as `ciphertext`, `PreKey` and `key_used`. Authors, timestamps and sizes are visible in both. |
-| Failure cases left open | The crash gap (a key consumed before the state write loses that message). The creator is a single point of failure for membership. Multi-committer groups are impossible without a sequencer. Metadata leaks above. | Publishing does not return the operation hash, so the app stores its own message only when it comes back through the stream. No epoch or key state is visible to the app, so "why can't I read this" is hard to diagnose. Anyone holding the space ID can announce a key bundle (the app's prompt is the only filter). On restart the app re-announces the member list. API stability before 1.0. |
+| Failure cases left open | The crash gap (a key consumed before the state write loses that message). The creator is a single point of failure for membership. Multi-committer groups are impossible without a sequencer. Metadata leaks above. | Publishing does not return the operation hash, so the app stores its own message only when it comes back through the stream. No epoch or key state is visible to the app, so "why can't I read this" is hard to diagnose. Anyone holding the space ID can announce a key bundle (the app's prompt is the only filter). On restart the app re-announces the member list. A removed member is not told and its writes vanish silently. A removed member who reconnects looks like a new join request. New members can read messages from before they joined. API stability before 1.0. |
 
 **Recommendation:** for this two-person, local-first use case, p2panda
 spaces. They remove the most code and the hardest problems found here (single
@@ -529,8 +596,11 @@ standardized, audited protocol is a requirement. Even then, the
 single-committer limit should be treated as a design constraint, not a
 temporary shortcut. Across two networks (Milestone 6), spaces behaved like
 the OpenMLS version: every run passed, joins were slightly faster and catch-up
-took the same time. Spaces' advantage for membership changes while members are
-offline is still untested.
+took the same time. The offline-membership tests confirm the main advantage:
+adds and removals converge with members offline and with two managers, and no
+member has to commit for the others. They also show what the app must still
+do itself. It must remember removals, tell a removed member it is out, and
+decide whether new members may read old messages.
 
 ## Library issues
 
@@ -572,8 +642,12 @@ No upstream issues were filed from this session.
   sessions per connection, each carrying the same operations.
 - **Spaces with the Mac as creator,** and a three-member run across machines.
   Neither is required by the spec.
-- **Spaces under offline membership changes:** add a member while another is
-  offline, and remove one, to test the claim in the comparison table.
+- **Spaces removals:** find out why a removed member never learns of its
+  removal in one case but does in the other, and whether p2panda can deliver
+  the removal to it. Make `triad-spaces` remember removals so `--auto-accept`
+  cannot re-add a removed member.
+- **Spaces history for new members:** check whether p2panda can limit a new
+  member to messages after its addition, if the product needs that.
 - **Hide metadata:** encode `Envelope` as an integer-tagged CBOR array (or
   wrap all of it in MLS) so type names stop leaking; add MLS padding.
 - **Merge identities:** use the p2panda signing key as the MLS signature key
