@@ -156,6 +156,30 @@ passes its own. Every JSON event about a channel has a `channel` field.
 There is no `/leave` yet. A `state.sqlite` from before channels is migrated
 on first open, and its group becomes `#main`.
 
+## Local web demo
+
+`triad-web` serves a small chat page for trying multiple Triad identities
+inside one Rust process. Each identity has its own keys and SQLite files
+and can create or join one p2panda space.
+
+```sh
+cargo run --locked -p triad-web
+```
+
+Open the local address printed at startup (by default
+`http://127.0.0.1:8765`). Create an identity and a room, then copy the
+invite link into a second tab and create a second identity there. The
+raw invite code under **Details** also works with the current CLI via
+`triad join <invite-code>`. To join a CLI-created room in the browser,
+paste its invite code into the **Room invite** field.
+
+The demo binds its web interface to loopback and automatically accepts
+invite holders in rooms it creates. It stores credentials and decrypted
+history under `demo-data/` by default. Use `--data <dir>` to choose another
+directory. After a restart, opening a saved identity reconnects its room.
+The browser enables the incoming message chime after you interact with the
+page.
+
 ## Acceptance run (two machines)
 
 Put the machines on different networks, for example the Mac on home Wi-Fi and

@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Triad</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font: 15px/1.5 system-ui, sans-serif;
+      --page: #fff;
+      --text: #202124;
+      --muted: #5f636b;
+      --line: #dbdde3;
+      --surface: #f2f3f5;
+      --own: #e8f0ff;
+      --accent: #244ec1;
+      --on-accent: #fff;
+      --error: #a23030;
+      background: var(--page);
+      color: var(--text);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #17181c;
+        --text: #f1f1f3;
+        --muted: #afb1bb;
+        --line: #3d3f49;
+        --surface: #262830;
+        --own: #263553;
+        --accent: #b5c8ff;
+        --on-accent: #121f41;
+        --error: #ffaeae;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 680px; margin: auto; padding: 0 clamp(16px, 5vw, 32px) 24px; }
+    header, .room-header, .actions, .form {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    header, .room-header { justify-content: space-between; flex-wrap: wrap; }
+    header { min-height: 64px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: 1.2rem; font-weight: 650; }
+    h2 { font-size: 1rem; font-weight: 600; }
+    .muted { color: var(--muted); font-size: .875rem; }
+    .actions { flex-wrap: wrap; }
+    button, input, select {
+      font: inherit;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--page);
+      color: var(--text);
+      padding: 6px 10px;
+    }
+    button { white-space: nowrap; cursor: pointer; font-weight: 550; }
+    button:hover:enabled { background: var(--surface); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    button.primary:hover:enabled { opacity: .88; }
+    button:disabled { opacity: .5; cursor: default; }
+    input { flex: 1; min-width: 0; width: 100%; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #empty, #setup { padding: 28px 0 10px; }
+    #join { margin-top: 22px; }
+    label { display: block; margin-bottom: 6px; }
+    .room-header { padding: 14px 0; }
+    #resume { margin: 0 0 10px; }
+    #messages {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      height: clamp(11rem, 51dvh, 33rem);
+      padding: 14px 0;
+      overflow-y: auto;
+      border-block: 1px solid var(--line);
+    }
+    .message {
+      max-width: 88%;
+      align-self: flex-start;
+      border-radius: 10px;
+      background: var(--surface);
+      padding: 7px 11px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .mine { align-self: flex-end; background: var(--own); }
+    .author { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; }
+    #send { padding: 12px 0; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; width: fit-content; }
+    #key { display: block; margin: 8px 0; overflow-wrap: anywhere; }
+    #notice { margin-top: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    #notice:empty { display: none; }
+    #notice[data-error] { color: var(--error); }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Triad</h1>
+    <div class="actions">
+      <select id="users" aria-label="Saved identities" hidden></select>
+      <button id="new">New identity</button>
+    </div>
+  </header>
+  <p id="empty" class="muted">Create an identity to start chatting.</p>
+  <section id="account" aria-label="Chat" hidden>
+    <div id="setup" hidden>
+      <button id="create" class="primary">Create room</button>
+      <form id="join">
+        <label for="invite" class="muted">Room invite</label>
+        <div class="form">
+          <input id="invite" placeholder="triad1-…" autocomplete="off" spellcheck="false" required>
+          <button>Join room</button>
+        </div>
+      </form>
+    </div>
+    <div id="room" hidden>
+      <div class="room-header">
+        <div>
+          <h2 id="room-title">Room</h2>
+          <span id="status" class="muted" role="status"></span>
+        </div>
+        <button id="copy" hidden>Copy invite link</button>
+      </div>
+      <button id="resume" hidden>Reconnect</button>
+      <div id="messages" role="log" aria-label="Chat messages" tabindex="0"></div>
+      <form id="send" class="form">
+        <input id="text" aria-label="Message" placeholder="Write a message…" autocomplete="off" required maxlength="2000">
+        <button id="send-button" class="primary">Send</button>
+      </form>
+    </div>
+    <details id="details" class="muted">
+      <summary>Details</summary>
+      <code id="key"></code>
+      <div id="sharing" hidden>
+        <label for="share-code">Invite code</label>
+        <input id="share-code" readonly>
+      </div>
+    </details>
+  </section>
+  <p id="notice" class="muted" role="status"></p>
+</main>
+<script>
+  const el = id => document.getElementById(id);
+  const savedKey = "triad-demo-users";
+  const activeKey = "triad-demo-active";
+  let users = JSON.parse(localStorage.getItem(savedKey) || "[]");
+  let active = sessionStorage.getItem(activeKey) || users.at(-1)?.Token || "";
+  let busy = false;
+  let messageCount = -1;
+  let joined = false;
+  let audio;
+  let lastError = "";
+  const receivedInvite = new URLSearchParams(location.hash.slice(1)).get("invite");
+  if (receivedInvite) el("invite").value = receivedInvite;
+
+  async function api(path, payload) {
+    const headers = { Authorization: "Bearer " + active };
+    if (payload !== undefined) headers["Content-Type"] = "application/json";
+    const response = await fetch("/api/" + path, {
+      headers,
+      method: payload === undefined ? "GET" : "POST",
+      body: payload === undefined ? undefined : JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.Error);
+    return result;
+  }
+
+  function selectIdentity(token) {
+    active = token;
+    sessionStorage.setItem(activeKey, token);
+    messageCount = -1;
+    joined = false;
+    lastError = "";
+    notice("");
+    el("details").open = false;
+    el("sharing").hidden = true;
+    el("key").textContent = "";
+    el("messages").replaceChildren();
+    el("room").hidden = true;
+    el("setup").hidden = true;
+    el("account").hidden = !token;
+    el("empty").hidden = !!token;
+    el("users").hidden = users.length === 0;
+    el("users").replaceChildren(...users.map(user => new Option(user.Node.slice(0, 12), user.Token)));
+    el("users").value = token;
+  }
+
+  function draw(state) {
+    const hasRoom = !!state.Group;
+    el("key").textContent = "Node ID " + state.Node;
+    el("setup").hidden = hasRoom || state.Running;
+    el("room").hidden = !hasRoom && !state.Running;
+    el("room-title").textContent = hasRoom ? "Room " + state.Group.slice(0, 8) : "Room";
+    const status = ({
+      joined: "Joined",
+      pending: "Waiting for approval",
+      starting: "Connecting",
+      disconnected: "Disconnected",
+      removed: "Removed"
+    })[state.Status] || "";
+    if (el("status").textContent !== status) el("status").textContent = status;
+    el("sharing").hidden = el("copy").hidden = !state.Invite;
+    el("share-code").value = state.Invite;
+    el("resume").hidden = !hasRoom || state.Running;
+    el("send-button").disabled = state.Status !== "joined" || !state.Running;
+    el("text").disabled = el("send-button").disabled;
+    if (state.Error && state.Error !== lastError) {
+      lastError = state.Error;
+      notice(state.Error, true);
+    }
+    const canChime = joined && state.Status === "joined";
+    joined = state.Status === "joined";
+    drawMessages(state.Messages, canChime);
+  }
+
+  function notice(text, isError = false) {
+    el("notice").textContent = text;
+    el("notice").toggleAttribute("data-error", isError);
+  }
+
+  function drawMessages(messages, canChime) {
+    if (messages.length === messageCount) return;
+    const list = el("messages");
+    const reset = messageCount < 0 || messages.length < messageCount;
+    const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 24;
+    if (reset) list.replaceChildren();
+    const added = messages.slice(reset ? 0 : messageCount);
+    messageCount = messages.length;
+    const fragment = document.createDocumentFragment();
+    for (const message of added) {
+      const item = document.createElement("div");
+      item.className = message.Mine ? "message mine" : "message";
+      const author = document.createElement("span");
+      author.className = "author";
+      author.textContent = message.Mine ? "You" : message.Author.slice(0, 8);
+      item.append(author, document.createTextNode(message.Text));
+      fragment.append(item);
+    }
+    list.append(fragment);
+    if (reset || atBottom || added.some(message => message.Mine)) list.scrollTop = list.scrollHeight;
+    if (!reset && canChime && added.some(message => !message.Mine)) chime();
+  }
+
+  function unlockChime() {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!Audio) return;
+    audio ??= new Audio();
+    if (audio.state === "suspended") audio.resume().catch(() => {});
+  }
+
+  function chime() {
+    if (audio?.state !== "running") return;
+    const start = audio.currentTime + 0.01;
+    for (const [frequency, offset] of [[659.25, 0], [880, 0.08]]) {
+      const time = start + offset;
+      const note = audio.createOscillator();
+      const gain = audio.createGain();
+      note.frequency.value = frequency;
+      gain.gain.setValueAtTime(0, time);
+      gain.gain.linearRampToValueAtTime(0.09, time + 0.014);
+      gain.gain.exponentialRampToValueAtTime(0.001, time + 0.16);
+      note.connect(gain).connect(audio.destination);
+      note.start(time);
+      note.stop(time + 0.17);
+    }
+  }
+
+  async function refresh() {
+    if (!active) return;
+    const token = active;
+    const state = await api("state");
+    if (active === token) draw(state);
+  }
+
+  async function action(callback) {
+    if (busy) return;
+    busy = true;
+    try {
+      await callback();
+      await refresh();
+    } catch (error) {
+      notice(error.message, true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  el("new").onclick = () => action(async () => {
+    const user = await api("users", {});
+    users = JSON.parse(localStorage.getItem(savedKey) || "[]");
+    users.push(user);
+    localStorage.setItem(savedKey, JSON.stringify(users));
+    selectIdentity(user.Token);
+  });
+  el("users").onchange = () => action(async () => selectIdentity(el("users").value));
+  el("create").onclick = () => action(() => api("room", { Action: "create" }));
+  el("resume").onclick = () => action(() => api("room", { Action: "resume" }));
+  el("join").onsubmit = event => {
+    event.preventDefault();
+    action(async () => {
+      await api("room", { Action: "join", Invite: el("invite").value });
+      history.replaceState(null, "", location.pathname);
+    });
+  };
+  el("send").onsubmit = event => {
+    event.preventDefault();
+    action(async () => {
+      await api("send", { Text: el("text").value });
+      el("text").value = "";
+    });
+  };
+  el("copy").onclick = async () => {
+    const url = new URL(location.pathname, location.origin);
+    url.hash = new URLSearchParams({ invite: el("share-code").value });
+    try {
+      await navigator.clipboard.writeText(url.href);
+      notice("Invite link copied.");
+    } catch {
+      el("details").open = true;
+      el("share-code").select();
+    }
+  };
+  document.addEventListener("click", unlockChime);
+  document.addEventListener("keydown", unlockChime);
+  selectIdentity(active);
+  action(async () => {});
+  setInterval(() => action(async () => {}), 800);
+</script>
+</body>
+</html>
