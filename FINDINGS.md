@@ -327,6 +327,69 @@ design around:
   depends on the product. It means adding someone exposes the space's past
   messages to them.
 
+## Bots (2026-11-11)
+
+Personal bots and channel-hosted bots, built to
+[HARNESS-PLAN.md](HARNESS-PLAN.md) on top of `628e58b`. The code is in the new
+`crates/triad-agent` (policy, context, brain, tools, MCP) and in
+`crates/triad/src/main.rs` (wiring). Every automated test uses the mock brain
+and fake or fixture tools; none calls a model or a third-party service.
+
+### Milestones
+
+| # | Milestone | Result | Tag | Notes |
+| --- | --- | --- | --- | --- |
+| H0 | Dependency spike | pass | `h0` | rig-core 0.46.0, rmcp 3.9.0; pins held; no aws-lc |
+| H1 | Wire format and display | pass | `h1` | plain bodies keep today's bytes |
+
+### H0: dependencies
+
+- **Versions.** `rig-core` 0.46.0 (the newest on crates.io; the earlier desk
+  research resolved 0.44.0) and `rig-reqwest` 0.46.0, `rmcp` 3.9.0, all
+  pinned exactly. `cargo tree` still shows p2panda 0.8.0, iroh 1.4.1,
+  rusqlite 0.37.0 and one libsqlite3-sys (0.35.0, shared by rusqlite and
+  sqlx-sqlite). No git dependencies.
+- **The plan was wrong about TLS being free.** With their default TLS
+  features, both `rig-core` (`rustls`) and `rmcp` (`reqwest`) turn on
+  reqwest 0.13's `rustls` feature, which selects rustls' **aws-lc-rs**
+  provider and adds `aws-lc-sys`, a C library built with cmake. That is a
+  second crypto provider next to the ring that iroh uses, and a C toolchain
+  dependency for the static VM build. Instead: `rig-core` with no features,
+  `rig-reqwest` with no features, `rmcp` with `reqwest-tls-no-provider`, and
+  reqwest with `rustls-no-provider`. `triad-agent` installs ring as the
+  process's rustls provider before any bot HTTP (reqwest panics on the first
+  client build otherwise, and rmcp builds clients of its own), and hands one
+  `reqwest::Client` to both libraries (`AnthropicConfig::connect`,
+  `StreamableHttpClientTransport::with_client`). `aws-lc-rs` is absent from
+  the tree; `openssl-probe` (pure Rust, already present) is the only
+  OpenSSL-named crate.
+- **Root certificates with no system store.** reqwest's rustls path uses
+  `rustls-platform-verifier`, which on Linux loads the system roots eagerly
+  and fails the client build when there are none. `triad-agent`'s client
+  falls back to the Mozilla roots bundled by `webpki-root-certs`.
+  `tests/no_ca_store.rs` points `SSL_CERT_FILE` and `SSL_CERT_DIR` at an
+  empty directory and checks that the fallback is taken. (rig-reqwest has
+  the same fallback, but only under its `rustls` feature, which brings
+  aws-lc back.) Whether a real HTTPS request succeeds from the static guest
+  is checked in H8.
+- **Binary size.** Adding the crates changes nothing until the binary calls
+  them; the figure is measured once `triad` links the bots (H2 and H7). The
+  static, stripped, size-optimized x86_64 `triad` at `75ba1fc` (as
+  `scripts/vm/build.sh` builds it) is 18,447,256 bytes.
+- `triad-agent` alone pulls 196 crates; `triad` at H0 has 530 (both counted
+  as unique `cargo tree -e normal` lines).
+
+### H1: wire format
+
+`ChatBody` keeps `v: 1` and gains `bot`, `ask` and `ctl`, each skipped when
+empty. `plain_body_keeps_todays_bytes` encodes a plain body next to a copy of
+the old three-field struct and compares bytes;
+`old_build_decodes_a_body_with_bot_fields` decodes a body with every new
+field set into the old struct (serde ignores unknown fields; the old struct
+never used `deny_unknown_fields`). `messages` gains `bot`. The `message`
+event gains `bot` (true only when shown as the channel's bot) and `ask`, and
+`bot_claim: "not accepted"` when a bot flag is not accepted.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

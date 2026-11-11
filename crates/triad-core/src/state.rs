@@ -132,6 +132,8 @@ pub struct StoredMessage {
     /// p2panda operation timestamp (microseconds), once known.
     pub op_ts: Option<u64>,
     pub text: String,
+    /// The author's bot wrote it (as the author claimed; see `bots`).
+    pub bot: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -180,6 +182,9 @@ impl State {
              );",
         )?;
         migrate_single_group(&conn)?;
+        if !has_column(&conn, "messages", "bot")? {
+            conn.execute_batch("ALTER TABLE messages ADD COLUMN bot INTEGER NOT NULL DEFAULT 0;")?;
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_topic ON messages (topic);
              CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);",
@@ -291,8 +296,8 @@ impl State {
         let tx = self.conn.transaction()?;
         if let Some(m) = message {
             tx.execute(
-                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, bot)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     m.op_hash.as_slice(),
                     m.author.as_slice(),
@@ -300,6 +305,7 @@ impl State {
                     m.op_ts.map(|t| t as i64),
                     m.text,
                     topic.as_slice(),
+                    m.bot,
                 ],
             )?;
         }
@@ -332,7 +338,7 @@ impl State {
     /// `limit` messages.
     pub fn history(&self, topic: &[u8; 32], limit: Option<usize>) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT op_hash, author, sent_at_ms, op_ts, text FROM messages
+            "SELECT op_hash, author, sent_at_ms, op_ts, text, bot FROM messages
              WHERE topic = ?1
              ORDER BY COALESCE(op_ts, sent_at_ms * 1000) ASC, op_hash ASC",
         )?;
@@ -343,17 +349,19 @@ impl State {
                 r.get::<_, i64>(2)?,
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (h, a, sent, ts, text) = row?;
+            let (h, a, sent, ts, text, bot) = row?;
             out.push(StoredMessage {
                 op_hash: to_32(&h)?,
                 author: to_32(&a)?,
                 sent_at_ms: sent as u64,
                 op_ts: ts.map(|t| t as u64),
                 text,
+                bot,
             });
         }
         if let Some(limit) = limit
@@ -388,21 +396,22 @@ impl State {
 /// Moves a database written when a data directory held exactly one group
 /// (a single `meta` row, no `topic` columns) to the multi-group layout. The
 /// old group becomes the channel `main`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 fn migrate_single_group(conn: &Connection) -> Result<()> {
-    let has_column = |table: &str, column: &str| -> Result<bool> {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-            params![table, column],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    };
     for table in ["processed_ops", "messages"] {
-        if !has_column(table, "topic")? {
+        if !has_column(conn, table, "topic")? {
             conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN topic BLOB;"))?;
         }
     }
-    if !has_column("meta", "topic")? {
+    if !has_column(conn, "meta", "topic")? {
         return Ok(());
     }
     conn.execute_batch(
@@ -452,6 +461,7 @@ mod tests {
             sent_at_ms: 1,
             op_ts: Some(ts),
             text: text.into(),
+            bot: hash.is_multiple_of(2),
         }
     }
 
@@ -518,6 +528,13 @@ mod tests {
             h.into_iter().map(|m| m.text).collect()
         };
         assert_eq!(texts(&a), ["first", "second"]);
+        let bots: Vec<bool> = state
+            .history(&a, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.bot)
+            .collect();
+        assert_eq!(bots, [false, true]);
         assert_eq!(texts(&b), ["elsewhere"]);
         assert_eq!(state.history(&a, Some(1)).unwrap()[0].text, "second");
         assert_eq!(state.outcome(&[3; 32]).unwrap(), Some(Outcome::Skipped));

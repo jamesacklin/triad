@@ -280,10 +280,11 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 lines.drain(..lines.len() - limit);
             }
             for (_, name, m) in lines {
-                let who = if m.author == me {
-                    "me".into()
-                } else {
-                    short_id(&m.author)
+                let who = match (m.author == me, m.bot) {
+                    (true, false) => "me".into(),
+                    (true, true) => "my bot".into(),
+                    (false, false) => short_id(&m.author),
+                    (false, true) => format!("{} (bot)", short_id(&m.author)),
                 };
                 if channel.is_some() {
                     println!("{}: {}", who, m.text);
@@ -433,6 +434,15 @@ fn parse_node(text: &str) -> Result<NodeId> {
     bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
+}
+
+/// Whether a typed line addresses the channel's bot: `@bot` as a word
+/// anywhere in it. Only the sender's client reads the text; bots read `ask`.
+fn addresses_bot(text: &str) -> bool {
+    text.split_whitespace().any(|w| {
+        w.trim_matches(|c: char| !c.is_alphanumeric() && c != '@')
+            .eq_ignore_ascii_case("@bot")
+    })
 }
 
 fn access_name(a: AccessLevel) -> &'static str {
@@ -1028,11 +1038,26 @@ impl Session {
             ));
             return Ok(());
         };
-        let body = ChatBody::new(text, now_ms())?;
+        let ask = addresses_bot(text);
+        if ask && !self.has_bot(&topic) {
+            bail!("#{} has no bot", channel.meta.name);
+        }
+        let body = ChatBody::new(text, now_ms())?.asking(ask);
         // The plaintext is stored when our own operation comes back through
         // the stream; spaces do not return its hash here.
         space.publish(body).await?;
         Ok(())
+    }
+
+    /// Whether the channel has a bot that `@bot` can address.
+    fn has_bot(&self, _topic: &Topic) -> bool {
+        false
+    }
+
+    /// Whether a message claiming to come from a bot is shown as the
+    /// channel's bot: only when its author is the channel's accepted host.
+    fn bot_accepted(&self, _topic: &Topic, _author: &NodeId) -> bool {
+        false
     }
 
     async fn add(&mut self, topic: Topic, member: NodeId) -> Result<()> {
@@ -1104,6 +1129,21 @@ impl Session {
         }
     }
 
+    /// Who a message is shown as: `me`, a short node ID, `my bot:` in the
+    /// DM, `bot` in a channel, or a note that a bot claim was not accepted.
+    fn label(&self, _topic: &Topic, author: &NodeId, claimed: bool, accepted: bool) -> String {
+        let who = if *author == self.me {
+            "me".to_string()
+        } else {
+            short_id(author)
+        };
+        match (claimed, accepted) {
+            (true, true) => "bot".to_string(),
+            (true, false) => format!("{who} (bot claim not accepted)"),
+            _ => who,
+        }
+    }
+
     /// Whether this node may add members to the channel (`Manage` access).
     async fn can_manage(&self, topic: &Topic) -> bool {
         let Some(space) = self.channels.get(topic).and_then(|c| c.space.as_ref()) else {
@@ -1134,17 +1174,22 @@ impl Session {
                     sent_at_ms: body.sent_at_ms,
                     op_ts: Some(operation.timestamp()),
                     text: body.text.clone(),
+                    bot: body.bot,
                 };
                 self.state
                     .record(&topic, &hash, Outcome::Ok, None, Some(&msg))?;
                 let mine = author == self.me;
-                let who = if mine { "me".into() } else { short_id(&author) };
-                self.printer.emit(
-                    json!({"event": "message", "channel": name, "author": hex_id(&author),
-                           "text": body.text, "op": hex::encode(hash), "mine": mine,
-                           "ts": operation.timestamp() / 1000}),
-                    || format!("[#{name}] {who}: {}", body.text),
-                );
+                let shown_as_bot = body.bot && self.bot_accepted(&topic, &author);
+                let who = self.label(&topic, &author, body.bot, shown_as_bot);
+                let mut value = json!({"event": "message", "channel": name, "author": hex_id(&author),
+                       "text": body.text, "op": hex::encode(hash), "mine": mine,
+                       "ts": operation.timestamp() / 1000,
+                       "bot": shown_as_bot, "ask": body.ask});
+                if body.bot && !shown_as_bot {
+                    value["bot_claim"] = json!("not accepted");
+                }
+                self.printer
+                    .emit(value, || format!("[#{name}] {who}: {}", body.text));
                 operation.ack().await?;
             }
             StreamEvent::Member(vk) => {
@@ -1234,5 +1279,20 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_bot_is_a_word_anywhere() {
+        assert!(addresses_bot("@bot add this"));
+        assert!(addresses_bot("hey @bot, add this"));
+        assert!(addresses_bot("add this @Bot"));
+        assert!(!addresses_bot("email bot@example.com"));
+        assert!(!addresses_bot("@bottle"));
+        assert!(!addresses_bot("no address"));
     }
 }
