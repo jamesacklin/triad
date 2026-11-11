@@ -33,7 +33,7 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | 2 | p2panda stream, no encryption | pass | `m2` | 10 each way in order; after kill -9 and 5 missed messages the restart receives exactly 5; no duplicates. All payload sizes up to 64 KB arrive. |
 | 3 | MLS in memory | pass | `m3` | 7 unit tests in `mls.rs`: create, KeyPackage, add, Welcome, join, 10 messages each way, reopen `mls.sqlite` mid-conversation, KeyPackage kept across restart, 3 members with a commit and a late epoch-1 message. |
 | 4 | Integration | pass | `m4` | `two_node.rs` passes with encryption on; `triad inspect --grep` exits 0 on both data directories for every probed message; 23 unit tests in `group.rs` cover every acceptance-rule row. |
-| 5 | Two machines | handed over | — | No SSH access to a Mac from this session. README install steps verified from a fresh clone on Linux. |
+| 5 | Two machines | handed over | — | No SSH access to a Mac from this session. README install steps verified from a fresh clone on Linux (clone, `cargo install --locked`, `triad whoami` with an empty HOME). |
 | 6 | Stretch: p2panda spaces | not started | — | Comes after 5. |
 | 7 | Stretch: three members | not started as a milestone | — | `mls.rs` already tests 3 members, a Commit and `max_past_epochs` without the network. |
 
@@ -42,7 +42,8 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | Measurement | Value | How |
 | --- | --- | --- |
 | Clean release build, M0 (empty main) | 1 min 30 s wall, 1.7 GB peak RSS | `/usr/bin/time -v cargo build --release`, 16 threads |
-| Clean install from a fresh clone, M4 | see "Fresh-clone install" below | `cargo install --path crates/triad-cli --locked` into an empty target dir |
+| Clean install from a fresh clone, M4 | 1 min 44 s wall, 1.8 GB peak RSS | `cargo install --path crates/triad-cli --locked`, empty target dir, 16 threads |
+| Release binary size | 52 MB (52,277,192 bytes), unstripped, Linux x86_64 | `ls -l` of the installed `triad` |
 | Probe, same machine | direct path, connect 23 ms, echo RTT 1.3 ms, QUIC path RTT 2.1 ms | `triad probe listen` / `connect` |
 | Join latency, same machine, no MLS (M2) | 0.13 s | `two_node.rs`, 3 runs: 0.125–0.128 s; "joined" was immediate in M2 |
 | Join latency, same machine, MLS (M4) | 2.4 s from `join` start to `joined` | `two_node.rs` and `cross-test.sh local`; KeyPackage and Welcome each travel by sync |
