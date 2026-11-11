@@ -26,6 +26,7 @@ openmls_sqlite_storage 0.3.0, rusqlite 0.37.0, libsqlite3-sys 0.35.0
 | 0 | Compatibility spike | pass | `m0` | One iroh (1.4.1) and one libsqlite3-sys (0.35.0) in `cargo tree`. |
 | 1 | iroh probe | pass (one machine) | `m1` | Direct path, 23 ms connect, 1.3 ms echo RTT. Cross-machine run pending (needs machine B). |
 | 2 | p2panda stream, no encryption | pass | `m2` | 10 each way in order; kill -9, 5 missed, restart receives exactly 5; no duplicates. |
+| 3 | MLS in memory | pass | `m3` | 7 unit tests in `mls.rs`: create, KeyPackage, add, Welcome, join, 10 messages each way, reopen `mls.sqlite` mid-conversation, KeyPackage kept across restart, 3 members with a commit and a late epoch-1 message. |
 
 ## Measurements
 
