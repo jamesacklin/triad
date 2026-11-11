@@ -22,8 +22,8 @@ use support::*;
 const BIN: &str = env!("CARGO_BIN_EXE_triad");
 
 const SCRIPT: &str = "\
-cal => call calendar.create_event {\"title\": \"hedge trimming\"} => Added ({result})
-lin => call linear.create_issue {\"title\": \"fence\"} => Filed ({result})
+cal => call calendar.create_event {\"title\": \"hedge trimming\"} => Added ({result}) for: {ask}
+lin => call linear.create_issue {\"title\": \"fence\"} => Filed ({result}) for: {ask}
 ";
 
 fn bot_reply(v: &Value) -> Option<String> {
@@ -49,6 +49,13 @@ fn turns(log: &Path) -> Vec<Value> {
 }
 
 /// Sends an ask and returns the bot's reply as seen by the asker.
+/// A reply to `ask`: the script tags allowed calls with the ask; a refusal
+/// is the only other reply an asker gets, and only to its own ask (other
+/// members' asks are all answered before an asker is refused).
+fn is_reply_to(v: &Value, ask: &str) -> bool {
+    bot_reply(v).is_some_and(|r| r.ends_with(&format!("for: {ask}")) || r.starts_with("I can't"))
+}
+
 fn ask(p: &mut Proc, text: &str) -> String {
     p.send(text);
     let op = p.wait_for("own ask", |v| own_text(v).as_deref() == Some(text))["op"]
@@ -56,7 +63,7 @@ fn ask(p: &mut Proc, text: &str) -> String {
         .unwrap()
         .to_string();
     let _ = op;
-    let v = p.wait_for(&format!("reply to {text:?}"), |v| bot_reply(v).is_some());
+    let v = p.wait_for(&format!("reply to {text:?}"), |v| is_reply_to(v, text));
     bot_reply(&v).unwrap()
 }
 
@@ -72,7 +79,7 @@ fn ask_at(p: &mut Proc, text: &str) -> Asked {
     let ts_ms = p.wait_for("own ask", |v| own_text(v).as_deref() == Some(text))["ts"]
         .as_u64()
         .unwrap();
-    let v = p.wait_for(&format!("reply to {text:?}"), |v| bot_reply(v).is_some());
+    let v = p.wait_for(&format!("reply to {text:?}"), |v| is_reply_to(v, text));
     Asked {
         reply: bot_reply(&v).unwrap(),
         ts_ms,
@@ -268,15 +275,18 @@ fn run(backend: Backend) {
     }
 
     // The host and the admin reach the tool.
-    assert_eq!(ask(&mut a, "@bot cal from a"), "Added (ok)");
+    assert_eq!(
+        ask(&mut a, "@bot cal from a"),
+        "Added (ok) for: @bot cal from a"
+    );
     assert_eq!(calls(&tools.log).len(), 1);
     let asked = ask_at(&mut b, "@bot cal from b");
-    assert_eq!(asked.reply, "Added (ok)");
+    assert_eq!(asked.reply, "Added (ok) for: @bot cal from b");
     assert_eq!(calls(&tools.log).len(), 2);
     // From B's @bot to the reply on C's screen, split into the parts A's
     // job reports. All three processes share one clock.
     let seen_on_c = c.wait_for("reply on C", |v| {
-        bot_reply(v).as_deref() == Some("Added (ok)")
+        bot_reply(v).as_deref() == Some("Added (ok) for: @bot cal from b")
     });
     let seen_on_c_ms = now_ms();
     let done = a.wait_for("job done", |v| {
@@ -322,7 +332,10 @@ fn run(backend: Backend) {
     // A grant lets C use exactly that tool.
     a.send(&format!("/grant {} calendar.create_event", &node_c[..8]));
     a.wait_for("granted", |v| is_event(v, "granted"));
-    assert_eq!(ask(&mut c, "@bot cal again from c"), "Added (ok)");
+    assert_eq!(
+        ask(&mut c, "@bot cal again from c"),
+        "Added (ok) for: @bot cal again from c"
+    );
     assert_eq!(calls(&tools.log).len(), 3);
     let t = turns(&mock_log);
     let granted_turn = t

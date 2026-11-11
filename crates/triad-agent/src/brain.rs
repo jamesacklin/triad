@@ -84,7 +84,8 @@ fn parse_script(text: &str) -> Result<Vec<Rule>> {
 }
 
 /// The mock brain. With no script it replies `echo: <asker's text>`. A
-/// scripted call goes through the real gate. Every turn's full input,
+/// scripted reply may use `{result}` (the tool's result) and `{ask}` (the
+/// asker's text). A scripted call goes through the real gate. Every turn's full input,
 /// including the offered tools, is appended to the log as one JSON line.
 pub struct MockBrain {
     rules: Vec<Rule>,
@@ -142,13 +143,15 @@ impl Brain for MockBrain {
                 None => format!("echo: {}", input.ask),
                 Some(Rule {
                     call: None, reply, ..
-                }) => reply.clone(),
+                }) => reply.replace("{ask}", &input.ask),
                 Some(Rule {
                     call: Some((tool, args)),
                     reply,
                     ..
                 }) => match tools.call(tool, args.clone()).await {
-                    Ok(result) => reply.replace("{result}", &result),
+                    Ok(result) => reply
+                        .replace("{result}", &result)
+                        .replace("{ask}", &input.ask),
                     Err(e) => format!("tool error: {e}"),
                 },
             };
@@ -195,12 +198,23 @@ impl AnthropicBrain {
     /// is never written anywhere.
     pub fn from_env(model: &str, http: reqwest::Client) -> Result<Self> {
         let config = AnthropicConfig::from_env().map_err(|e| anyhow!("{e}"))?;
+        Ok(Self::with_config(config, model, http))
+    }
+
+    /// An explicit key and base URL, for tests against a local stand-in for
+    /// the Messages API.
+    pub fn with_key(key: &str, base_url: &str, model: &str, http: reqwest::Client) -> Self {
+        let config = AnthropicConfig::new(key.to_string()).with_base_url(base_url);
+        Self::with_config(config, model, http)
+    }
+
+    fn with_config(config: AnthropicConfig, model: &str, http: reqwest::Client) -> Self {
         let client = config.connect(rig_reqwest::ReqwestClient::from(http));
-        Ok(AnthropicBrain {
+        AnthropicBrain {
             model: client.completion(model),
             model_name: model.to_string(),
             max_tokens: 1024,
-        })
+        }
     }
 
     fn transcript(input: &TurnInput) -> String {
