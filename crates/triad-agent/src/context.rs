@@ -226,10 +226,17 @@ fn system_prompt(turn: &Turn) -> String {
             }
         }
     }
-    s.push_str(
-        "Keep replies short: one chat message of at most 1500 characters, plain text. \
-         Longer replies are cut off.\n",
-    );
+    match turn.kind {
+        Kind::Channel => s.push_str(
+            "Keep replies short: one chat message of at most 1500 characters, plain text. \
+             Longer replies are cut off.\n",
+        ),
+        Kind::Dm => s.push_str(
+            "Reply in plain text. Keep chat replies short, but when the user asks for \
+             something long (a summary, a plan, a draft) you may write up to about 15000 \
+             characters. Longer replies are cut off.\n",
+        ),
+    }
     if let Some(p) = turn.persona {
         s.push_str("\nThe host's instructions for you:\n");
         s.push_str(p);

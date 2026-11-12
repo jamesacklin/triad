@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
+use triad_core::envelope::{MAX_DM_TEXT_BYTES, MAX_TEXT_BYTES, truncate_text};
 
 use crate::brain::{Brain, MockBrain, ModelBrain, TurnOutput};
 use crate::context::TurnInput;
@@ -309,6 +309,7 @@ impl AgentConfig {
             channel_per_day: env_num("TRIAD_AGENT_CHANNEL_PER_DAY", d.channel_per_day)?,
             channel_per_minute: env_num("TRIAD_AGENT_BURST_PER_MINUTE", d.channel_per_minute)?,
             max_steps: env_num("TRIAD_AGENT_MAX_STEPS", d.max_steps as u64)? as usize,
+            dm_max_steps: env_num("TRIAD_AGENT_DM_MAX_STEPS", d.dm_max_steps as u64)? as usize,
         };
         let persona = env("TRIAD_AGENT_PERSONA")
             .map(PathBuf::from)
@@ -455,8 +456,8 @@ impl Agent {
             None => None,
         };
         let all_tools = tools.list();
-        if config.limits.max_steps == 0 {
-            bail!("TRIAD_AGENT_MAX_STEPS must be at least 1");
+        if config.limits.max_steps == 0 || config.limits.dm_max_steps == 0 {
+            bail!("TRIAD_AGENT_MAX_STEPS and TRIAD_AGENT_DM_MAX_STEPS must be at least 1");
         }
         Ok(Agent {
             brain,
@@ -510,7 +511,8 @@ impl Agent {
 /// What a turn sends back to the event loop.
 #[derive(Clone, Debug, Default)]
 pub struct TurnResult {
-    /// The reply, at most `MAX_TEXT_BYTES`.
+    /// The reply: at most `MAX_TEXT_BYTES` in a channel, `MAX_DM_TEXT_BYTES`
+    /// in the DM.
     pub text: String,
     /// Tools the gate refused.
     pub denied: Vec<String>,
@@ -544,7 +546,7 @@ pub async fn run_turn(
         agent.tools.as_ref(),
         CallContext::of(input),
         allowed,
-        agent.limits.max_steps,
+        agent.limits.steps(input.kind),
         audit,
     );
     let output = agent.brain.turn(input, &gate).await?;
@@ -574,11 +576,19 @@ pub async fn run_turn(
         text
     };
     Ok(TurnResult {
-        text: truncate_text(&text, MAX_TEXT_BYTES),
+        text: truncate_text(&text, max_reply_bytes(input.kind)),
         denied,
         tool_time: gate.tool_time(),
         output,
     })
+}
+
+/// The longest reply a turn of `kind` sends; the rest is cut.
+pub fn max_reply_bytes(kind: context::Kind) -> usize {
+    match kind {
+        context::Kind::Dm => MAX_DM_TEXT_BYTES,
+        context::Kind::Channel => MAX_TEXT_BYTES,
+    }
 }
 
 /// Whether a tool was offered to the asker.
@@ -603,14 +613,14 @@ mod tests {
             all_tools: Vec::new(),
             warnings: Vec::new(),
         };
-        let input = TurnInput {
-            kind: Kind::Dm,
+        let mut input = TurnInput {
+            kind: Kind::Channel,
             channel: "agent".into(),
             system: String::new(),
             transcript: Vec::new(),
             asker: "a".into(),
             asker_tier: "host".into(),
-            ask: "é".repeat(1100),
+            ask: "é".repeat(8100),
             tools: Vec::new(),
             unavailable: Vec::new(),
             host: "a".into(),
@@ -619,6 +629,19 @@ mod tests {
             .await
             .unwrap();
         assert!(r.text.len() <= MAX_TEXT_BYTES, "{}", r.text.len());
+        assert!(r.text.ends_with('…'));
+        // The DM's replies go as long messages, with a higher limit.
+        input.kind = Kind::Dm;
+        input.ask = "é".repeat(2000);
+        let r = run_turn(&agent, ToolSet::All, &crate::tools::NoAudit, &input)
+            .await
+            .unwrap();
+        assert_eq!(r.text, format!("echo: {}", input.ask));
+        input.ask = "é".repeat(8100);
+        let r = run_turn(&agent, ToolSet::All, &crate::tools::NoAudit, &input)
+            .await
+            .unwrap();
+        assert!(r.text.len() <= MAX_DM_TEXT_BYTES && r.text.len() > MAX_TEXT_BYTES);
         assert!(r.text.ends_with('…'));
     }
 

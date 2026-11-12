@@ -700,7 +700,8 @@ impl Session {
         match result {
             Ok(turn) => {
                 let published = async {
-                    let body = ChatBody::new(&turn.text, now_ms())?.from_bot();
+                    let body = ChatBody::new_up_to(&turn.text, now_ms(), self.max_text(&topic))?
+                        .from_bot();
                     self.publish_chat(topic, body).await?;
                     anyhow::Ok(())
                 }

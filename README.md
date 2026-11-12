@@ -271,6 +271,12 @@ Memories and schedules are rows in `state.sqlite` (encrypted with it under
 SQLCipher). Channel turns are never offered these tools and never see a
 memory, and a channel is not told they exist.
 
+In the DM the bot also has more room: replies up to 16,000 bytes (sent as
+long messages, since only you read the DM), up to 4,096 output tokens per
+model request and 24 tool calls per turn (`TRIAD_AGENT_DM_MAX_STEPS`). A
+channel's bot keeps one message of 2,000 bytes, 1,024 tokens and 8 tool
+calls (`TRIAD_AGENT_MAX_STEPS`).
+
 **Skills** are standing instructions you write as `skills/<name>.md` in
 the data directory (`<name>` is letters, digits, `-` and `_`). When the bots
 start, every turn's system prompt lists each skill with a one-line summary

@@ -118,8 +118,21 @@ pub struct Limits {
     pub channel_per_day: u64,
     /// Answers per channel per minute.
     pub channel_per_minute: u64,
-    /// Tool calls per turn.
+    /// Tool calls per channel turn.
     pub max_steps: usize,
+    /// Tool calls per turn in the personal bot's DM, which may do longer
+    /// work for its one user.
+    pub dm_max_steps: usize,
+}
+
+impl Limits {
+    /// Tool calls a turn of `kind` may make.
+    pub fn steps(&self, kind: crate::context::Kind) -> usize {
+        match kind {
+            crate::context::Kind::Dm => self.dm_max_steps,
+            crate::context::Kind::Channel => self.max_steps,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -130,6 +143,7 @@ impl Default for Limits {
             channel_per_day: 100,
             channel_per_minute: 6,
             max_steps: 8,
+            dm_max_steps: 24,
         }
     }
 }

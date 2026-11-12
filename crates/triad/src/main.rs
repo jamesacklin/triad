@@ -1536,7 +1536,7 @@ impl Session {
     async fn publish_chat(&self, topic: Topic, body: ChatBody) -> Result<()> {
         let space = self.joined_space(&topic)?;
         let body = if body.text.len() > SEND_TEXT_BYTES {
-            let (long, payload) = long::seal(&body.text)?;
+            let (long, payload) = long::seal_up_to(&body.text, self.max_text(&topic))?;
             self.long_pubs
                 .get(&topic)
                 .context("no long-message stream for this channel")?
@@ -1548,6 +1548,16 @@ impl Session {
         };
         space.publish(RoomEvent::Chat(body)).await?;
         Ok(())
+    }
+
+    /// The longest text a message in `topic` may have: more in the bot's
+    /// DM, which only this node reads.
+    fn max_text(&self, topic: &Topic) -> usize {
+        if self.is_dm(topic) {
+            triad_core::envelope::MAX_DM_TEXT_BYTES
+        } else {
+            triad_core::envelope::MAX_TEXT_BYTES
+        }
     }
 
     async fn publish_nickname(&self, topic: Topic) -> Result<()> {
@@ -1742,7 +1752,7 @@ impl Session {
             .long
             .as_ref()
             .context("not a long message")
-            .and_then(|r| long::open(r, ciphertext));
+            .and_then(|r| long::open_up_to(r, ciphertext, self.max_text(&topic)));
         match opened {
             Ok(text) => {
                 self.on_chat(topic, hash, author, op_ts, body.with_text(text), streams)
@@ -1781,7 +1791,12 @@ impl Session {
         // Anyone who knows the topic can publish here; the hash in a
         // member's space message decides what is read. Oversized bodies are
         // not stored.
-        if ct.len() <= long::MAX_CIPHERTEXT_BYTES {
+        let max = if self.is_dm(&topic) {
+            long::MAX_DM_CIPHERTEXT_BYTES
+        } else {
+            long::MAX_CIPHERTEXT_BYTES
+        };
+        if ct.len() <= max {
             let hash = long::hash_of(ct);
             self.state.put_long_body(&topic, &hash, ct)?;
             for w in self.state.take_waiting(&hash)? {

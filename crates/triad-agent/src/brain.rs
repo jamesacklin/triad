@@ -187,7 +187,23 @@ use rig_core::providers::registry::{ConnectOptions, ProviderId};
 pub struct ModelBrain {
     model: DynModel<Completion>,
     provider: String,
-    max_tokens: u64,
+}
+
+/// Most output tokens per model request: a channel reply is one short
+/// message; a DM reply may be a long one.
+fn max_tokens(kind: Kind) -> u64 {
+    match kind {
+        Kind::Channel => 1024,
+        Kind::Dm => 4096,
+    }
+}
+
+/// Most model requests per turn.
+fn max_rounds(kind: Kind) -> usize {
+    match kind {
+        Kind::Channel => 16,
+        Kind::Dm => 32,
+    }
 }
 
 /// The name a tool is sent to the model under.
@@ -300,7 +316,6 @@ impl ModelBrain {
         Ok(ModelBrain {
             model,
             provider: reference.to_string(),
-            max_tokens: 1024,
         })
     }
 
@@ -361,14 +376,14 @@ impl Brain for ModelBrain {
             let mut out = TurnOutput::default();
             // Each round is one model request; a round that calls no tool
             // ends the turn. The gate enforces the step limit on calls.
-            for _ in 0..16 {
+            for _ in 0..max_rounds(input.kind) {
                 let mut prompt = history.clone();
                 let last = prompt.pop().expect("history is never empty");
                 let request = CompletionRequest::new(last)
                     .messages(prompt)
                     .preamble(input.system.clone())
                     .tools(defs.clone())
-                    .max_tokens(self.max_tokens);
+                    .max_tokens(max_tokens(input.kind));
                 let started = Instant::now();
                 let response = self
                     .model

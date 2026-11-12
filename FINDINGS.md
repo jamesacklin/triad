@@ -1088,7 +1088,9 @@ on branch `james/rig-tools-assistant-3773ad`.
 | A1 | Context and scope | `89538e2` | `tools::tests::a_dm_only_tool_stays_in_the_dm` passes; no existing assertion changed |
 | A2 | Memory | `08d950a` | `bots_memory.rs` and the extended `bots_isolation.rs` pass; FTS5 checked in both SQLite builds |
 | A3 | Schedules | `0d6acae` | `bots_schedules.rs` passes: one fire and one reply, none repeated after SIGKILL, overdue rules, interval advance |
-| A4 | Skills | `A4` | `context` prompt tests and `bots_skills.rs` pass; no existing assertion changed |
+| A4 | Skills | `c42146b` | `context` prompt tests and `bots_skills.rs` pass; no existing assertion changed |
+| A5 | Room to answer | `A5` | `bots_long_reply.rs` passes: 5,000 bytes whole in `#agent`, cut in a channel |
+| A6 | Upkeep (stretch) | — | Not built: its pass condition is a by-hand run on a real model, and no model key was available to this session |
 
 ### A0: stage 1
 
@@ -1227,6 +1229,75 @@ at least one skill. Offering it with nothing to read would have added a
 `skills` server to every channel's `BotOn` announcement and changed the
 `bots_tools.rs` assertions for no use. The cost is that a skill added while
 the session runs needs a restart, as `mcp.json` already does.
+
+### A5: room to answer
+
+**The plan was wrong here.** It says to send a long DM reply "as a long
+message (`triad-core/src/long.rs`) instead of cutting it", and its test wants
+5,000 bytes whole, but long messages were capped at `MAX_TEXT_BYTES`
+(2,000) in `long::seal`, `long::open` and the plain-stream ciphertext check.
+The fix that keeps every channel exactly as before: a separate
+`MAX_DM_TEXT_BYTES` (16,000) in `envelope.rs`, with `ChatBody::new_up_to`,
+`long::seal_up_to` and `long::open_up_to`. `Session::max_text(topic)` gives
+16,000 only for the one-member DM, which only this node reads, so no other
+build ever has to accept the larger size; typed messages keep 2,000
+everywhere (`ChatBody::new`, unchanged, so `message_sizes.rs` is unchanged),
+and channel messages and their ciphertext keep the old limits. A 16,016-byte
+operation body on the plain stream went through p2panda 0.8 without trouble
+(the 512-byte limit is on headers only).
+
+In the DM only: replies are cut at 16,000 bytes instead of 2,000; a model
+request may produce 4,096 output tokens instead of 1,024; a turn may make 24
+tool calls (`Limits::dm_max_steps`, `TRIAD_AGENT_DM_MAX_STEPS`) and 32 model
+requests instead of 8 and 16; the prompt allows up to about 15,000
+characters when asked for something long. Channel turns are unchanged.
+
+Changed assertion: `lib.rs`'s `replies_are_cut_to_what_spaces_can_carry`
+used a DM turn to show a reply is cut to 2,000 bytes. That is now the
+channel's rule, so the test runs it as a channel turn and adds the DM case
+(4,006 bytes whole; 16,200 cut to at most 16,000).
+
+### Answers to the plan's questions
+
+- **Does a real model save and recall without being told to in each
+  message?** Not run: no model key in this session's environment (the only
+  key on the machine is in the user's own data directory, which this
+  session did not use). The DM prompt tells the model to save lasting facts
+  unasked and to search before saying it does not know; whether models do
+  needs the by-hand run.
+- **Did a fetched page or a search result ever cause a save or a
+  schedule?** Not run on a real model, for the same reason, and A0's
+  search-and-fetch check was not run for lack of a Brave key. What is in
+  place: web results are wrapped as data, and the DM prompt says only the
+  user's own message may cause a save or a schedule. The H7-style test (a
+  planted instruction in a fetched page) is still to do.
+- **How late does a schedule fire, and what happens across a restart?**
+  874–977 ms late in `bots_schedules.rs` (a one-second tick). A fire is
+  recorded before its line is posted: SIGKILL just after left no second
+  fire (that fire was lost). Across downtime, a one-shot less than a day
+  late fires once on start, one more than a day late is dropped with a
+  notice, and a recurring one fires once and jumps forward by whole
+  intervals. Nothing fires while the session is down.
+- **What do pinned memories add to each DM turn in tokens?** Not measured
+  with a model's tokenizer. In bytes: the heading is 104, each note adds its
+  text plus 3, and the notes are capped at 2,000, so at most about 2,200
+  bytes, roughly 550 tokens at four bytes a token. Whenever memory and
+  schedule tools are offered, the DM prompt also gains 557 bytes of fixed
+  instructions (about 140 tokens), and the six tool definitions are sent
+  with every request.
+
+### Proposed follow-ups
+
+- **The by-hand runs:** A0 (a Brave key and a real model: one question
+  needing a search and a fetch, with latency and tokens), the two
+  real-model questions above, and an injection test with a planted
+  instruction to save a memory or add a schedule.
+- **A6, upkeep:** a built-in nightly schedule, off unless `agent.json` has
+  `"upkeep": true`, asking the bot to merge duplicate memories and unpin
+  stale ones. It needs a real model to judge, so it was left out.
+- **Skills without a restart:** read `skills/` per turn, or watch it.
+- **Daylight saving:** `utc_offset_minutes` is fixed; a user in a zone with
+  DST must change it twice a year.
 
 ## Agent harness options (2026-11-11)
 
