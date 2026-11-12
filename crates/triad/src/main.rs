@@ -28,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use p2panda::node::AckPolicy;
 use p2panda::spaces::{PendingSpace, Space, SpaceSubscription};
-use p2panda::streams::StreamEvent;
+use p2panda::streams::{StreamEvent, StreamPublisher, StreamSubscription};
 use p2panda::{AccessLevel, Hash, Node, RelayUrl, VerifyingKey};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -40,9 +40,10 @@ use triad_core::envelope::{
     ChatBody, Invite, ProfileUpdate, RoomEvent, SEND_TEXT_BYTES, normalize_nickname,
 };
 use triad_core::identity::{Identity, NodeId, hex_id, short_id};
+use triad_core::long::{self, LongBody};
 use triad_core::net::{DEFAULT_RELAY, P2PANDA_FILE};
 use triad_core::state::{
-    JoinStatus, Meta, Outcome, Role, State, StoredMessage, channel_name, now_ms,
+    JoinStatus, Meta, Outcome, Role, State, StoredMessage, WaitingLong, channel_name, now_ms,
 };
 
 #[derive(Parser)]
@@ -544,6 +545,9 @@ struct Streams {
     jobs: JoinSet<bots::JobDone>,
     /// Display lines from bot turns (tool calls).
     bot_events: mpsc::UnboundedReceiver<bots::BotEvent>,
+    /// Long-message ciphertext, one plain stream per space, keyed by the
+    /// space's topic.
+    longs: StreamMap<Topic, StreamSubscription<LongBody>>,
 }
 
 impl Streams {
@@ -626,12 +630,15 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
         },
         opts,
         asks: VecDeque::new(),
+        long_pubs: BTreeMap::new(),
+        held_long: None,
     };
     let mut streams = Streams {
         subs: StreamMap::new(),
         joining: JoinSet::new(),
         jobs: JoinSet::new(),
         bot_events: bot_events_rx,
+        longs: StreamMap::new(),
     };
     let first = groups.first().map(|g| g.topic);
     for meta in groups {
@@ -701,6 +708,10 @@ struct Session {
     bots: Option<bots::Bots>,
     /// Where bot turns send display lines.
     bot_events: mpsc::UnboundedSender<bots::BotEvent>,
+    /// Publishers for long-message ciphertext, by space topic.
+    long_pubs: BTreeMap<Topic, StreamPublisher<LongBody>>,
+    /// Test hook `/debug-long-hold`: ciphertext not yet published.
+    held_long: Option<(Topic, LongBody)>,
 }
 
 fn spawn_stdin() -> mpsc::Receiver<String> {
@@ -752,6 +763,19 @@ impl Session {
             .with_context(|| format!("not a member of #{} yet", channel.meta.name))
     }
 
+    /// Subscribes to the plain stream that carries a space's long-message
+    /// ciphertext ([`triad_core::long`]).
+    async fn open_long(&mut self, topic: Topic, streams: &mut Streams) -> Result<()> {
+        let (publisher, rx) = self
+            .node
+            .stream::<LongBody>(Hash::from(long::stream_topic(&topic)))
+            .await
+            .context("subscribing to a channel's long-message stream")?;
+        self.long_pubs.insert(topic, publisher);
+        streams.longs.insert(topic, rx);
+        Ok(())
+    }
+
     /// Subscribes to a channel already recorded in `state.sqlite`.
     async fn open(&mut self, meta: Meta, streams: &mut Streams) -> Result<()> {
         let topic = meta.topic;
@@ -762,6 +786,7 @@ impl Session {
             .with_context(|| format!("subscribing to #{}", meta.name))?;
         streams.subs.insert(topic, rx);
         streams.wait_joined(topic, pending);
+        self.open_long(topic, streams).await?;
         self.channels.insert(
             topic,
             Channel {
@@ -798,6 +823,7 @@ impl Session {
         self.state.insert_group(&meta)?;
         tracing::info!(channel = %meta.name, space = %hex::encode(&topic[..4]), "created channel");
         streams.subs.insert(topic, rx);
+        self.open_long(topic, streams).await?;
         self.channels.insert(
             topic,
             Channel {
@@ -969,6 +995,11 @@ impl Session {
                 },
                 Some((topic, ev)) = streams.subs.next() => {
                     if let Err(e) = self.on_event(topic, ev, streams).await {
+                        self.printer.error(&format!("{e:#}"));
+                    }
+                }
+                Some((topic, ev)) = streams.longs.next() => {
+                    if let Err(e) = self.on_long_event(topic, ev, streams).await {
                         self.printer.error(&format!("{e:#}"));
                     }
                 }
@@ -1158,27 +1189,40 @@ impl Session {
 
     async fn send(&mut self, topic: Topic, text: &str) -> Result<()> {
         let channel = self.channel(&topic)?;
-        let Some(space) = &channel.space else {
+        if channel.space.is_none() {
             self.printer.error(&format!(
                 "not in #{} yet; messages are disabled until a manager adds you",
                 channel.meta.name
             ));
             return Ok(());
-        };
-        if text.len() > SEND_TEXT_BYTES {
-            bail!(
-                "message is {} bytes; spaces can carry at most {SEND_TEXT_BYTES} today",
-                text.len()
-            );
         }
         let ask = addresses_bot(text);
         if ask && !self.has_bot(&topic) {
             bail!("#{} has no bot", channel.meta.name);
         }
-        let body = RoomEvent::Chat(ChatBody::new(text, now_ms())?.asking(ask));
         // The plaintext is stored when our own operation comes back through
         // the stream; spaces do not return its hash here.
-        space.publish(body).await?;
+        self.publish_chat(topic, ChatBody::new(text, now_ms())?.asking(ask))
+            .await
+    }
+
+    /// Publishes a chat message into a space. Text over `SEND_TEXT_BYTES`
+    /// goes as a long message: the ciphertext first, on the plain stream,
+    /// then the space message that holds its key.
+    async fn publish_chat(&self, topic: Topic, body: ChatBody) -> Result<()> {
+        let space = self.joined_space(&topic)?;
+        let body = if body.text.len() > SEND_TEXT_BYTES {
+            let (long, payload) = long::seal(&body.text)?;
+            self.long_pubs
+                .get(&topic)
+                .context("no long-message stream for this channel")?
+                .publish(payload)
+                .await?;
+            body.into_long(long)
+        } else {
+            body
+        };
+        space.publish(RoomEvent::Chat(body)).await?;
         Ok(())
     }
 
@@ -1290,6 +1334,146 @@ impl Session {
         }
     }
 
+    /// Records, shows and (for a bot) queues one chat message whose full
+    /// text is in `body`.
+    async fn on_chat(
+        &mut self,
+        topic: Topic,
+        hash: [u8; 32],
+        author: NodeId,
+        op_ts: u64,
+        body: ChatBody,
+        streams: &mut Streams,
+    ) -> Result<()> {
+        let name = self.name(&topic).to_string();
+        let msg = StoredMessage {
+            op_hash: hash,
+            author,
+            sent_at_ms: body.sent_at_ms,
+            op_ts: Some(op_ts),
+            text: body.text.clone(),
+            bot: body.bot,
+            nickname: body.nickname().map(str::to_owned),
+        };
+        let incoming = Incoming {
+            author,
+            bot: body.bot,
+            ask: body.ask,
+            ctl: body.ctl.is_some(),
+            at_ms: op_ts / 1000,
+        };
+        let job = self.bot_job(topic, hash, &incoming).await?;
+        self.state
+            .record_with_job(&topic, &hash, Outcome::Ok, None, Some(&msg), job.as_ref())?;
+        if let Some(ctl) = &body.ctl {
+            self.on_control(topic, author, ctl).await?;
+        }
+        let mine = author == self.me;
+        let profile = self.state.profile(&topic, &author)?;
+        let base = message_sender(&msg, &self.me, profile.clone());
+        let nickname = profile
+            .or_else(|| msg.nickname.clone())
+            .filter(|name| !name.is_empty());
+        let shown_as_bot = body.bot && self.bot_accepted(&topic, &author);
+        let who = self.label(&topic, base, body.bot, shown_as_bot);
+        let mut value = json!({"event": "message", "channel": name, "author": hex_id(&author),
+               "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
+               "ts": op_ts / 1000,
+               "bot": shown_as_bot, "ask": body.ask, "long": body.long.is_some()});
+        if body.bot && !shown_as_bot {
+            value["bot_claim"] = json!("not accepted");
+        }
+        self.printer
+            .emit(value, || format!("[#{name}] {who}: {}", body.text));
+        if let Some(job) = job {
+            self.emit_job(
+                &topic,
+                &hash,
+                &job.asker,
+                job.state,
+                job.reason.as_deref(),
+                None,
+            );
+            if job.state == triad_core::state::JobState::Queued {
+                self.pump(topic, streams).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens a long message with its ciphertext and handles it as
+    /// [`Self::on_chat`] does. One that cannot be opened is recorded as
+    /// failed.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_long_chat(
+        &mut self,
+        topic: Topic,
+        hash: [u8; 32],
+        author: NodeId,
+        op_ts: u64,
+        body: ChatBody,
+        ciphertext: &[u8],
+        streams: &mut Streams,
+    ) -> Result<()> {
+        let opened = body
+            .long
+            .as_ref()
+            .context("not a long message")
+            .and_then(|r| long::open(r, ciphertext));
+        match opened {
+            Ok(text) => {
+                self.on_chat(topic, hash, author, op_ts, body.with_text(text), streams)
+                    .await
+            }
+            Err(e) => {
+                self.state.record(
+                    &topic,
+                    &hash,
+                    Outcome::Failed,
+                    Some(&format!("{e:#}")),
+                    None,
+                )?;
+                self.printer.error(&format!(
+                    "a long message in #{} from {} could not be read: {e:#}",
+                    self.name(&topic),
+                    short_id(&author)
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Ciphertext of a long message, from the plain stream beside a space.
+    /// Stored, then any space message waiting for it is finished.
+    async fn on_long_event(
+        &mut self,
+        topic: Topic,
+        ev: StreamEvent<LongBody>,
+        streams: &mut Streams,
+    ) -> Result<()> {
+        let StreamEvent::Processed { operation, .. } = ev else {
+            return Ok(());
+        };
+        let ct = &operation.message().ciphertext;
+        // Anyone who knows the topic can publish here; the hash in a
+        // member's space message decides what is read. Oversized bodies are
+        // not stored.
+        if ct.len() <= long::MAX_CIPHERTEXT_BYTES {
+            let hash = long::hash_of(ct);
+            self.state.put_long_body(&topic, &hash, ct)?;
+            for w in self.state.take_waiting(&hash)? {
+                if self.state.outcome(&w.op_hash)?.is_some() {
+                    continue;
+                }
+                let body = ChatBody::decode(&w.body)?;
+                self.on_long_chat(w.topic, w.op_hash, w.author, w.op_ts, body, ct, streams)
+                    .await?;
+            }
+        }
+        operation.ack().await?;
+        Ok(())
+    }
+
     async fn on_event(
         &mut self,
         topic: Topic,
@@ -1316,65 +1500,34 @@ impl Session {
                     return Ok(());
                 }
                 let author = *operation.author().as_bytes();
-                let msg = StoredMessage {
-                    op_hash: hash,
-                    author,
-                    sent_at_ms: body.sent_at_ms,
-                    op_ts: Some(operation.timestamp()),
-                    text: body.text.clone(),
-                    bot: body.bot,
-                    nickname: body.nickname().map(str::to_owned),
-                };
-                let incoming = Incoming {
-                    author,
-                    bot: body.bot,
-                    ask: body.ask,
-                    ctl: body.ctl.is_some(),
-                    at_ms: operation.timestamp() / 1000,
-                };
-                let job = self.bot_job(topic, hash, &incoming).await?;
-                self.state.record_with_job(
-                    &topic,
-                    &hash,
-                    Outcome::Ok,
-                    None,
-                    Some(&msg),
-                    job.as_ref(),
-                )?;
-                if let Some(ctl) = &body.ctl {
-                    self.on_control(topic, author, ctl).await?;
-                }
-                let mine = author == self.me;
-                let profile = self.state.profile(&topic, &author)?;
-                let base = message_sender(&msg, &self.me, profile.clone());
-                let nickname = profile
-                    .or_else(|| msg.nickname.clone())
-                    .filter(|name| !name.is_empty());
-                let shown_as_bot = body.bot && self.bot_accepted(&topic, &author);
-                let who = self.label(&topic, base, body.bot, shown_as_bot);
-                let mut value = json!({"event": "message", "channel": name, "author": hex_id(&author),
-                       "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
-                       "ts": operation.timestamp() / 1000,
-                       "bot": shown_as_bot, "ask": body.ask});
-                if body.bot && !shown_as_bot {
-                    value["bot_claim"] = json!("not accepted");
-                }
-                self.printer
-                    .emit(value, || format!("[#{name}] {who}: {}", body.text));
-                operation.ack().await?;
-                if let Some(job) = job {
-                    self.emit_job(
-                        &topic,
-                        &hash,
-                        &job.asker,
-                        job.state,
-                        job.reason.as_deref(),
-                        None,
-                    );
-                    if job.state == triad_core::state::JobState::Queued {
-                        self.pump(topic, streams).await;
+                let op_ts = operation.timestamp();
+                let body = body.clone();
+                match &body.long {
+                    None => {
+                        self.on_chat(topic, hash, author, op_ts, body, streams)
+                            .await?
                     }
+                    Some(r) => match self.state.long_body(&r.hash)? {
+                        Some(ct) => {
+                            self.on_long_chat(topic, hash, author, op_ts, body, &ct, streams)
+                                .await?
+                        }
+                        None => {
+                            // The ciphertext has not arrived on the plain
+                            // stream yet; finished in `on_long_event`.
+                            tracing::debug!(op = %hex::encode(&hash[..4]), "long message waits for its body");
+                            self.state.wait_long(&WaitingLong {
+                                op_hash: hash,
+                                topic,
+                                hash: r.hash,
+                                author,
+                                op_ts,
+                                body: body.encode()?,
+                            })?;
+                        }
+                    },
                 }
+                operation.ack().await?;
             }
             StreamEvent::Member(vk) if self.is_dm(&topic) => {
                 // The bot DM never gains a member: decline without asking,

@@ -5,17 +5,19 @@ use p2panda_core::{Signature, VerifyingKey, identity::Signer};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{Identity, NodeId};
+use crate::long::LongRef;
 
 /// Wire format version used everywhere.
 pub const VERSION: u8 = 1;
 /// Maximum UTF-8 text length of one chat message, in the wire format.
 pub const MAX_TEXT_BYTES: usize = 2_000;
-/// Longest text that can be sent today. p2panda-core 0.8.0 decodes operation
-/// headers with a 512-byte limit on any byte string, and spaces carry the
-/// encrypted message in the header. A message over about 460 bytes of text
-/// is published but can never be read back, which wedges the author's log
-/// in that space: no later message from them is published or synced. 400
-/// leaves a margin. See FINDINGS.md, "Bots", H7.
+/// Longest text sent as one space message. p2panda-core 0.8.0 decodes
+/// operation headers with a 512-byte limit on any byte string, and spaces
+/// carry the encrypted message in the header. A message over about 460 bytes
+/// of text is published but can never be read back, which wedges the
+/// author's log in that space: no later message from them is published or
+/// synced. 400 leaves a margin. Longer text, up to [`MAX_TEXT_BYTES`], goes
+/// as a long message ([`crate::long`]). See FINDINGS.md, "Bots", H7.
 pub const SEND_TEXT_BYTES: usize = 400;
 const MAX_NICKNAME_CHARS: usize = 24;
 /// Invite prefix.
@@ -42,6 +44,10 @@ pub struct ChatBody {
     /// An announcement. `text` holds a readable fallback for old builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctl: Option<Control>,
+    /// A long message: the text travels encrypted beside the space (see
+    /// [`crate::long`]), and `text` holds [`crate::long::FALLBACK_TEXT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long: Option<LongRef>,
 }
 
 /// A channel announcement about its bot.
@@ -89,6 +95,7 @@ impl ChatBody {
             bot: false,
             ask: false,
             ctl: None,
+            long: None,
             nickname: None,
         })
     }
@@ -108,6 +115,20 @@ impl ChatBody {
     /// Makes this message an announcement.
     pub fn with_ctl(mut self, ctl: Control) -> Self {
         self.ctl = Some(ctl);
+        self
+    }
+
+    /// Turns this message into a pointer to its long text, sealed in
+    /// `long`: `text` becomes [`crate::long::FALLBACK_TEXT`].
+    pub fn into_long(mut self, long: LongRef) -> Self {
+        self.text = crate::long::FALLBACK_TEXT.to_string();
+        self.long = Some(long);
+        self
+    }
+
+    /// Puts the opened long text back in place of the fallback.
+    pub fn with_text(mut self, text: String) -> Self {
+        self.text = text;
         self
     }
 
