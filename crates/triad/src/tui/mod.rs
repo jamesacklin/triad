@@ -15,7 +15,7 @@ mod view;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use ratatui::DefaultTerminal;
@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use app::{App, Backfill, Line, Store};
+use app::{App, Backfill, Bot, Line, Store};
 use triad_core::state::State;
 
 /// Stored messages, numbered like the session's own `history`.
@@ -47,7 +47,8 @@ impl StateStore {
             .group_named(channel)?
             .with_context(|| format!("no channel named #{channel}"))?;
         let dm = state.dm_topic()? == Some(meta.topic);
-        let host = state.bot(&meta.topic)?.map(|b| b.host);
+        let bot = state.bot(&meta.topic)?;
+        let host = bot.as_ref().map(|b| b.host);
         let profiles = state.profiles(&meta.topic)?;
         let messages = state
             .history(&meta.topic, Some(BACKLOG))?
@@ -65,7 +66,24 @@ impl StateStore {
                 (hex::encode(m.op_hash), line)
             })
             .collect();
-        Ok(Backfill { dm, messages })
+        let queued = state
+            .queued_jobs()?
+            .into_iter()
+            .filter(|j| j.topic == meta.topic)
+            .map(|j| hex::encode(j.op_hash))
+            .collect();
+        let bot = bot.map(|b| Bot {
+            host: hex::encode(b.host),
+            provider: b.provider,
+            servers: b.servers,
+            enabled: b.enabled,
+        });
+        Ok(Backfill {
+            dm,
+            messages,
+            bot,
+            queued,
+        })
     }
 }
 
@@ -145,13 +163,19 @@ fn run(
 ) -> Result<()> {
     let mut app = App::new(Box::new(store));
     let mut dirty = true;
+    let mut drawn = Instant::now();
     loop {
         if PANICKED.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // A running turn's clock ticks while nothing else happens.
+        if app.ticking() && drawn.elapsed() >= Duration::from_millis(500) {
+            dirty = true;
+        }
         if dirty {
             terminal.draw(|frame| view::draw(frame, &app))?;
             dirty = false;
+            drawn = Instant::now();
         }
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -180,10 +204,17 @@ fn run(
 }
 
 /// Hands a line to the session. The UI does no checking of its own.
-fn submit(lines: &mpsc::Sender<String>, line: String) -> bool {
-    match lines.try_send(line) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(_)) => true,
+/// Returns false once the session has stopped reading.
+fn submit(app: &mut App, lines: &mpsc::Sender<String>, line: String) -> bool {
+    match lines.try_send(line.clone()) {
+        Ok(()) => {
+            app.submitted(&line);
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            app.error(&format!("the session is busy; not sent: {line}"));
+            true
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
@@ -191,7 +222,7 @@ fn submit(lines: &mpsc::Sender<String>, line: String) -> bool {
 /// Moves the sidebar selection and asks the session to switch.
 fn switch(app: &mut App, step: isize, lines: &mpsc::Sender<String>) -> bool {
     match app.select(step) {
-        Some(line) => submit(lines, line),
+        Some(line) => submit(app, lines, line),
         None => true,
     }
 }
@@ -200,14 +231,14 @@ fn switch(app: &mut App, step: isize, lines: &mpsc::Sender<String>) -> bool {
 fn on_key(app: &mut App, key: KeyEvent, lines: &mpsc::Sender<String>) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let quit = |app: &App| {
+    let quit = |app: &mut App| {
         if app.me.is_empty() {
             // The session has not started its event loop, so it would not
             // read `/quit`; leave now, as Ctrl-C does in plain mode.
             restore();
             std::process::exit(130);
         }
-        submit(lines, "/quit".into())
+        submit(app, lines, "/quit".into())
     };
     match key.code {
         KeyCode::Char('c') if ctrl => return quit(app),
@@ -225,7 +256,7 @@ fn on_key(app: &mut App, key: KeyEvent, lines: &mpsc::Sender<String>) -> bool {
         KeyCode::Char(c) if !ctrl && !alt => app.input.insert(c),
         KeyCode::Enter => {
             let line = app.input.take();
-            return submit(lines, line);
+            return submit(app, lines, line);
         }
         KeyCode::Backspace => app.input.backspace(),
         KeyCode::Delete => app.input.delete(),

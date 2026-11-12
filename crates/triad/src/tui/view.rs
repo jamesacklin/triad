@@ -6,7 +6,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::app::{App, Line};
+use std::time::Instant;
+
+use super::app::{App, Chan, Line};
 use super::input::width;
 
 /// Below this many columns the sidebar is hidden.
@@ -228,12 +230,119 @@ fn draw_pane(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(rows[start..end].to_vec()), inner);
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let text = match app.focused() {
-        Some(c) => format!(" #{}", clean(&c.name)),
-        None => " connecting…".to_string(),
+fn short(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn tools(servers: &[String]) -> String {
+    if servers.is_empty() {
+        "no tools".into()
+    } else {
+        format!("tools {}", servers.join(","))
+    }
+}
+
+/// The bot part of the status line, for the focused channel.
+fn bot_segment(app: &App, c: &Chan) -> Span<'static> {
+    let off = |why: &str| Span::styled(why.to_string(), dim());
+    if c.dm {
+        return if app.bots {
+            Span::raw(format!(
+                "bot on · {} · {}",
+                app.bot_provider,
+                tools(&app.bot_servers)
+            ))
+        } else {
+            match &app.bots_off {
+                Some(why) => off(&format!("bot off: {why}")),
+                None => off("bot off"),
+            }
+        };
+    }
+    match &c.bot {
+        Some(b) if b.enabled && b.host == app.me && !app.bots => {
+            off("my bot, not running here (/bot on)")
+        }
+        Some(b) if b.enabled => {
+            let by = if b.host == app.me {
+                "mine".to_string()
+            } else {
+                format!("run by {}", short(&b.host))
+            };
+            Span::raw(format!(
+                "bot on ({by}) · {} · {}",
+                b.provider,
+                tools(&b.servers)
+            ))
+        }
+        Some(_) => off("bot off"),
+        None => off("no bot"),
+    }
+}
+
+fn status_spans(app: &App, now: Instant) -> Vec<Span<'static>> {
+    let sep = || Span::styled(" │ ", dim());
+    let Some(c) = app.focused() else {
+        return vec![Span::styled(" connecting…", dim())];
     };
-    frame.render_widget(Paragraph::new(text).style(dim()), area);
+    // What needs an answer comes first, so a narrow terminal keeps it.
+    let mut urgent: Vec<Span<'static>> = Vec::new();
+    if let Some(ask) = app.asks.front() {
+        let more = match app.asks.len() {
+            1 => String::new(),
+            n => format!(" (+{})", n - 1),
+        };
+        urgent.push(Span::styled(
+            format!(
+                "join request for #{} from {} — y/N{more}",
+                clean(&ask.channel),
+                short(&ask.member)
+            ),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    if let Some(e) = &app.last_error {
+        urgent.push(Span::styled(
+            format!("error: {}", clean(e)),
+            Style::new().fg(Color::Red),
+        ));
+    }
+    let mut spans = vec![Span::raw(" ")];
+    for span in urgent {
+        spans.extend([span, sep()]);
+    }
+    spans.push(bot_segment(app, c));
+    if let Some(t) = &c.running {
+        let secs = now.saturating_duration_since(t.since).as_secs();
+        let mut turn = format!("turn running {secs}s");
+        if let Some((tool, state)) = &t.tool {
+            turn.push_str(&format!(" → {tool} {state}"));
+        }
+        spans.extend([sep(), Span::styled(turn, Style::new().fg(Color::Yellow))]);
+    } else if let Some(last) = &c.last_turn {
+        spans.extend([sep(), Span::styled(last.clone(), dim())]);
+    }
+    if !c.queued.is_empty() {
+        spans.extend([sep(), Span::raw(format!("queue {}", c.queued.len()))]);
+    }
+    let busy: Vec<String> = app
+        .channels
+        .iter()
+        .filter(|o| o.name != c.name && o.running.is_some())
+        .map(|o| format!("#{}", clean(&o.name)))
+        .collect();
+    if !busy.is_empty() {
+        spans.extend([
+            sep(),
+            Span::styled(format!("turn in {}", busy.join(" ")), dim()),
+        ]);
+    }
+    spans
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let line = TextLine::from(status_spans(app, Instant::now()));
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -246,9 +355,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let prompt = "> ";
     let cols = inner.width as usize - prompt.len();
     if app.input.is_empty() {
-        let hint = match app.focused() {
-            Some(c) => format!("message #{} or /command", clean(&c.name)),
-            None => "message or /command".to_string(),
+        let hint = match (app.asks.front(), app.focused()) {
+            (Some(a), _) => format!(
+                "y lets {} into #{}; anything else declines",
+                short(&a.member),
+                clean(&a.channel)
+            ),
+            (None, Some(c)) => format!("message #{} or /command", clean(&c.name)),
+            (None, None) => "message or /command".to_string(),
         };
         frame.render_widget(
             Paragraph::new(TextLine::from(vec![
@@ -304,6 +418,64 @@ mod tests {
         assert!(has(&rows, "sam: old one"));
         assert!(has(&rows, "bb112233: hello garden"));
         assert!(has(&rows, "> message #garden or /command"));
+    }
+
+    #[test]
+    fn status_line_shows_the_turn_queue_and_join_request() {
+        let mut app = started();
+        app.apply(
+            &serde_json::json!({"event": "job", "channel": "garden", "op": "j1",
+                                "state": "started"}),
+            "",
+        );
+        app.apply(
+            &serde_json::json!({"event": "tool_call", "channel": "garden", "op": "j1",
+                                "tool": "fs.read", "state": "sent"}),
+            "",
+        );
+        app.apply(
+            &serde_json::json!({"event": "join_request", "channel": "garden", "member": SAM}),
+            "",
+        );
+        let rows = screen(&app, 140, 30);
+        // ready said this session runs no bots.
+        assert!(
+            rows[26].contains("my bot, not running here"),
+            "{}",
+            rows[26]
+        );
+        app.apply(
+            &serde_json::json!({"event": "bots_started", "provider": "mock", "servers": []}),
+            "",
+        );
+        let rows = screen(&app, 140, 30);
+        let status = &rows[26];
+        assert!(
+            status.contains("bot on (mine) · mock · tools fs"),
+            "{status}"
+        );
+        assert!(
+            status.contains("turn running 0s → fs.read sent"),
+            "{status}"
+        );
+        assert!(status.contains("queue 1"), "{status}");
+        assert!(status.contains("join request for #garden from bb112233 — y/N"));
+        assert!(has(
+            &rows,
+            "y lets bb112233 into #garden; anything else declines"
+        ));
+        // The DM shows the session's own bots.
+        app.apply(
+            &serde_json::json!({"event": "switched", "channel": "agent"}),
+            "",
+        );
+        let rows = screen(&app, 140, 30);
+        assert!(
+            rows[26].contains(" bot on · mock · no tools"),
+            "{}",
+            rows[26]
+        );
+        assert!(rows[26].contains("turn in #garden"), "{}", rows[26]);
     }
 
     #[test]

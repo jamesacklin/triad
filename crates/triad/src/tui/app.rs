@@ -2,7 +2,8 @@
 //! no terminal, and no I/O apart from the backlog reads through [`Store`].
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -30,6 +31,47 @@ pub struct Backfill {
     pub dm: bool,
     /// Stored messages, oldest first, with their operation hashes (hex).
     pub messages: Vec<(String, Line)>,
+    /// The channel's accepted bot, if any.
+    pub bot: Option<Bot>,
+    /// Operation hashes (hex) of bot jobs still queued here.
+    pub queued: Vec<String>,
+}
+
+/// A channel's bot, as accepted by this node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bot {
+    /// The node that runs it (hex).
+    pub host: String,
+    pub provider: String,
+    pub servers: Vec<String>,
+    pub enabled: bool,
+}
+
+impl Bot {
+    fn from_event(v: &Value, enabled: bool) -> Option<Bot> {
+        Some(Bot {
+            host: str_of(v, "host")?.to_string(),
+            provider: str_of(v, "provider").unwrap_or_default().to_string(),
+            servers: strings(v, "servers"),
+            enabled,
+        })
+    }
+}
+
+/// A bot turn running in a channel.
+#[derive(Clone, Debug)]
+pub struct Turn {
+    pub op: String,
+    pub since: Instant,
+    /// The latest tool call: its name and state (`sent`, `ok`, ...).
+    pub tool: Option<(String, String)>,
+}
+
+/// A join request waiting for this user's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    pub channel: String,
+    pub member: String,
 }
 
 /// Reads a channel's backlog. The real one is a second, read-only use of
@@ -54,6 +96,12 @@ pub struct Chan {
     pub members: Option<u64>,
     /// First pane row shown when scrolled up; `None` follows the bottom.
     pub scroll_top: Option<usize>,
+    pub bot: Option<Bot>,
+    /// Bot jobs waiting for this channel's worker (operation hashes).
+    pub queued: BTreeSet<String>,
+    pub running: Option<Turn>,
+    /// The last finished turn's figures, ready to show.
+    pub last_turn: Option<String>,
 }
 
 pub struct App {
@@ -72,10 +120,33 @@ pub struct App {
     store: Box<dyn Store>,
     /// Rows in the focused pane and its height, as last drawn.
     pub pane: Cell<(usize, usize)>,
+    /// Whether this session runs my bots, and with what.
+    pub bots: bool,
+    pub bot_provider: String,
+    pub bot_servers: Vec<String>,
+    /// Why the bots are off, when the session said.
+    pub bots_off: Option<String>,
+    /// Join requests waiting for an answer, oldest first, as the session
+    /// keeps them.
+    pub asks: VecDeque<Ask>,
+    /// The last error, until the next line is submitted.
+    pub last_error: Option<String>,
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+fn strings(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn bool_of(v: &Value, key: &str) -> bool {
@@ -105,6 +176,12 @@ impl App {
             early: Vec::new(),
             store,
             pane: Cell::new((0, 0)),
+            bots: false,
+            bot_provider: String::new(),
+            bot_servers: Vec::new(),
+            bots_off: None,
+            asks: VecDeque::new(),
+            last_error: None,
         }
     }
 
@@ -159,6 +236,8 @@ impl App {
         match self.store.backfill(name, &self.me) {
             Ok(b) => {
                 chan.dm = b.dm;
+                chan.bot = b.bot;
+                chan.queued = b.queued.into_iter().collect();
                 for (op, line) in b.messages {
                     chan.ops.insert(op);
                     chan.lines.push(line);
@@ -179,6 +258,11 @@ impl App {
         match str_of(v, "event").unwrap_or("") {
             "ready" => {
                 self.me = str_of(v, "node").unwrap_or_default().to_string();
+                self.bots = bool_of(v, "bots");
+                if self.bots {
+                    self.bot_provider = str_of(v, "bot_provider").unwrap_or_default().into();
+                    self.bot_servers = strings(v, "bot_servers");
+                }
                 if let Some(list) = v.get("channels").and_then(Value::as_array) {
                     for c in list {
                         self.add_channel(c);
@@ -210,15 +294,128 @@ impl App {
                         c.pending = false;
                     }
                 }
+                if str_of(v, "event") == Some("joined") {
+                    let member = str_of(v, "member");
+                    self.asks.retain(|a| {
+                        Some(a.channel.as_str()) != channel || Some(a.member.as_str()) != member
+                    });
+                }
                 self.push(channel, Line::Notice(without_prefix(text, channel)));
             }
             "error" => {
                 // A /switch that failed leaves the selection where it was.
                 self.selected = self.focus.clone();
+                self.last_error = Some(str_of(v, "text").unwrap_or(text).to_string());
                 self.push(channel, Line::Error(text.to_string()));
+            }
+            "job" => self.on_job(v, text),
+            "tool_call" => {
+                let op = str_of(v, "op");
+                if let Some(turn) = channel
+                    .and_then(|c| self.chan_mut(c))
+                    .and_then(|c| c.running.as_mut())
+                    .filter(|t| Some(t.op.as_str()) == op)
+                {
+                    turn.tool = Some((
+                        str_of(v, "tool").unwrap_or("?").to_string(),
+                        str_of(v, "state").unwrap_or_default().to_string(),
+                    ));
+                }
+            }
+            "join_request" => {
+                if !bool_of(v, "auto")
+                    && let (Some(channel), Some(member)) = (channel, str_of(v, "member"))
+                {
+                    self.asks.push_back(Ask {
+                        channel: channel.to_string(),
+                        member: member.to_string(),
+                    });
+                }
+                self.push(channel, Line::Notice(text.to_string()));
+            }
+            event @ ("bot_on" | "bot_off" | "bot") => {
+                let enabled = match event {
+                    "bot" => bool_of(v, "enabled"),
+                    e => e == "bot_on",
+                };
+                let bot = Bot::from_event(v, enabled);
+                if let Some(c) = channel.and_then(|c| self.chan_mut(c))
+                    && !c.dm
+                {
+                    c.bot = bot;
+                }
+                self.push(channel, Line::Notice(without_prefix(text, channel)));
+            }
+            "bots_started" => {
+                self.bots = true;
+                self.bots_off = None;
+                self.bot_provider = str_of(v, "provider").unwrap_or_default().into();
+                self.bot_servers = strings(v, "servers");
+                self.push(None, Line::Notice(text.to_string()));
+            }
+            "bot_unavailable" => {
+                self.bots = false;
+                self.bots_off = str_of(v, "reason").map(str::to_string);
+                self.push(None, Line::Notice(text.to_string()));
             }
             _ => self.push(channel, Line::Notice(without_prefix(text, channel))),
         }
+    }
+
+    /// A bot job changed state. Routine transitions only move the status
+    /// line; a refusal or failure also leaves a line in the channel.
+    fn on_job(&mut self, v: &Value, text: &str) {
+        let channel = str_of(v, "channel");
+        let op = str_of(v, "op").unwrap_or_default().to_string();
+        let state = str_of(v, "state").unwrap_or_default();
+        let Some(c) = channel.and_then(|c| self.chan_mut(c)) else {
+            self.push(None, Line::Notice(text.to_string()));
+            return;
+        };
+        if state == "queued" {
+            c.queued.insert(op);
+            return;
+        }
+        c.queued.remove(&op);
+        if state == "started" {
+            c.running = Some(Turn {
+                op,
+                since: Instant::now(),
+                tool: None,
+            });
+            return;
+        }
+        if c.running.as_ref().is_some_and(|t| t.op == op) {
+            c.running = None;
+        }
+        match state {
+            "done" => c.last_turn = Some(turn_figures(v)),
+            "refused" | "failed" => {
+                let line = Line::Notice(without_prefix(text, channel));
+                c.lines.push(line);
+            }
+            _ => {}
+        }
+    }
+
+    /// A line was submitted. The session takes the next plain line as the
+    /// answer to the oldest join request; so does the status line.
+    pub fn submitted(&mut self, line: &str) {
+        self.last_error = None;
+        if !line.trim().starts_with('/') {
+            self.asks.pop_front();
+        }
+    }
+
+    /// Whether the screen shows a clock that needs redrawing.
+    pub fn ticking(&self) -> bool {
+        self.focused().is_some_and(|c| c.running.is_some())
+    }
+
+    /// An error of the interface's own.
+    pub fn error(&mut self, text: &str) {
+        self.last_error = Some(text.to_string());
+        self.push(None, Line::Error(format!("error: {text}")));
     }
 
     fn set_focus(&mut self, channel: Option<&str>) {
@@ -288,6 +485,29 @@ impl App {
     }
 }
 
+/// A finished turn's figures from its `done` event.
+fn turn_figures(v: &Value) -> String {
+    let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let secs = |ms: u64| format!("{}.{}s", ms / 1000, (ms % 1000) / 100);
+    let mut s = format!(
+        "last turn {} (model {}, tools {})",
+        secs(n("turn_ms")),
+        secs(n("model_ms")),
+        secs(n("tool_ms"))
+    );
+    let requests = n("requests");
+    s.push_str(&format!(
+        " · {requests} request{}",
+        if requests == 1 { "" } else { "s" }
+    ));
+    s.push_str(&format!(
+        " · {}→{} tokens",
+        n("input_tokens"),
+        n("output_tokens")
+    ));
+    s
+}
+
 /// A live message as a pane line, labelled as the plain prompt labels it.
 pub fn message_line(v: &Value, dm: bool) -> Line {
     let mine = bool_of(v, "mine");
@@ -342,6 +562,13 @@ pub mod tests {
             Ok(match channel {
                 "garden" => Backfill {
                     dm: false,
+                    bot: Some(Bot {
+                        host: ME.into(),
+                        provider: "mock".into(),
+                        servers: vec!["fs".into()],
+                        enabled: true,
+                    }),
+                    queued: vec!["q0".into()],
                     messages: vec![
                         ("01".into(), msg("sam", "old one")),
                         ("02".into(), msg("me", "old two")),
@@ -509,6 +736,124 @@ pub mod tests {
             app.chan("ops").unwrap().lines.last(),
             Some(&Line::Notice("something new".into()))
         );
+    }
+
+    fn job(op: &str, state: &str) -> Value {
+        json!({"event": "job", "channel": "garden", "op": op, "asker": ME, "state": state,
+               "reason": null})
+    }
+
+    #[test]
+    fn turn_lifecycle() {
+        let mut app = started();
+        let garden = |app: &App| {
+            let c = app.chan("garden").unwrap();
+            (
+                c.queued.len(),
+                c.running.as_ref().map(|t| (t.op.clone(), t.tool.clone())),
+                c.lines.len(),
+            )
+        };
+        assert_eq!(garden(&app), (1, None, 2));
+        app.apply(&job("q0", "abandoned"), "");
+        app.apply(&job("j1", "queued"), "");
+        app.apply(&job("j2", "queued"), "");
+        assert_eq!(garden(&app), (2, None, 2));
+        app.apply(&job("j1", "started"), "");
+        assert!(app.ticking());
+        app.apply(
+            &json!({"event": "tool_call", "channel": "garden", "asker": ME, "tool": "fs.read",
+                    "state": "sent", "op": "j1"}),
+            "",
+        );
+        assert_eq!(
+            garden(&app),
+            (
+                1,
+                Some(("j1".into(), Some(("fs.read".into(), "sent".into())))),
+                2
+            )
+        );
+        let mut done = job("j1", "done");
+        for (k, n) in [
+            ("turn_ms", 4200),
+            ("model_ms", 3100),
+            ("tool_ms", 900),
+            ("requests", 2),
+            ("input_tokens", 1200),
+            ("output_tokens", 80),
+        ] {
+            done[k] = json!(n);
+        }
+        app.apply(&done, "");
+        assert!(!app.ticking());
+        assert_eq!(
+            app.chan("garden").unwrap().last_turn.as_deref(),
+            Some("last turn 4.2s (model 3.1s, tools 0.9s) · 2 requests · 1200→80 tokens")
+        );
+        // Routine transitions leave no line; a refusal does.
+        assert_eq!(garden(&app).2, 2);
+        let mut refused = job("j2", "refused");
+        refused["reason"] = json!("rate limited");
+        app.apply(
+            &refused,
+            "[#garden] bot job for aa000000: refused (rate limited)",
+        );
+        assert_eq!(garden(&app), (0, None, 3));
+        assert_eq!(
+            app.chan("garden").unwrap().lines.last(),
+            Some(&Line::Notice(
+                "bot job for aa000000: refused (rate limited)".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn join_requests_and_errors() {
+        let mut app = started();
+        let ask = |m: &str, auto: bool| json!({"event": "join_request", "channel": "garden", "member": m, "auto": auto});
+        app.apply(&ask(SAM, false), "join request");
+        app.apply(&ask(ME, true), "join request (auto)");
+        assert_eq!(app.asks.len(), 1);
+        // Commands do not answer it; a plain line does.
+        app.submitted("/members");
+        assert_eq!(app.asks.len(), 1);
+        app.submitted("y");
+        assert!(app.asks.is_empty());
+        // Or the member being let in some other way.
+        app.apply(&ask(SAM, false), "join request");
+        app.apply(
+            &json!({"event": "joined", "channel": "garden", "member": SAM, "members": 2}),
+            "",
+        );
+        assert!(app.asks.is_empty());
+        app.apply(&json!({"event": "error", "text": "boom"}), "error: boom");
+        assert_eq!(app.last_error.as_deref(), Some("boom"));
+        app.submitted("/channels");
+        assert_eq!(app.last_error, None);
+    }
+
+    #[test]
+    fn bot_state() {
+        let mut app = started();
+        assert!(!app.bots);
+        app.apply(
+            &json!({"event": "bots_started", "provider": "mock", "servers": []}),
+            "bots started: mock",
+        );
+        assert!(app.bots);
+        app.apply(
+            &json!({"event": "bot_off", "channel": "garden", "host": ME, "provider": "mock",
+                    "servers": ["fs"]}),
+            "[#garden] bot off (me)",
+        );
+        assert!(!app.chan("garden").unwrap().bot.as_ref().unwrap().enabled);
+        app.apply(
+            &json!({"event": "bot_unavailable", "reason": "no key"}),
+            "bots off",
+        );
+        assert!(!app.bots);
+        assert_eq!(app.bots_off.as_deref(), Some("no key"));
     }
 
     #[test]

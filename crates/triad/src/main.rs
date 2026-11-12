@@ -1086,6 +1086,12 @@ impl Session {
         fields.insert("node".into(), json!(hex_id(&self.me)));
         fields.insert("channels".into(), json!(all));
         fields.remove("focused");
+        // Whether this session runs my bots, for the terminal interface.
+        fields.insert("bots".into(), json!(self.bots.is_some()));
+        if let Some(b) = &self.bots {
+            fields.insert("bot_provider".into(), json!(b.agent.provider()));
+            fields.insert("bot_servers".into(), json!(b.agent.servers()));
+        }
         let invite = value["invite"].as_str().map(str::to_string);
         self.printer.emit(value, || {
             let mut s = format!("node    {}\n{}", short_id(&self.me), self.channel_lines());
@@ -1697,7 +1703,8 @@ impl Session {
                     return Ok(());
                 }
                 self.printer.emit(
-                    json!({"event": "join_request", "channel": name, "member": hex_id(&member)}),
+                    json!({"event": "join_request", "channel": name, "member": hex_id(&member),
+                           "auto": self.opts.auto_accept}),
                     || {
                         format!(
                             "join request for #{name} from {}. Accept? [y/N]{}",
