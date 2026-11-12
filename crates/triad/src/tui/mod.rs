@@ -12,17 +12,68 @@ mod app;
 mod input;
 mod view;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use app::App;
+use app::{App, Backfill, Line, Store};
+use triad_core::state::State;
+
+/// Stored messages, numbered like the session's own `history`.
+const BACKLOG: usize = 500;
+
+/// The backlog from a second connection to `state.sqlite`, opened when
+/// first needed (the bots keep a second connection the same way).
+struct StateStore {
+    data_dir: PathBuf,
+    state: Option<State>,
+}
+
+impl StateStore {
+    fn read(&mut self, channel: &str, me: &str) -> Result<Backfill> {
+        if self.state.is_none() {
+            self.state = Some(State::open(&self.data_dir)?);
+        }
+        let state = self.state.as_ref().expect("just opened");
+        let me = crate::parse_node(me)?;
+        let meta = state
+            .group_named(channel)?
+            .with_context(|| format!("no channel named #{channel}"))?;
+        let dm = state.dm_topic()? == Some(meta.topic);
+        let host = state.bot(&meta.topic)?.map(|b| b.host);
+        let profiles = state.profiles(&meta.topic)?;
+        let messages = state
+            .history(&meta.topic, Some(BACKLOG))?
+            .into_iter()
+            .map(|m| {
+                let base = crate::message_sender(&m, &me, profiles.get(&m.author).cloned());
+                let accepted =
+                    m.bot && crate::bot_author_accepted(dm, &me, host.as_ref(), &m.author);
+                let line = Line::Msg {
+                    who: crate::author_label(base, dm, m.bot, accepted),
+                    text: m.text,
+                    mine: m.author == me,
+                    bot: accepted,
+                };
+                (hex::encode(m.op_hash), line)
+            })
+            .collect();
+        Ok(Backfill { dm, messages })
+    }
+}
+
+impl Store for StateStore {
+    fn backfill(&mut self, channel: &str, me: &str) -> Result<Backfill, String> {
+        self.read(channel, me).map_err(|e| format!("{e:#}"))
+    }
+}
 
 /// Events from the session: the JSON form and the text form.
 pub type Events = mpsc::UnboundedSender<(Value, String)>;
@@ -50,7 +101,7 @@ impl Ui {
 /// Takes over the terminal and starts the interface thread. Returns the
 /// sender the session's printer emits into, and the receiver of submitted
 /// lines.
-pub fn spawn() -> Result<(Events, mpsc::Receiver<String>, Ui)> {
+pub fn spawn(data_dir: &Path) -> Result<(Events, mpsc::Receiver<String>, Ui)> {
     let terminal = match ratatui::try_init() {
         Ok(t) => t,
         Err(e) => {
@@ -63,12 +114,17 @@ pub fn spawn() -> Result<(Events, mpsc::Receiver<String>, Ui)> {
         PANICKED.store(true, Ordering::SeqCst);
         previous(info);
     }));
+    let data_dir = data_dir.to_path_buf();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (lines_tx, lines_rx) = mpsc::channel(64);
     let handle = std::thread::Builder::new()
         .name("triad-tui".into())
         .spawn(move || {
-            let result = run(terminal, events_rx, lines_tx);
+            let store = StateStore {
+                data_dir,
+                state: None,
+            };
+            let result = run(terminal, events_rx, lines_tx, store);
             restore();
             result
         })?;
@@ -85,8 +141,9 @@ fn run(
     mut terminal: DefaultTerminal,
     mut events: mpsc::UnboundedReceiver<(Value, String)>,
     lines: mpsc::Sender<String>,
+    store: StateStore,
 ) -> Result<()> {
-    let mut app = App::default();
+    let mut app = App::new(Box::new(store));
     let mut dirty = true;
     loop {
         if PANICKED.load(Ordering::SeqCst) {
@@ -131,9 +188,18 @@ fn submit(lines: &mpsc::Sender<String>, line: String) -> bool {
     }
 }
 
+/// Moves the sidebar selection and asks the session to switch.
+fn switch(app: &mut App, step: isize, lines: &mpsc::Sender<String>) -> bool {
+    match app.select(step) {
+        Some(line) => submit(lines, line),
+        None => true,
+    }
+}
+
 /// Handles one key. Returns false when the interface should close.
 fn on_key(app: &mut App, key: KeyEvent, lines: &mpsc::Sender<String>) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let quit = |app: &App| {
         if app.me.is_empty() {
             // The session has not started its event loop, so it would not
@@ -145,12 +211,18 @@ fn on_key(app: &mut App, key: KeyEvent, lines: &mpsc::Sender<String>) -> bool {
     };
     match key.code {
         KeyCode::Char('c') if ctrl => return quit(app),
+        KeyCode::Char('n') if ctrl => return switch(app, 1, lines),
+        KeyCode::Char('p') if ctrl => return switch(app, -1, lines),
+        KeyCode::Down if alt => return switch(app, 1, lines),
+        KeyCode::Up if alt => return switch(app, -1, lines),
+        KeyCode::PageUp => app.scroll(-1),
+        KeyCode::PageDown => app.scroll(1),
         KeyCode::Char('d') if ctrl && app.input.is_empty() => return quit(app),
         KeyCode::Char('u') if ctrl => app.input.kill_to_start(),
         KeyCode::Char('w') if ctrl => app.input.kill_word(),
         KeyCode::Char('a') if ctrl => app.input.home(),
         KeyCode::Char('e') if ctrl => app.input.end(),
-        KeyCode::Char(c) if !ctrl => app.input.insert(c),
+        KeyCode::Char(c) if !ctrl && !alt => app.input.insert(c),
         KeyCode::Enter => {
             let line = app.input.take();
             return submit(lines, line);

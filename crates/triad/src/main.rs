@@ -242,13 +242,45 @@ fn main() -> ExitCode {
 }
 
 fn message_sender(message: &StoredMessage, me: &NodeId, profile: Option<String>) -> String {
-    if &message.author == me {
+    sender_name(
+        &message.author == me,
+        &message.author,
+        profile.or_else(|| message.nickname.clone()),
+    )
+}
+
+/// A message author's name: `me`, their nickname (from their profile or
+/// the message), or a short node ID.
+fn sender_name(mine: bool, author: &NodeId, nickname: Option<String>) -> String {
+    if mine {
         "me".into()
     } else {
-        profile
-            .or_else(|| message.nickname.clone())
+        nickname
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| short_id(&message.author))
+            .unwrap_or_else(|| short_id(author))
+    }
+}
+
+/// How a message's author is shown: `my bot` in the DM, `bot` in a
+/// channel, a note that a bot claim was not accepted, or `who`, their name
+/// as [`sender_name`] gives it. Shared by the live display and the
+/// interface's backlog.
+fn author_label(who: String, dm: bool, claimed: bool, accepted: bool) -> String {
+    match (claimed, accepted) {
+        (true, true) if dm => "my bot".to_string(),
+        (true, true) => "bot".to_string(),
+        (true, false) => format!("{who} (bot claim not accepted)"),
+        _ => who,
+    }
+}
+
+/// Whether a bot message from `author` is shown as the channel's bot: in
+/// the DM only this node's, elsewhere only the accepted host's (`host`).
+fn bot_author_accepted(dm: bool, me: &NodeId, host: Option<&NodeId>, author: &NodeId) -> bool {
+    if dm {
+        author == me
+    } else {
+        host == Some(author)
     }
 }
 
@@ -635,7 +667,7 @@ fn run_chat(
     match opts.mode {
         #[cfg(feature = "tui")]
         Mode::Tui => {
-            let (events, lines, ui) = tui::spawn()?;
+            let (events, lines, ui) = tui::spawn(data_dir)?;
             let result = rt.block_on(chat(
                 data_dir,
                 start,
@@ -1427,12 +1459,7 @@ impl Session {
     /// How a message's author is shown. `who` is their name as
     /// [`message_sender`] gives it.
     fn label(&self, topic: &Topic, who: String, claimed: bool, accepted: bool) -> String {
-        match (claimed, accepted) {
-            (true, true) if self.is_dm(topic) => "my bot".to_string(),
-            (true, true) => "bot".to_string(),
-            (true, false) => format!("{who} (bot claim not accepted)"),
-            _ => who,
-        }
+        author_label(who, self.is_dm(topic), claimed, accepted)
     }
 
     /// Whether this node may add members to the channel (`Manage` access).
