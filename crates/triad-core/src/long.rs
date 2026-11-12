@@ -23,11 +23,13 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{MAX_TEXT_BYTES, VERSION};
+use crate::envelope::{MAX_DM_TEXT_BYTES, MAX_TEXT_BYTES, VERSION};
 
 /// Largest ciphertext taken from a plain stream: the longest text plus the
 /// 16-byte tag. Larger bodies are ignored.
 pub const MAX_CIPHERTEXT_BYTES: usize = MAX_TEXT_BYTES + 16;
+/// The same for the personal bot's DM ([`MAX_DM_TEXT_BYTES`]).
+pub const MAX_DM_CIPHERTEXT_BYTES: usize = MAX_DM_TEXT_BYTES + 16;
 
 /// The `text` of a long message's space message, shown by builds that do not
 /// know long messages.
@@ -72,9 +74,14 @@ pub fn stream_topic(space: &[u8; 32]) -> [u8; 32] {
 
 /// Encrypts `text` under a fresh key.
 pub fn seal(text: &str) -> Result<(LongRef, LongBody)> {
+    seal_up_to(text, MAX_TEXT_BYTES)
+}
+
+/// [`seal`] with a limit of `max` bytes.
+pub fn seal_up_to(text: &str, max: usize) -> Result<(LongRef, LongBody)> {
     ensure!(
-        text.len() <= MAX_TEXT_BYTES,
-        "message is {} bytes, limit is {MAX_TEXT_BYTES}",
+        text.len() <= max,
+        "message is {} bytes, limit is {max}",
         text.len()
     );
     let mut key = [0u8; 32];
@@ -98,6 +105,11 @@ pub fn seal(text: &str) -> Result<(LongRef, LongBody)> {
 
 /// Checks `ciphertext` against `long` and decrypts it.
 pub fn open(long: &LongRef, ciphertext: &[u8]) -> Result<String> {
+    open_up_to(long, ciphertext, MAX_TEXT_BYTES)
+}
+
+/// [`open`] with a limit of `max` bytes.
+pub fn open_up_to(long: &LongRef, ciphertext: &[u8], max: usize) -> Result<String> {
     ensure!(
         hash_of(ciphertext) == long.hash,
         "long message body does not match its hash"
@@ -106,7 +118,7 @@ pub fn open(long: &LongRef, ciphertext: &[u8]) -> Result<String> {
         .decrypt(Nonce::from_slice(&NONCE), ciphertext)
         .map_err(|_| anyhow!("cannot decrypt a long message"))?;
     ensure!(
-        plain.len() == long.len as usize && plain.len() <= MAX_TEXT_BYTES,
+        plain.len() == long.len as usize && plain.len() <= max,
         "long message is {} bytes, expected {}",
         plain.len(),
         long.len
@@ -140,6 +152,15 @@ mod tests {
         assert!(open(&long, &tampered).is_err());
 
         assert!(seal(&"x".repeat(MAX_TEXT_BYTES + 1)).is_err());
+        // The DM's longer limit, and only where it is asked for.
+        let dm = "y".repeat(MAX_DM_TEXT_BYTES);
+        let (long, body) = seal_up_to(&dm, MAX_DM_TEXT_BYTES).unwrap();
+        assert!(open(&long, &body.ciphertext).is_err());
+        assert_eq!(
+            open_up_to(&long, &body.ciphertext, MAX_DM_TEXT_BYTES).unwrap(),
+            dm
+        );
+        assert!(seal_up_to(&format!("{dm}y"), MAX_DM_TEXT_BYTES).is_err());
     }
 
     #[test]

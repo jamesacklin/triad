@@ -6,11 +6,15 @@
 //! messages, asks [`policy`] what to do, builds a [`context`], and runs a
 //! turn with [`run_turn`] off its event loop.
 
+pub mod assistant;
 pub mod brain;
+pub mod builtin;
 pub mod context;
 pub mod http;
 pub mod mcp;
 pub mod policy;
+pub mod schedule;
+pub mod skills;
 pub mod tools;
 
 use std::path::{Path, PathBuf};
@@ -18,12 +22,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
+use triad_core::envelope::{MAX_DM_TEXT_BYTES, MAX_TEXT_BYTES, truncate_text};
 
 use crate::brain::{Brain, MockBrain, ModelBrain, TurnOutput};
 use crate::context::TurnInput;
 use crate::policy::{Limits, ToolSet};
-use crate::tools::{Audit, FakeTools, Gate, NoTools, ToolSpec, Tools};
+use crate::tools::{Audit, Both, CallContext, FakeTools, Gate, NoTools, Scope, ToolSpec, Tools};
 
 /// Model references shown when asking for one. There is no default model:
 /// the user picks the vendor, and with it who sees the bots' messages.
@@ -31,6 +35,8 @@ pub const EXAMPLE_MODELS: &str =
     "openrouter/anthropic/claude-opus-5.5, openai/gpt-5.5 or ollama/qwen3:4b";
 /// The bots' settings file in the data directory.
 pub const CONFIG_FILE: &str = "agent.json";
+/// The persona file read when `agent.json` names none.
+pub const PERSONA_FILE: &str = "persona.md";
 /// Keys saved with `/bot provider-key`, by vendor, readable only by the
 /// user. A vendor's environment variable wins over it.
 pub const KEYS_FILE: &str = "keys.json";
@@ -63,7 +69,8 @@ pub enum BrainKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolsKind {
-    /// `mcp.json` in the data directory; none if the file is missing.
+    /// The built-in tools (unless turned off) and the servers in `mcp.json`
+    /// in the data directory, if the file is there.
     Mcp,
     /// `TRIAD_AGENT_FAKE_TOOLS`.
     Fake(PathBuf),
@@ -74,8 +81,14 @@ pub enum ToolsKind {
 pub struct AgentConfig {
     pub brain: BrainKind,
     pub tools: ToolsKind,
+    /// Whether the bots have the built-in tools (`web.*`, `time.*`).
+    pub builtin: bool,
+    /// Replaces the search service's endpoint.
+    pub search_url: Option<String>,
     pub persona: Option<PathBuf>,
     pub limits: Limits,
+    /// Minutes east of UTC that schedule times are written in.
+    pub utc_offset_minutes: i32,
 }
 
 /// A configuration the user must fix before the bots can run.
@@ -114,6 +127,12 @@ struct FileConfig {
     base_url: Option<String>,
     /// A file whose text is added to the system prompt.
     persona: Option<PathBuf>,
+    /// `false` leaves out the built-in tools.
+    builtin: Option<bool>,
+    /// Minutes east of UTC for schedule times (`-300` for UTC-5). There is
+    /// no time zone database, so a change of daylight saving time means
+    /// changing this.
+    utc_offset_minutes: Option<i32>,
 }
 
 impl FileConfig {
@@ -128,7 +147,9 @@ impl FileConfig {
     }
 }
 
-fn read_keys(data_dir: &Path) -> Result<std::collections::BTreeMap<String, String>, UsageError> {
+pub(crate) fn read_keys(
+    data_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, UsageError> {
     let path = data_dir.join(KEYS_FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -190,6 +211,22 @@ fn reference(brain: Option<&str>, file_model: Option<String>) -> Option<String> 
     })
 }
 
+/// The persona file the bots read: `TRIAD_AGENT_PERSONA`, else `persona` in
+/// `agent.json`, else `persona.md` in the data directory (which need not
+/// exist yet).
+pub fn persona_path(data_dir: &Path) -> Result<PathBuf, UsageError> {
+    let file = FileConfig::read(data_dir)?;
+    Ok(env("TRIAD_AGENT_PERSONA")
+        .map(PathBuf::from)
+        .or(file.persona.map(|p| data_dir.join(p)))
+        .unwrap_or_else(|| data_dir.join(PERSONA_FILE)))
+}
+
+/// `utc_offset_minutes` from `agent.json`, 0 if unset.
+pub fn configured_utc_offset(data_dir: &Path) -> Result<i32, UsageError> {
+    Ok(FileConfig::read(data_dir)?.utc_offset_minutes.unwrap_or(0))
+}
+
 /// Saves `vendor/model` as the bots' model in `agent.json`, keeping its
 /// other fields. Checks the vendor, not the key.
 pub fn save_model(data_dir: &Path, model: &str) -> Result<()> {
@@ -209,8 +246,9 @@ pub fn save_model(data_dir: &Path, model: &str) -> Result<()> {
 }
 
 /// Saves a key for `vendor` in `keys.json`, which only the user can read.
+/// `vendor` is a model vendor or the search service.
 pub fn save_key(data_dir: &Path, vendor: &str, key: &str) -> Result<()> {
-    if brain::key_vars(vendor).is_empty() {
+    if vendor != builtin::SEARCH_VENDOR && brain::key_vars(vendor).is_empty() {
         brain::vendor_of(&format!("{vendor}/x")).map_err(anyhow::Error::msg)?;
         bail!("{vendor} needs no key");
     }
@@ -289,15 +327,40 @@ impl AgentConfig {
             channel_per_day: env_num("TRIAD_AGENT_CHANNEL_PER_DAY", d.channel_per_day)?,
             channel_per_minute: env_num("TRIAD_AGENT_BURST_PER_MINUTE", d.channel_per_minute)?,
             max_steps: env_num("TRIAD_AGENT_MAX_STEPS", d.max_steps as u64)? as usize,
+            dm_max_steps: env_num("TRIAD_AGENT_DM_MAX_STEPS", d.dm_max_steps as u64)? as usize,
         };
         let persona = env("TRIAD_AGENT_PERSONA")
             .map(PathBuf::from)
-            .or(file.persona.map(|p| data_dir.join(p)));
+            .or(file.persona.map(|p| data_dir.join(p)))
+            .or_else(|| {
+                let default = data_dir.join(PERSONA_FILE);
+                default.exists().then_some(default)
+            });
+        let builtin = match env("TRIAD_AGENT_BUILTIN").as_deref() {
+            None => file.builtin.unwrap_or(true),
+            Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                return Err(UsageError(format!(
+                    "TRIAD_AGENT_BUILTIN must be on or off, got {other:?}"
+                )));
+            }
+        };
+        let utc_offset_minutes = file.utc_offset_minutes.unwrap_or(0);
+        if !(-14 * 60..=14 * 60).contains(&utc_offset_minutes) {
+            return Err(UsageError(format!(
+                "utc_offset_minutes in {CONFIG_FILE} must be between -840 and 840, got \
+                 {utc_offset_minutes}"
+            )));
+        }
         Ok(AgentConfig {
             brain,
             tools,
+            builtin,
+            search_url: env("TRIAD_AGENT_SEARCH_URL"),
             persona,
             limits,
+            utc_offset_minutes,
         })
     }
 }
@@ -308,6 +371,10 @@ pub struct Agent {
     pub tools: Arc<dyn Tools>,
     pub persona: Option<String>,
     pub limits: Limits,
+    /// Minutes east of UTC that schedule times are written in.
+    pub utc_offset_minutes: i32,
+    /// The persona file, read again at each turn so edits apply at once.
+    pub persona_path: Option<PathBuf>,
     /// Every tool the bots have.
     pub all_tools: Vec<ToolSpec>,
     /// Problems found at start (an MCP server that did not connect), for
@@ -339,22 +406,68 @@ fn brain(config: &AgentConfig) -> Result<Arc<dyn Brain>> {
 }
 
 impl Agent {
-    pub async fn start(config: &AgentConfig, data_dir: &Path) -> Result<Agent> {
+    /// Starts the bots. With a `store`, the personal bot also has its own
+    /// DM-only tools (memory) over it.
+    pub async fn start(
+        config: &AgentConfig,
+        data_dir: &Path,
+        store: Option<Arc<dyn assistant::Store>>,
+    ) -> Result<Agent> {
         let brain = brain(config)?;
         let mut warnings = Vec::new();
-        let tools: Arc<dyn Tools> = match &config.tools {
+        let mut tools: Arc<dyn Tools> = match &config.tools {
             ToolsKind::Fake(path) => Arc::new(FakeTools::load(path)?),
             ToolsKind::Mcp => {
                 let path = data_dir.join(mcp::CONFIG_FILE);
-                if path.exists() {
+                let mcp: Option<Arc<dyn Tools>> = if path.exists() {
                     let (tools, failed) = mcp::McpTools::connect(&path).await?;
                     warnings.extend(failed);
-                    Arc::new(tools)
+                    Some(Arc::new(tools))
                 } else {
-                    Arc::new(NoTools)
+                    None
+                };
+                let builtin: Option<Arc<dyn Tools>> = config.builtin.then(|| {
+                    Arc::new(builtin::Builtin::new(
+                        data_dir,
+                        config.search_url.as_deref(),
+                    )) as _
+                });
+                match (builtin, mcp) {
+                    (Some(b), Some(m)) => {
+                        let both = Both::new(b, m);
+                        for name in &both.hidden {
+                            warnings.push(format!(
+                                "MCP server {name} is left out: the built-in tools use that \
+                                 name. Rename it in {}",
+                                mcp::CONFIG_FILE
+                            ));
+                        }
+                        Arc::new(both)
+                    }
+                    (Some(one), None) | (None, Some(one)) => one,
+                    (None, None) => Arc::new(NoTools),
                 }
             }
         };
+        if let Some(found) = skills::Skills::load(data_dir) {
+            let both = Both::new(Arc::new(found), tools);
+            for name in &both.hidden {
+                warnings.push(format!(
+                    "tool server {name} is left out: the skills use that name"
+                ));
+            }
+            tools = Arc::new(both);
+        }
+        if let Some(store) = store {
+            let own = assistant::Assistant::new(store, config.utc_offset_minutes);
+            let both = Both::new(Arc::new(own), tools);
+            for name in &both.hidden {
+                warnings.push(format!(
+                    "tool server {name} is left out: the personal bot's own tools use that name"
+                ));
+            }
+            tools = Arc::new(both);
+        }
         let persona = match &config.persona {
             Some(p) => Some(
                 std::fs::read_to_string(p)
@@ -363,14 +476,16 @@ impl Agent {
             None => None,
         };
         let all_tools = tools.list();
-        if config.limits.max_steps == 0 {
-            bail!("TRIAD_AGENT_MAX_STEPS must be at least 1");
+        if config.limits.max_steps == 0 || config.limits.dm_max_steps == 0 {
+            bail!("TRIAD_AGENT_MAX_STEPS and TRIAD_AGENT_DM_MAX_STEPS must be at least 1");
         }
         Ok(Agent {
             brain,
             tools,
             persona,
             limits: config.limits,
+            utc_offset_minutes: config.utc_offset_minutes,
+            persona_path: config.persona.clone(),
             all_tools,
             warnings,
         })
@@ -384,6 +499,8 @@ impl Agent {
             tools: self.tools.clone(),
             persona: self.persona.clone(),
             limits: self.limits,
+            utc_offset_minutes: self.utc_offset_minutes,
+            persona_path: self.persona_path.clone(),
             all_tools: self.all_tools.clone(),
             warnings: Vec::new(),
         })
@@ -393,15 +510,42 @@ impl Agent {
         self.brain.provider()
     }
 
+    /// The persona as its file reads now: none if the file was removed, the
+    /// text read at start if it cannot be read.
+    pub fn persona_now(&self) -> Option<String> {
+        let Some(path) = &self.persona_path else {
+            return self.persona.clone();
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => self.persona.clone(),
+        }
+    }
+
+    /// Every server the bots have, the DM's own included.
     pub fn servers(&self) -> Vec<String> {
         tools::servers(&self.all_tools)
+    }
+
+    /// The servers a channel's bot can use: those with a tool of any scope.
+    /// This is what a channel is told about.
+    pub fn channel_servers(&self) -> Vec<String> {
+        let any: Vec<ToolSpec> = self
+            .all_tools
+            .iter()
+            .filter(|t| t.scope == Scope::Any)
+            .cloned()
+            .collect();
+        tools::servers(&any)
     }
 }
 
 /// What a turn sends back to the event loop.
 #[derive(Clone, Debug, Default)]
 pub struct TurnResult {
-    /// The reply, at most `MAX_TEXT_BYTES`.
+    /// The reply: at most `MAX_TEXT_BYTES` in a channel, `MAX_DM_TEXT_BYTES`
+    /// in the DM.
     pub text: String,
     /// Tools the gate refused.
     pub denied: Vec<String>,
@@ -431,14 +575,27 @@ pub async fn run_turn(
     audit: &dyn Audit,
     input: &TurnInput,
 ) -> Result<TurnResult> {
-    let gate = Gate::new(agent.tools.as_ref(), allowed, agent.limits.max_steps, audit);
+    let gate = Gate::new(
+        agent.tools.as_ref(),
+        CallContext::of(input),
+        allowed,
+        agent.limits.steps(input.kind),
+        audit,
+    );
     let output = agent.brain.turn(input, &gate).await?;
     let denied = gate.denied();
     // A tool that was offered can only have been refused by the step
-    // limit; the rest were not permitted for this asker.
+    // limit, and a DM-only one in a channel by its scope (the model was
+    // told why); the rest were not permitted for this asker.
+    let dm_only = |t: &str| {
+        agent
+            .all_tools
+            .iter()
+            .any(|s| s.name == t && s.scope == Scope::DmOnly)
+    };
     let refused: Vec<String> = denied
         .iter()
-        .filter(|t| !offered(input, t))
+        .filter(|t| !offered(input, t) && !dm_only(t))
         .cloned()
         .collect();
     let text = if refused.is_empty() {
@@ -452,11 +609,19 @@ pub async fn run_turn(
         text
     };
     Ok(TurnResult {
-        text: truncate_text(&text, MAX_TEXT_BYTES),
+        text: truncate_text(&text, max_reply_bytes(input.kind)),
         denied,
         tool_time: gate.tool_time(),
         output,
     })
+}
+
+/// The longest reply a turn of `kind` sends; the rest is cut.
+pub fn max_reply_bytes(kind: context::Kind) -> usize {
+    match kind {
+        context::Kind::Dm => MAX_DM_TEXT_BYTES,
+        context::Kind::Channel => MAX_TEXT_BYTES,
+    }
 }
 
 /// Whether a tool was offered to the asker.
@@ -476,17 +641,19 @@ mod tests {
             tools: Arc::new(NoTools),
             persona: None,
             limits: Limits::default(),
+            utc_offset_minutes: 0,
+            persona_path: None,
             all_tools: Vec::new(),
             warnings: Vec::new(),
         };
-        let input = TurnInput {
-            kind: Kind::Dm,
+        let mut input = TurnInput {
+            kind: Kind::Channel,
             channel: "agent".into(),
             system: String::new(),
             transcript: Vec::new(),
             asker: "a".into(),
             asker_tier: "host".into(),
-            ask: "é".repeat(1100),
+            ask: "é".repeat(8100),
             tools: Vec::new(),
             unavailable: Vec::new(),
             host: "a".into(),
@@ -495,6 +662,19 @@ mod tests {
             .await
             .unwrap();
         assert!(r.text.len() <= MAX_TEXT_BYTES, "{}", r.text.len());
+        assert!(r.text.ends_with('…'));
+        // The DM's replies go as long messages, with a higher limit.
+        input.kind = Kind::Dm;
+        input.ask = "é".repeat(2000);
+        let r = run_turn(&agent, ToolSet::All, &crate::tools::NoAudit, &input)
+            .await
+            .unwrap();
+        assert_eq!(r.text, format!("echo: {}", input.ask));
+        input.ask = "é".repeat(8100);
+        let r = run_turn(&agent, ToolSet::All, &crate::tools::NoAudit, &input)
+            .await
+            .unwrap();
+        assert!(r.text.len() <= MAX_DM_TEXT_BYTES && r.text.len() > MAX_TEXT_BYTES);
         assert!(r.text.ends_with('…'));
     }
 

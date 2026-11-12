@@ -19,6 +19,11 @@ pub const MAX_TEXT_BYTES: usize = 2_000;
 /// synced. 400 leaves a margin. Longer text, up to [`MAX_TEXT_BYTES`], goes
 /// as a long message ([`crate::long`]). See FINDINGS.md, "Bots", H7.
 pub const SEND_TEXT_BYTES: usize = 400;
+/// Longest text in the personal bot's DM, a one-member space that only its
+/// owner's node reads, so no other build needs to accept it. Used for the
+/// bot's replies there, which go as long messages. Everywhere else the limit
+/// stays [`MAX_TEXT_BYTES`].
+pub const MAX_DM_TEXT_BYTES: usize = 16_000;
 const MAX_NICKNAME_CHARS: usize = 24;
 /// Invite prefix.
 pub const INVITE_PREFIX: &str = "triad1-";
@@ -121,8 +126,15 @@ pub fn truncate_text(text: &str, max: usize) -> String {
 
 impl ChatBody {
     pub fn new(text: &str, sent_at_ms: u64) -> Result<Self> {
-        if text.len() > MAX_TEXT_BYTES {
-            bail!("message is {} bytes, limit is {MAX_TEXT_BYTES}", text.len());
+        Self::new_up_to(text, sent_at_ms, MAX_TEXT_BYTES)
+    }
+
+    /// A message of up to `max` bytes, for where a longer limit applies
+    /// ([`MAX_DM_TEXT_BYTES`]). Over [`SEND_TEXT_BYTES`] it must be sent as a
+    /// long message.
+    pub fn new_up_to(text: &str, sent_at_ms: u64, max: usize) -> Result<Self> {
+        if text.len() > max {
+            bail!("message is {} bytes, limit is {max}", text.len());
         }
         Ok(ChatBody {
             v: VERSION,

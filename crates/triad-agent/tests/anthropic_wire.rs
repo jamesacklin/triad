@@ -113,6 +113,8 @@ async fn rig_brain_runs_a_tool_turn() {
         tools: Arc::new(tools),
         persona: None,
         limits: Limits::default(),
+        utc_offset_minutes: 0,
+        persona_path: None,
         all_tools: all_tools.clone(),
         warnings: Vec::new(),
     };
@@ -220,6 +222,8 @@ async fn openrouter_brain_runs_a_tool_turn() {
         tools: Arc::new(tools),
         persona: None,
         limits: Limits::default(),
+        utc_offset_minutes: 0,
+        persona_path: None,
         all_tools: all_tools.clone(),
         warnings: Vec::new(),
     };

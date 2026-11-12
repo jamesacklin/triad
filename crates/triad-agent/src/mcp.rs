@@ -25,7 +25,7 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::tools::{BoxFuture, ToolSpec, Tools};
+use crate::tools::{BoxFuture, CallContext, Scope, ToolSpec, Tools};
 
 pub const CONFIG_FILE: &str = "mcp.json";
 
@@ -148,6 +148,7 @@ impl McpTools {
                     name: format!("{}.{}", cfg.name, t.name),
                     description: t.description.map(|d| d.to_string()).unwrap_or_default(),
                     schema: Value::Object((*t.input_schema).clone()),
+                    scope: Scope::Any,
                 });
             }
             servers.push(Server {
@@ -172,7 +173,12 @@ impl Tools for McpTools {
         self.specs.clone()
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        _: &'a CallContext,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             let (server, tool) = name
                 .split_once('.')

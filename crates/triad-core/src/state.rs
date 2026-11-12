@@ -384,7 +384,37 @@ impl State {
              );
              CREATE INDEX IF NOT EXISTS long_waiting_hash ON long_waiting (hash);
              CREATE INDEX IF NOT EXISTS messages_topic ON messages (topic);
-             CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);",
+             CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);
+             CREATE TABLE IF NOT EXISTS bot_memory (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 text TEXT NOT NULL,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS bot_memory_fts USING fts5(
+                 text, content='bot_memory', content_rowid='id'
+             );
+             CREATE TRIGGER IF NOT EXISTS bot_memory_ai AFTER INSERT ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (rowid, text) VALUES (new.id, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS bot_memory_ad AFTER DELETE ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (bot_memory_fts, rowid, text)
+                 VALUES ('delete', old.id, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS bot_memory_au AFTER UPDATE OF text ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (bot_memory_fts, rowid, text)
+                 VALUES ('delete', old.id, old.text);
+                 INSERT INTO bot_memory_fts (rowid, text) VALUES (new.id, new.text);
+             END;
+             CREATE TABLE IF NOT EXISTS bot_schedules (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 prompt TEXT NOT NULL,
+                 next_at_ms INTEGER NOT NULL,
+                 every_ms INTEGER,
+                 last_fired_ms INTEGER,
+                 created_at_ms INTEGER NOT NULL
+             );",
         )?;
         Ok(State { conn })
     }
@@ -1147,6 +1177,261 @@ impl State {
     }
 }
 
+/// One saved memory of the personal bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub text: String,
+    pub pinned: bool,
+    pub created_at_ms: u64,
+}
+
+/// The words of a search, as FTS5 prefix terms. Anything but letters and
+/// digits separates words, so the query cannot use FTS5 syntax.
+fn fts_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{}\"*", w.to_lowercase()))
+        .collect()
+}
+
+impl State {
+    // --- the personal bot's memory -------------------------------------
+
+    pub fn memory_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM bot_memory", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Saves a memory. Returns its ID.
+    pub fn memory_save(&self, text: &str, pinned: bool) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO bot_memory (text, pinned, created_at_ms) VALUES (?1, ?2, ?3)",
+            params![text, pinned, now_ms() as i64],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Changes a memory's text and pin. Whether it existed.
+    pub fn memory_update(&self, id: i64, text: &str, pinned: bool) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE bot_memory SET text = ?2, pinned = ?3 WHERE id = ?1",
+            params![id, text, pinned],
+        )? > 0)
+    }
+
+    /// Whether a memory with this ID existed.
+    pub fn memory_forget(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM bot_memory WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    fn memories(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<MemoryRow>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                pinned: r.get(2)?,
+                created_at_ms: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Up to `count` memories matching `query`. Those holding every word
+    /// (or a word it starts) come first, newest first; if there are none,
+    /// those holding any word, best match first. An empty query lists the
+    /// newest.
+    pub fn memory_search(&self, query: &str, count: usize) -> Result<Vec<MemoryRow>> {
+        let terms = fts_terms(query);
+        let limit = count as i64;
+        if terms.is_empty() {
+            return self.memories(
+                "SELECT id, text, pinned, created_at_ms FROM bot_memory
+                 ORDER BY id DESC LIMIT ?1",
+                &[&limit],
+            );
+        }
+        let all = self.memories(
+            "SELECT m.id, m.text, m.pinned, m.created_at_ms
+             FROM bot_memory_fts f JOIN bot_memory m ON m.id = f.rowid
+             WHERE bot_memory_fts MATCH ?1 ORDER BY m.id DESC LIMIT ?2",
+            &[&terms.join(" AND "), &limit],
+        )?;
+        if !all.is_empty() || terms.len() == 1 {
+            return Ok(all);
+        }
+        self.memories(
+            "SELECT m.id, m.text, m.pinned, m.created_at_ms
+             FROM bot_memory_fts f JOIN bot_memory m ON m.id = f.rowid
+             WHERE bot_memory_fts MATCH ?1 ORDER BY f.rank, m.id DESC LIMIT ?2",
+            &[&terms.join(" OR "), &limit],
+        )
+    }
+
+    /// Pinned memories, oldest first.
+    pub fn memory_pinned(&self) -> Result<Vec<MemoryRow>> {
+        self.memories(
+            "SELECT id, text, pinned, created_at_ms FROM bot_memory
+             WHERE pinned = 1 ORDER BY id",
+            &[],
+        )
+    }
+}
+
+/// One schedule of the personal bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleRow {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub next_at_ms: u64,
+    /// `None` for a one-shot.
+    pub every_ms: Option<u64>,
+    pub last_fired_ms: Option<u64>,
+    pub created_at_ms: u64,
+}
+
+impl State {
+    // --- the personal bot's schedules ----------------------------------
+
+    pub fn schedule_add(
+        &self,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO bot_schedules (name, prompt, next_at_ms, every_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                prompt,
+                next_at_ms as i64,
+                every_ms.map(|e| e as i64),
+                now_ms() as i64
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn schedules_where(
+        &self,
+        clause: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<ScheduleRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, name, prompt, next_at_ms, every_ms, last_fired_ms, created_at_ms
+             FROM bot_schedules {clause}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(ScheduleRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                prompt: r.get(2)?,
+                next_at_ms: r.get::<_, i64>(3)? as u64,
+                every_ms: r.get::<_, Option<i64>>(4)?.map(|e| e as u64),
+                last_fired_ms: r.get::<_, Option<i64>>(5)?.map(|e| e as u64),
+                created_at_ms: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every schedule, soonest first.
+    pub fn schedules(&self) -> Result<Vec<ScheduleRow>> {
+        self.schedules_where("ORDER BY next_at_ms, id", &[])
+    }
+
+    pub fn schedule(&self, id: i64) -> Result<Option<ScheduleRow>> {
+        Ok(self.schedules_where("WHERE id = ?1", &[&id])?.pop())
+    }
+
+    /// Schedules whose time has come, soonest first.
+    pub fn due_schedules(&self, now_ms: u64) -> Result<Vec<ScheduleRow>> {
+        self.schedules_where(
+            "WHERE next_at_ms <= ?1 ORDER BY next_at_ms, id",
+            &[&(now_ms as i64)],
+        )
+    }
+
+    /// Whether a schedule with this ID existed.
+    pub fn schedule_remove(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM bot_schedules WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    /// Changes a schedule. Whether it existed.
+    pub fn schedule_update(
+        &self,
+        id: i64,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE bot_schedules SET name = ?2, prompt = ?3, next_at_ms = ?4, every_ms = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                name,
+                prompt,
+                next_at_ms as i64,
+                every_ms.map(|e| e as i64)
+            ],
+        )? > 0)
+    }
+
+    /// Sets when a schedule fires next.
+    pub fn schedule_set_next(&self, id: i64, next_at_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bot_schedules SET next_at_ms = ?2 WHERE id = ?1",
+            params![id, next_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records a fire before its message is posted, in one transaction: a
+    /// recurring schedule moves to `next`, a one-shot (`next` is `None`) is
+    /// removed. Returns false if the row was no longer due as `due_at_ms`
+    /// (another fire, or an edit, got there first), in which case nothing
+    /// changed and the caller must not post.
+    pub fn schedule_fired(
+        &mut self,
+        id: i64,
+        due_at_ms: u64,
+        now_ms: u64,
+        next: Option<u64>,
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = match next {
+            Some(next) => tx.execute(
+                "UPDATE bot_schedules SET next_at_ms = ?3, last_fired_ms = ?4
+                 WHERE id = ?1 AND next_at_ms = ?2",
+                params![id, due_at_ms as i64, next as i64, now_ms as i64],
+            )?,
+            None => tx.execute(
+                "DELETE FROM bot_schedules WHERE id = ?1 AND next_at_ms = ?2",
+                params![id, due_at_ms as i64],
+            )?,
+        };
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+}
+
 fn migrate_layout(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let has_column = |table: &str, column: &str| -> Result<bool> {
@@ -1451,6 +1736,94 @@ mod tests {
                 .map(String::as_str),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn memory_is_saved_searched_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let plumber = state
+            .memory_save("The plumber is Dana, 555-0100", true)
+            .unwrap();
+        let dentist = state
+            .memory_save("Dentist appointment on Friday", false)
+            .unwrap();
+        state.memory_save("Dana likes tea", false).unwrap();
+        assert_eq!(state.memory_count().unwrap(), 3);
+        let ids = |q: &str| -> Vec<i64> {
+            state
+                .memory_search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        // Case, punctuation and prefixes; FTS5 syntax is just words.
+        assert_eq!(ids("PLUMB"), [plumber]);
+        assert_eq!(ids("dana"), [plumber + 2, plumber]);
+        assert_eq!(ids("who is the plumber?"), [plumber]);
+        assert_eq!(ids("\"dentist\" OR NEAR("), [dentist]);
+        assert_eq!(ids(""), [plumber + 2, dentist, plumber]);
+        assert!(ids("zebra").is_empty());
+        let pinned = state.memory_pinned().unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned[0].pinned && pinned[0].text.contains("Dana"));
+        assert!(
+            state
+                .memory_update(plumber, "The plumber is Lee", true)
+                .unwrap()
+        );
+        assert_eq!(ids("lee"), [plumber]);
+        assert!(ids("dana").len() == 1, "the old text left the index");
+        assert!(state.memory_forget(plumber).unwrap());
+        assert!(!state.memory_forget(plumber).unwrap());
+        assert!(!state.memory_update(plumber, "x", false).unwrap());
+        assert_eq!(ids("plumber"), Vec::<i64>::new());
+        assert!(state.memory_pinned().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schedules_fire_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        let once = state.schedule_add("once", "Say hi.", 1_000, None).unwrap();
+        let every = state
+            .schedule_add("hourly", "Check.", 2_000, Some(3_600_000))
+            .unwrap();
+        state.schedule_add("later", "Later.", 9_000, None).unwrap();
+        let due: Vec<i64> = state
+            .due_schedules(5_000)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(due, [once, every]);
+        assert!(state.schedule_fired(once, 1_000, 5_000, None).unwrap());
+        // A second fire of the same due time changes nothing.
+        assert!(!state.schedule_fired(once, 1_000, 5_000, None).unwrap());
+        assert!(state.schedule(once).unwrap().is_none());
+        assert!(
+            state
+                .schedule_fired(every, 2_000, 5_000, Some(3_602_000))
+                .unwrap()
+        );
+        assert!(
+            !state
+                .schedule_fired(every, 2_000, 5_000, Some(3_602_000))
+                .unwrap()
+        );
+        let row = state.schedule(every).unwrap().unwrap();
+        assert_eq!(row.next_at_ms, 3_602_000);
+        assert_eq!(row.last_fired_ms, Some(5_000));
+        assert_eq!(state.schedules().unwrap().len(), 2);
+        assert!(state.schedule_update(every, "h", "P.", 7, None).unwrap());
+        let row = state.schedule(every).unwrap().unwrap();
+        assert_eq!(
+            (row.name.as_str(), row.next_at_ms, row.every_ms),
+            ("h", 7, None)
+        );
+        assert!(state.schedule_remove(every).unwrap());
+        assert!(!state.schedule_remove(every).unwrap());
     }
 
     #[test]

@@ -232,6 +232,7 @@ Set the model in `agent.json` in the data directory, kept between sessions:
 | `model` | `TRIAD_AGENT_MODEL` | `vendor/model`. |
 | `base_url` | `TRIAD_AGENT_BASE_URL` | Replaces the vendor's endpoint: a proxy, or a local server on another port. |
 | `persona` | `TRIAD_AGENT_PERSONA` | A file whose text is added to the system prompt (relative to the data directory). |
+| `builtin` | `TRIAD_AGENT_BUILTIN` (`on` or `off`) | `false` leaves out the [built-in tools](#built-in-tools). |
 
 `TRIAD_AGENT_BRAIN=mock` runs a scripted stand-in with no model (the tests
 use it). The older `TRIAD_AGENT_BRAIN=anthropic` and `=openrouter` still
@@ -242,6 +243,83 @@ must name its vendor. Limits:
 `TRIAD_AGENT_MAX_STEPS`. MCP servers go in `mcp.json` in the data
 directory, tokens named by environment variable.
 
+#### Built-in tools
+
+Your bots have these without any MCP server. They are named like MCP tools,
+so grants (`/grant <node> web.*`), the audit log and the rule that admins
+get every tool apply to them unchanged.
+
+| Tool | What it does |
+| --- | --- |
+| `web.search` | Searches the web through the [Brave Search API](https://brave.com/search/api/). Needs a key: `/bot provider-key brave <key>`, or `BRAVE_API_KEY`. Queries go to Brave. |
+| `web.fetch` | Fetches a public page over http or https and returns its text. No JavaScript, no logins. The request comes from your machine, so the site sees your address. |
+| `time.now` | The date and time in UTC. |
+
+In your DM (`#agent`) only, the personal bot also has a memory that lasts
+between conversations:
+
+| Tool | What it does |
+| --- | --- |
+| `memory.save` | Saves a fact, preference or note (at most 2,000 bytes; at most 2,000 memories). A pinned one is shown to the bot in every DM turn (2,000 bytes of them in all). |
+| `memory.search` | Finds memories by their words, newest first. |
+| `memory.forget` | Deletes one by its ID. |
+
+| `schedule.add` | Schedules a prompt: once (`at`: `in 20m`, `09:00`, `2026-11-13 09:00`) or repeating (`every`: `30m`, `1d`, at least `5m`, with an optional `time` of day). At most 50. |
+| `schedule.list`, `schedule.remove` | Lists schedules, or removes one by its ID. |
+
+Memories and schedules are rows in `state.sqlite` (encrypted with it under
+SQLCipher). Channel turns are never offered these tools and never see a
+memory, and a channel is not told they exist.
+
+In the DM the bot also has more room: replies up to 16,000 bytes (sent as
+long messages, since only you read the DM), up to 4,096 output tokens per
+model request and 24 tool calls per turn (`TRIAD_AGENT_DM_MAX_STEPS`). A
+channel's bot keeps one message of 2,000 bytes, 1,024 tokens and 8 tool
+calls (`TRIAD_AGENT_MAX_STEPS`).
+
+**Skills** are standing instructions you write as `skills/<name>.md` in
+the data directory (`<name>` is letters, digits, `-` and `_`). When the bots
+start, every turn's system prompt lists each skill with a one-line summary
+(the `description:` of YAML front matter, else the file's first line), and
+`skills.read` lets the bot read one before a task it covers. `skills.read`
+works in channels too, for askers whose tools allow it, and reads nothing
+outside `skills/`. Skills and the persona (`persona.md` in the data
+directory, or the file `persona` in `agent.json` names) are read again at
+every turn, so edits apply from the next one; only the first skill, which
+creates `skills/`, needs the session restarted before `skills.read` exists.
+
+### Seeing and changing what the bot keeps
+
+Everything is in the data directory (`~/.local/share/triad` by default).
+`triad bot` shows where, and these work whether or not a chat session is
+running:
+
+| Command | What it does |
+| --- | --- |
+| `triad bot` | Counts and paths: memories, schedules, skills, persona, `agent.json`, `mcp.json`. |
+| `triad bot memory [query]` | Lists memories. `--edit` opens them all in `$VISUAL`/`$EDITOR`, one per line (`<id> [*] <text>`, `*` = pinned): delete a line to forget it, change it to edit it, add `+ text` for a new one. |
+| `triad bot schedules` | Lists schedules. `--edit` opens them as `<id> \| <next> \| <every> \| <name> \| <prompt>`, the same way. |
+| `triad bot skills [name]` | Lists skills or prints one. `triad bot skills <name> --edit` writes `skills/<name>.md`. |
+| `triad bot persona [--edit]` | Prints or edits the persona, the standing instructions in every turn. |
+| `/prompt` (in chat) | The system prompt and tools a turn of yours in the focused channel gets right now. |
+
+An edit that cannot be applied changes nothing and leaves your edited file
+in the data directory to copy from.
+
+A schedule fires by posting its prompt in `#agent` as a line from you,
+`[scheduled: <name>] <prompt>`, which the bot answers like any other. It
+fires only while triad is running with bots: a one-shot that came due while
+it was not running fires on the next start if it is less than a day late and
+is dropped otherwise; a repeating one fires once for everything it missed.
+Times are UTC, or set `"utc_offset_minutes"` in `agent.json` (`-300` for
+UTC-5; there is no time zone database, so change it for daylight saving).
+
+`web.fetch` connects only to public addresses. It refuses this machine,
+private and shared networks and link-local addresses, and checks every
+redirect, so nobody can have your bot read your own network. A tool's result
+is cut to 24,000 bytes before the model sees it. An MCP server named `web`
+or `time` is left out, with a warning at start.
+
 | In chat mode | Behavior |
 | --- | --- |
 | `/bot`, `/bot on`, `/bot off` | Show the focused channel's bot, add yours to it, or remove it. On and off: creator only. |
@@ -250,6 +328,8 @@ directory, tokens named by environment variable.
 | `/grant <node> <server.tool \| server.*>`, `/revoke <node> [pattern]`, `/grants` | Edit grants in the focused channel. Host only. |
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
+| `/memory [query]`, `/forget <id>` | List (or search) what your personal bot remembers, or delete one memory. |
+| `/schedules`, `/unschedule <id>` | List your personal bot's schedules, or remove one. |
 
 ## Terminal interface
 

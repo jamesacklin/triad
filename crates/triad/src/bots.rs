@@ -14,14 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::Value;
+use triad_agent::assistant::{self, Memory, Schedule, Store};
 use triad_agent::context::{self, ContextLimits, HistoryLine, Kind, Turn};
 use triad_agent::policy::{self, ChannelView, Decision, Incoming, Tier, ToolSet};
+use triad_agent::schedule::{self as sched, Due};
 use triad_agent::tools::{Audit, offered, servers};
 use triad_agent::{
     Agent, AgentConfig, KEYS_FILE, TurnResult, configured_model, save_key, save_model,
 };
 use triad_core::envelope::Control;
-use triad_core::state::{BotRow, Job, JobState, NewJob};
+use triad_core::state::{BotRow, Job, JobState, MemoryRow, NewJob, ScheduleRow};
 
 use super::*;
 
@@ -124,6 +126,82 @@ impl Audit for JobAudit {
     }
 }
 
+/// The personal bot's rows, kept in `state.sqlite` through the second
+/// connection worker tasks use.
+struct StateStore(Arc<Mutex<State>>);
+
+impl StateStore {
+    fn db(&self) -> std::sync::MutexGuard<'_, State> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn memory(m: MemoryRow) -> Memory {
+    Memory {
+        id: m.id,
+        text: m.text,
+        pinned: m.pinned,
+        created_at_ms: m.created_at_ms,
+    }
+}
+
+fn schedule(s: ScheduleRow) -> Schedule {
+    Schedule {
+        id: s.id,
+        name: s.name,
+        prompt: s.prompt,
+        next_at_ms: s.next_at_ms,
+        every_ms: s.every_ms,
+    }
+}
+
+/// A storage error as the model sees it; the detail goes to the log.
+fn store_error(e: anyhow::Error) -> String {
+    tracing::error!("bot store: {e:#}");
+    "the bot's storage failed; see triad.log".to_string()
+}
+
+impl Store for StateStore {
+    fn schedule_count(&self) -> Result<u64, String> {
+        Ok(self.db().schedules().map_err(store_error)?.len() as u64)
+    }
+    fn schedule_add(
+        &self,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<i64, String> {
+        self.db()
+            .schedule_add(name, prompt, next_at_ms, every_ms)
+            .map_err(store_error)
+    }
+    fn schedules(&self) -> Result<Vec<Schedule>, String> {
+        let rows = self.db().schedules().map_err(store_error)?;
+        Ok(rows.into_iter().map(schedule).collect())
+    }
+    fn schedule_remove(&self, id: i64) -> Result<bool, String> {
+        self.db().schedule_remove(id).map_err(store_error)
+    }
+    fn memory_count(&self) -> Result<u64, String> {
+        self.db().memory_count().map_err(store_error)
+    }
+    fn memory_save(&self, text: &str, pinned: bool) -> Result<i64, String> {
+        self.db().memory_save(text, pinned).map_err(store_error)
+    }
+    fn memory_search(&self, query: &str, count: usize) -> Result<Vec<Memory>, String> {
+        let rows = self.db().memory_search(query, count).map_err(store_error)?;
+        Ok(rows.into_iter().map(memory).collect())
+    }
+    fn memory_forget(&self, id: i64) -> Result<bool, String> {
+        self.db().memory_forget(id).map_err(store_error)
+    }
+    fn memory_pinned(&self) -> Result<Vec<Memory>, String> {
+        let rows = self.db().memory_pinned().map_err(store_error)?;
+        Ok(rows.into_iter().map(memory).collect())
+    }
+}
+
 fn access_level(a: AccessLevel) -> policy::Access {
     match a {
         AccessLevel::Manage => policy::Access::Manage,
@@ -148,7 +226,9 @@ impl Session {
     pub async fn start_bots(&mut self, config: &AgentConfig, streams: &mut Streams) -> Result<()> {
         let data_dir = self.data_dir.clone();
         let data_dir = data_dir.as_path();
-        let agent = Agent::start(config, data_dir).await?;
+        let audit_db = Arc::new(Mutex::new(State::open(data_dir)?));
+        let store: Arc<dyn Store> = Arc::new(StateStore(audit_db.clone()));
+        let agent = Agent::start(config, data_dir, Some(store)).await?;
         for w in &agent.warnings {
             self.printer.info(w);
         }
@@ -164,7 +244,7 @@ impl Session {
         }
         self.bots = Some(Bots {
             agent: Arc::new(agent),
-            audit_db: Arc::new(Mutex::new(State::open(data_dir)?)),
+            audit_db,
             busy: BTreeSet::new(),
         });
         self.ensure_dm(streams).await?;
@@ -225,6 +305,67 @@ impl Session {
             },
         );
         Ok(topic)
+    }
+
+    /// Fires the personal bot's due schedules: each posts its prompt in the
+    /// DM as a line from this node, which becomes a job by the normal path.
+    /// The fire is recorded (a one-shot removed, a recurring one moved on)
+    /// before the line is posted, so a crash can lose a fire but never
+    /// repeat one. Waits while the bots are off or the DM is not open.
+    pub async fn fire_schedules(&mut self) {
+        let Some(dm) = self.dm else { return };
+        if self.bots.is_none() || !self.channels.get(&dm).is_some_and(|c| c.space.is_some()) {
+            return;
+        }
+        let now = now_ms();
+        let due = match self.state.due_schedules(now) {
+            Ok(due) => due,
+            Err(e) => {
+                self.printer.error(&format!("reading schedules: {e:#}"));
+                return;
+            }
+        };
+        for s in due {
+            let decision = sched::on_due(s.next_at_ms, s.every_ms, now);
+            let next = match decision {
+                Due::Fire { next } => next,
+                Due::Drop => None,
+            };
+            match self.state.schedule_fired(s.id, s.next_at_ms, now, next) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    self.printer.error(&format!("recording a schedule: {e:#}"));
+                    continue;
+                }
+            }
+            let late_ms = now.saturating_sub(s.next_at_ms);
+            if decision == Due::Drop {
+                self.printer.emit(
+                    json!({"event": "schedule_missed", "id": s.id, "name": s.name,
+                           "late_ms": late_ms}),
+                    || {
+                        format!(
+                            "schedule #{} \"{}\" was due {} ago, while triad was not running; \
+                             dropped",
+                            s.id,
+                            s.name,
+                            ago(late_ms)
+                        )
+                    },
+                );
+                continue;
+            }
+            self.printer.emit(
+                json!({"event": "schedule_fired", "id": s.id, "name": s.name,
+                       "late_ms": late_ms, "next_at_ms": next}),
+                || format!("schedule #{} \"{}\" fired", s.id, s.name),
+            );
+            if let Err(e) = self.send(dm, &sched::fired_text(&s.name, &s.prompt)).await {
+                self.printer
+                    .error(&format!("posting schedule #{}: {e:#}", s.id));
+            }
+        }
     }
 
     /// Whether `@bot` can address a bot in the channel.
@@ -409,7 +550,7 @@ impl Session {
             );
             return Ok(false);
         }
-        let input = self.turn_input(job, &msg)?;
+        let input = self.turn_input(job, &msg.text)?;
         self.state
             .set_job_state(&job.op_hash, JobState::Started, None)?;
         self.emit_job(
@@ -451,7 +592,7 @@ impl Session {
     }
 
     /// Builds one turn's model input from the job's own channel only.
-    fn turn_input(&self, job: &Job, msg: &StoredMessage) -> Result<context::TurnInput> {
+    fn turn_input(&self, job: &Job, ask: &str) -> Result<context::TurnInput> {
         let bots = self.bots.as_ref().expect("bots are running");
         let channel = self.channel(&job.topic)?;
         let dm = self.is_dm(&job.topic);
@@ -488,11 +629,15 @@ impl Session {
         let member_list: Vec<(String, String)> =
             members.keys().map(|n| (short_id(n), tier(n))).collect();
         let allowed = ToolSet::parse(&job.tools);
-        let tools = offered(&bots.agent.all_tools, &allowed);
+        let kind = if dm { Kind::Dm } else { Kind::Channel };
+        let tools = offered(&bots.agent.all_tools, &allowed, kind);
         let offered_servers = servers(&tools);
-        let unavailable: Vec<String> = bots
-            .agent
-            .servers()
+        // A channel turn is not told about the DM's own servers.
+        let reachable = match kind {
+            Kind::Dm => bots.agent.servers(),
+            Kind::Channel => bots.agent.channel_servers(),
+        };
+        let unavailable: Vec<String> = reachable
             .into_iter()
             .filter(|s| !offered_servers.contains(s))
             .collect();
@@ -503,23 +648,77 @@ impl Session {
         };
         let host = short_id(&self.me);
         let asker = short_id(&job.asker);
+        // Pinned memories go to the DM's turns only; a channel turn never
+        // reads them.
+        let notes = if dm {
+            let pinned: Vec<Memory> = self
+                .state
+                .memory_pinned()?
+                .into_iter()
+                .map(memory)
+                .collect();
+            assistant::pinned_notes(&pinned)
+        } else {
+            Vec::new()
+        };
+        // Read at each turn, so edits apply without a restart.
+        let persona = bots.agent.persona_now();
+        let skill_list = triad_agent::skills::list(&self.data_dir);
         Ok(context::build(
             Turn {
-                kind: if dm { Kind::Dm } else { Kind::Channel },
+                kind,
                 channel: &channel.meta.name,
-                persona: bots.agent.persona.as_deref(),
+                persona: persona.as_deref(),
                 members: &member_list,
                 history: &history,
                 ask_hash: job.op_hash,
                 asker: &asker,
                 asker_tier: &asker_tier,
-                ask: &msg.text,
+                ask,
                 tools,
                 unavailable,
                 host: &host,
+                notes: &notes,
+                skills: &skill_list,
             },
             ContextLimits::default(),
         ))
+    }
+
+    /// `/prompt`: the system prompt and tools a turn of mine in the focused
+    /// channel would get now, shown here only.
+    fn show_prompt(&self, topic: Topic) -> Result<()> {
+        if self.bots.is_none() {
+            bail!("the bots are not running");
+        }
+        if !self.is_dm(&topic) && !self.hosting(&topic) {
+            bail!("#{} has no bot of yours", self.name(&topic));
+        }
+        let job = Job {
+            op_hash: [0; 32],
+            topic,
+            asker: self.me,
+            state: JobState::Queued,
+            reason: None,
+            tools: ToolSet::All.render(),
+            created_at_ms: now_ms(),
+        };
+        let input = self.turn_input(&job, "")?;
+        let tools: Vec<&str> = input.tools.iter().map(|t| t.name.as_str()).collect();
+        let name = self.name(&topic).to_string();
+        self.printer.emit(
+            json!({"event": "prompt", "channel": name, "system": input.system,
+                   "tools": tools, "transcript_lines": input.transcript.len()}),
+            || {
+                format!(
+                    "[#{name}] system prompt for a turn of yours:\n{}\ntools: {}\n                     (plus the last {} messages of #{name} as the transcript)",
+                    input.system.trim_end(),
+                    if tools.is_empty() { "none".into() } else { tools.join(", ") },
+                    input.transcript.len()
+                )
+            },
+        );
+        Ok(())
     }
 
     /// A turn finished: publish the reply with `bot: true`, then mark the
@@ -540,7 +739,8 @@ impl Session {
         match result {
             Ok(turn) => {
                 let published = async {
-                    let body = ChatBody::new(&turn.text, now_ms())?.from_bot();
+                    let body = ChatBody::new_up_to(&turn.text, now_ms(), self.max_text(&topic))?
+                        .from_bot();
                     self.publish_chat(topic, body).await?;
                     anyhow::Ok(())
                 }
@@ -673,7 +873,7 @@ impl Session {
     fn bot_on_body(&self) -> Result<ChatBody> {
         let bots = self.bots.as_ref().context("this session has no bots")?;
         let provider = bots.agent.provider();
-        let servers = bots.agent.servers();
+        let servers = bots.agent.channel_servers();
         let text = format!(
             "This channel has a bot, run by me. It sends the channel's messages to {provider} and can use: {}.",
             if servers.is_empty() {
@@ -735,8 +935,8 @@ impl Session {
     }
 
     /// `/bot provider-key [vendor] <key>`: saves a key for the configured
-    /// model's vendor (or the one named) and applies it. The key is not
-    /// echoed or logged.
+    /// model's vendor (or the one named, which may be `brave` for
+    /// `web.search`) and applies it. The key is not echoed or logged.
     async fn bot_provider_key(&mut self, arg: &str, streams: &mut Streams) -> Result<()> {
         let usage = "usage: /bot provider-key [vendor] <key>";
         let (vendor, key) = match arg.split_whitespace().collect::<Vec<_>>()[..] {
@@ -760,6 +960,17 @@ impl Session {
             "saved the {vendor} key in {} (readable only by you)",
             self.data_dir.join(KEYS_FILE).display()
         ));
+        if vendor == triad_agent::builtin::SEARCH_VENDOR {
+            // Read at each search, so there is nothing to restart.
+            let var = triad_agent::builtin::SEARCH_KEY_VAR;
+            self.printer
+                .info(&if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+                    format!("{var} is set and wins over the saved key")
+                } else {
+                    "web.search uses it from the next search".to_string()
+                });
+            return Ok(());
+        }
         if let Some(var) = triad_agent::brain::key_var_set(&vendor) {
             self.printer
                 .info(&format!("{var} is set and wins over the saved key"));
@@ -1049,6 +1260,90 @@ impl Session {
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
+                    },
+                );
+            }
+            "/memory" => {
+                let rows = self.state.memory_search(rest.trim(), 50)?;
+                let list: Vec<Value> = rows
+                    .iter()
+                    .map(|m| {
+                        json!({"id": m.id, "text": m.text, "pinned": m.pinned,
+                                    "created_at_ms": m.created_at_ms})
+                    })
+                    .collect();
+                let lines: Vec<String> = rows
+                    .into_iter()
+                    .map(|m| assistant::memory_line(&memory(m)))
+                    .collect();
+                self.printer.emit(
+                    json!({"event": "memory", "query": rest.trim(), "memories": list}),
+                    || {
+                        if lines.is_empty() {
+                            "no saved memories match".to_string()
+                        } else {
+                            lines.join("\n")
+                        }
+                    },
+                );
+            }
+            "/prompt" => self.show_prompt(focus)?,
+            "/schedules" => {
+                let offset = self.bots.as_ref().map_or(0, |b| b.agent.utc_offset_minutes);
+                let rows: Vec<Schedule> =
+                    self.state.schedules()?.into_iter().map(schedule).collect();
+                let list: Vec<Value> = rows
+                    .iter()
+                    .map(|s| {
+                        json!({"id": s.id, "name": s.name, "prompt": s.prompt,
+                                    "next_at_ms": s.next_at_ms, "every_ms": s.every_ms})
+                    })
+                    .collect();
+                self.printer
+                    .emit(json!({"event": "schedules", "schedules": list}), || {
+                        if rows.is_empty() {
+                            "no schedules".to_string()
+                        } else {
+                            rows.iter()
+                                .map(|s| assistant::schedule_line(s, offset))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    });
+            }
+            "/unschedule" => {
+                let id: i64 = rest
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .context("usage: /unschedule <id>")?;
+                let removed = self.state.schedule_remove(id)?;
+                self.printer.emit(
+                    json!({"event": "unscheduled", "id": id, "removed": removed}),
+                    || {
+                        if removed {
+                            format!("removed schedule #{id}")
+                        } else {
+                            format!("no schedule #{id}")
+                        }
+                    },
+                );
+            }
+            "/forget" => {
+                let id: i64 = rest
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .context("usage: /forget <id>")?;
+                let removed = self.state.memory_forget(id)?;
+                self.printer.emit(
+                    json!({"event": "forgot", "id": id, "removed": removed}),
+                    || {
+                        if removed {
+                            format!("forgot memory #{id}")
+                        } else {
+                            format!("no memory #{id}")
+                        }
                     },
                 );
             }

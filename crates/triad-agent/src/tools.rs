@@ -11,17 +11,31 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use triad_core::envelope::truncate_text;
+
+use crate::context::{Kind, TurnInput};
 use crate::policy::ToolSet;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Where a tool may be used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// In the DM and in channels, for askers whose tool set allows it.
+    #[default]
+    Any,
+    /// Only in the personal bot's DM: never offered to a channel turn, and
+    /// refused by the gate there.
+    DmOnly,
+}
 
 /// One tool, named `server.tool`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -30,6 +44,9 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema of the arguments.
     pub schema: Value,
+    /// Not part of what the model is given.
+    #[serde(skip)]
+    pub scope: Scope,
 }
 
 impl ToolSpec {
@@ -38,11 +55,49 @@ impl ToolSpec {
     }
 }
 
-/// A source of tools: fake, MCP, or none.
+/// Who a call is made for, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallContext {
+    pub kind: Kind,
+    /// The channel's name (`agent` for the DM).
+    pub channel: String,
+    /// Short node ID of the asker.
+    pub asker: String,
+    pub asker_tier: String,
+}
+
+impl CallContext {
+    pub fn of(input: &TurnInput) -> Self {
+        CallContext {
+            kind: input.kind,
+            channel: input.channel.clone(),
+            asker: input.asker.clone(),
+            asker_tier: input.asker_tier.clone(),
+        }
+    }
+
+    /// The host in its own DM, for tests.
+    pub fn dm() -> Self {
+        CallContext {
+            kind: Kind::Dm,
+            channel: "agent".into(),
+            asker: "me".into(),
+            asker_tier: "host".into(),
+        }
+    }
+}
+
+/// A source of tools: fake, MCP, built in, or none.
 pub trait Tools: Send + Sync {
     fn list(&self) -> Vec<ToolSpec>;
-    /// Calls `name` (`server.tool`). The result is text for the model.
-    fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>>;
+    /// Calls `name` (`server.tool`) for the asker `cx` names. The result is
+    /// text for the model.
+    fn call<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<String, String>>;
 }
 
 /// The names of the servers a tool list covers, sorted, without repeats.
@@ -53,10 +108,16 @@ pub fn servers(tools: &[ToolSpec]) -> Vec<String> {
     s
 }
 
-/// The tools an asker is offered: those its tool set allows.
-pub fn offered(all: &[ToolSpec], allowed: &ToolSet) -> Vec<ToolSpec> {
+/// Whether a tool may be used in a turn of `kind`.
+pub fn in_scope(tool: &ToolSpec, kind: Kind) -> bool {
+    tool.scope == Scope::Any || kind == Kind::Dm
+}
+
+/// The tools an asker is offered in a turn of `kind`: those its tool set
+/// allows and whose scope covers the turn.
+pub fn offered(all: &[ToolSpec], allowed: &ToolSet, kind: Kind) -> Vec<ToolSpec> {
     all.iter()
-        .filter(|t| allowed.allows(&t.name))
+        .filter(|t| allowed.allows(&t.name) && in_scope(t, kind))
         .cloned()
         .collect()
 }
@@ -69,8 +130,69 @@ impl Tools for NoTools {
         Vec::new()
     }
 
-    fn call<'a>(&'a self, name: &'a str, _args: Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        _: &'a CallContext,
+        name: &'a str,
+        _args: Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move { Err(format!("no tool named {name}")) })
+    }
+}
+
+/// Two tool sources as one. A tool of `second` whose server name `first`
+/// also uses is left out, so no name is offered twice.
+pub struct Both {
+    first: Arc<dyn Tools>,
+    second: Arc<dyn Tools>,
+    specs: Vec<ToolSpec>,
+    /// How many of `specs` are `first`'s.
+    split: usize,
+    /// Server names of `second` that `first` hides.
+    pub hidden: Vec<String>,
+}
+
+impl Both {
+    pub fn new(first: Arc<dyn Tools>, second: Arc<dyn Tools>) -> Self {
+        let mut specs = first.list();
+        let split = specs.len();
+        let taken = servers(&specs);
+        let theirs = second.list();
+        let hidden: Vec<String> = servers(&theirs)
+            .into_iter()
+            .filter(|s| taken.contains(s))
+            .collect();
+        specs.extend(
+            theirs
+                .into_iter()
+                .filter(|t| !hidden.iter().any(|h| h == t.server())),
+        );
+        Both {
+            first,
+            second,
+            specs,
+            split,
+            hidden,
+        }
+    }
+}
+
+impl Tools for Both {
+    fn list(&self) -> Vec<ToolSpec> {
+        self.specs.clone()
+    }
+
+    fn call<'a>(
+        &'a self,
+        cx: &'a CallContext,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        match self.specs.iter().position(|t| t.name == name) {
+            Some(i) if i < self.split => self.first.call(cx, name, args),
+            Some(_) => self.second.call(cx, name, args),
+            None => Box::pin(async move { Err(format!("no tool named {name}")) }),
+        }
     }
 }
 
@@ -116,6 +238,7 @@ impl FakeTools {
                     name,
                     description: format!("Fake {tool} on {server}."),
                     schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+                    scope: Scope::Any,
                 });
             }
         }
@@ -133,7 +256,12 @@ impl Tools for FakeTools {
         self.specs.clone()
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        _: &'a CallContext,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             if !self.specs.iter().any(|s| s.name == name) {
                 return Err(format!("no tool named {name}"));
@@ -178,9 +306,17 @@ pub trait ToolCaller: Send + Sync {
     fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>>;
 }
 
+/// The most bytes of a tool's result the model is given. A web page or a
+/// long listing is cut to this.
+pub const MAX_RESULT_BYTES: usize = 24_000;
+
+/// Why the gate refuses a DM-only tool in a channel.
+pub const DM_ONLY: &str = "only available in the personal DM";
+
 /// The permission gate for one turn.
 pub struct Gate<'t> {
     tools: &'t dyn Tools,
+    cx: CallContext,
     allowed: ToolSet,
     max_steps: usize,
     audit: &'t dyn Audit,
@@ -192,12 +328,14 @@ pub struct Gate<'t> {
 impl<'t> Gate<'t> {
     pub fn new(
         tools: &'t dyn Tools,
+        cx: CallContext,
         allowed: ToolSet,
         max_steps: usize,
         audit: &'t dyn Audit,
     ) -> Self {
         Gate {
             tools,
+            cx,
             allowed,
             max_steps,
             audit,
@@ -240,12 +378,18 @@ impl ToolCaller for Gate<'_> {
             if !self.allowed.allows(name) {
                 return Err(self.deny(name, &args, "not permitted for this asker"));
             }
-            if !self.tools.list().iter().any(|t| t.name == name) {
+            let Some(spec) = self.tools.list().into_iter().find(|t| t.name == name) else {
                 return Err(format!("{name}: no such tool"));
+            };
+            if !in_scope(&spec, self.cx.kind) {
+                return Err(self.deny(name, &args, DM_ONLY));
             }
             let id = self.audit.sent(name, &args);
             let started = Instant::now();
-            let result = self.tools.call(name, args).await;
+            let result = match self.tools.call(&self.cx, name, args).await {
+                Ok(text) => Ok(truncate_text(&text, MAX_RESULT_BYTES)),
+                Err(text) => Err(truncate_text(&text, MAX_RESULT_BYTES)),
+            };
             *self.tool_time.lock().unwrap_or_else(|e| e.into_inner()) += started.elapsed();
             match &result {
                 Ok(text) => self.audit.finished(id, true, text.len()),
@@ -311,10 +455,13 @@ mod tests {
         let tools = fake(dir.path());
         let all = tools.list();
         assert_eq!(servers(&all), ["calendar", "linear"]);
-        assert_eq!(offered(&all, &ToolSet::All).len(), 2);
-        assert!(offered(&all, &ToolSet::none()).is_empty());
+        assert_eq!(offered(&all, &ToolSet::All, Kind::Dm).len(), 2);
+        assert!(offered(&all, &ToolSet::none(), Kind::Dm).is_empty());
         let one = ToolSet::parse("calendar.create_event");
-        let names: Vec<_> = offered(&all, &one).into_iter().map(|t| t.name).collect();
+        let names: Vec<_> = offered(&all, &one, Kind::Dm)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
         assert_eq!(names, ["calendar.create_event"]);
     }
 
@@ -323,7 +470,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tools = fake(dir.path());
         let audit = Recorder::default();
-        let gate = Gate::new(&tools, ToolSet::parse("calendar.create_event"), 8, &audit);
+        let gate = Gate::new(
+            &tools,
+            CallContext::dm(),
+            ToolSet::parse("calendar.create_event"),
+            8,
+            &audit,
+        );
         block_on(async {
             let ok = gate.call("calendar.create_event", serde_json::json!({"x": 1}));
             assert_eq!(ok.await.unwrap(), "ok");
@@ -344,11 +497,122 @@ mod tests {
         );
     }
 
+    /// One tool that returns a long result, and the context it was called
+    /// with.
+    struct Long(&'static str, Scope, Mutex<Vec<CallContext>>);
+
+    impl Long {
+        fn new(name: &'static str, scope: Scope) -> Self {
+            Long(name, scope, Mutex::new(Vec::new()))
+        }
+    }
+
+    impl Tools for Long {
+        fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                schema: Value::Null,
+                scope: self.1,
+            }]
+        }
+        fn call<'a>(
+            &'a self,
+            cx: &'a CallContext,
+            name: &'a str,
+            _: Value,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            self.2.lock().unwrap().push(cx.clone());
+            Box::pin(async move { Ok(format!("{name} {}", "x".repeat(MAX_RESULT_BYTES))) })
+        }
+    }
+
+    #[test]
+    fn a_dm_only_tool_stays_in_the_dm() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes: Arc<dyn Tools> = Arc::new(Long::new("notes.read", Scope::DmOnly));
+        let both = Both::new(notes, Arc::new(fake(dir.path())));
+        let all = both.list();
+        let names = |kind| -> Vec<String> {
+            offered(&all, &ToolSet::All, kind)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        // Offered in a DM turn; absent from a channel turn, even for the
+        // host, whose tool set allows everything.
+        assert_eq!(
+            names(Kind::Dm),
+            ["notes.read", "calendar.create_event", "linear.create_issue"]
+        );
+        assert_eq!(
+            names(Kind::Channel),
+            ["calendar.create_event", "linear.create_issue"]
+        );
+
+        let channel = CallContext {
+            kind: Kind::Channel,
+            channel: "garden".into(),
+            asker: "7c1d09ee".into(),
+            asker_tier: "host".into(),
+        };
+        let audit = Recorder::default();
+        let gate = Gate::new(&both, channel.clone(), ToolSet::All, 8, &audit);
+        block_on(async {
+            // Called anyway from a channel turn: refused, never sent.
+            let no = gate.call("notes.read", Value::Null).await.unwrap_err();
+            assert!(no.contains(DM_ONLY), "{no}");
+            // Tools of any scope still work there, and see the context.
+            let ok = gate.call("calendar.create_event", Value::Null).await;
+            assert_eq!(ok.unwrap(), "ok");
+        });
+        assert_eq!(gate.denied(), ["notes.read"]);
+        assert_eq!(
+            *audit.0.lock().unwrap(),
+            [
+                "denied notes.read",
+                "sent calendar.create_event",
+                "finished true"
+            ]
+        );
+
+        let notes = Long::new("notes.read", Scope::DmOnly);
+        let gate = Gate::new(&notes, CallContext::dm(), ToolSet::All, 8, &NoAudit);
+        block_on(async { gate.call("notes.read", Value::Null).await.unwrap() });
+        assert_eq!(*notes.2.lock().unwrap(), [CallContext::dm()]);
+    }
+
+    #[test]
+    fn two_sources_act_as_one_and_results_are_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = Both::new(
+            Arc::new(Long::new("calendar.long", Scope::Any)),
+            Arc::new(fake(dir.path())),
+        );
+        // The first source's `calendar` hides the second's.
+        assert_eq!(both.hidden, ["calendar"]);
+        let names: Vec<_> = both.list().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["calendar.long", "linear.create_issue"]);
+        let gate = Gate::new(&both, CallContext::dm(), ToolSet::All, 8, &NoAudit);
+        block_on(async {
+            let long = gate.call("calendar.long", Value::Null).await.unwrap();
+            assert!(long.starts_with("calendar.long x"));
+            assert!(long.len() <= MAX_RESULT_BYTES && long.ends_with('…'));
+            assert_eq!(
+                gate.call("linear.create_issue", Value::Null).await.unwrap(),
+                "ok"
+            );
+            let hidden = gate.call("calendar.create_event", Value::Null).await;
+            assert!(hidden.unwrap_err().contains("no such tool"));
+        });
+        assert_eq!(calls(dir.path()).len(), 1);
+    }
+
     #[test]
     fn the_gate_enforces_the_step_limit() {
         let dir = tempfile::tempdir().unwrap();
         let tools = fake(dir.path());
-        let gate = Gate::new(&tools, ToolSet::All, 2, &NoAudit);
+        let gate = Gate::new(&tools, CallContext::dm(), ToolSet::All, 2, &NoAudit);
         block_on(async {
             for _ in 0..2 {
                 gate.call("calendar.create_event", Value::Null)
