@@ -428,7 +428,7 @@ impl Brain for ModelBrain {
 mod tests {
     use super::*;
     use crate::context::Line;
-    use crate::tools::{FakeTools, Gate, NoAudit, Tools};
+    use crate::tools::{CallContext, FakeTools, Gate, NoAudit, Tools};
 
     #[test]
     fn script_lines() {
@@ -502,12 +502,24 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
-        let all = Gate::new(&tools, crate::policy::ToolSet::All, 8, &NoAudit);
+        let all = Gate::new(
+            &tools,
+            CallContext::dm(),
+            crate::policy::ToolSet::All,
+            8,
+            &NoAudit,
+        );
         let out = rt.block_on(brain.turn(&input("hello"), &all)).unwrap();
         assert_eq!(out.text, "echo: hello");
         let out = rt.block_on(brain.turn(&input("add it"), &all)).unwrap();
         assert_eq!(out.text, "added (ok)");
-        let none = Gate::new(&tools, crate::policy::ToolSet::none(), 8, &NoAudit);
+        let none = Gate::new(
+            &tools,
+            CallContext::dm(),
+            crate::policy::ToolSet::none(),
+            8,
+            &NoAudit,
+        );
         let out = rt.block_on(brain.turn(&input("add it"), &none)).unwrap();
         assert!(out.text.contains("not permitted"), "{}", out.text);
         assert_eq!(none.denied(), ["calendar.create_event"]);

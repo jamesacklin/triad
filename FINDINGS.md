@@ -1084,7 +1084,8 @@ on branch `james/rig-tools-assistant-3773ad`.
 
 | # | Milestone | Commit | Result |
 | --- | --- | --- | --- |
-| A0 | Land stage 1 | `A0: ...` | Committed after review; tests, fmt and clippy pass. By-hand check not run: no Brave key (`BRAVE_API_KEY` unset, none in `keys.json`) |
+| A0 | Land stage 1 | `73dd271` | Committed after review; tests, fmt and clippy pass. By-hand check not run: no Brave key (`BRAVE_API_KEY` unset, none in `keys.json`) |
+| A1 | Context and scope | `A1` | `tools::tests::a_dm_only_tool_stays_in_the_dm` passes; no existing assertion changed |
 
 ### A0: stage 1
 
@@ -1101,6 +1102,23 @@ key. It still needs doing.
 Changed assertions (from stage 1, already noted in the plan): two in
 `crates/triad/tests/bots_tools.rs`, because under the MCP backend the bot now
 also has the built-in `time` and `web` servers.
+
+### A1: context and scope
+
+`Tools::call` takes a `CallContext` (kind, channel, asker, asker's tier),
+which the `Gate` builds from the turn input. `ToolSpec` has a `scope` (`Any`
+or `DmOnly`) that is `#[serde(skip)]`, so the logged turn input and what the
+model is sent are unchanged. `offered` takes the turn's kind; the gate
+refuses a `DmOnly` tool outside the DM before it is sent and records the
+denial in the audit log. A DM-only refusal in a channel is not turned into
+the "ask the host for access" reply, since access would not help.
+
+Two places the plan did not mention but the scope needs: a channel's
+`BotOn` announcement and a channel turn's "the host's bot can also reach …"
+line both list servers. They now use `Agent::channel_servers()` (servers
+with a tool of `Any` scope), so a channel is never told the DM-only servers
+exist. Nothing a channel turn is given changed; the stop condition did not
+apply.
 
 ## Agent harness options (2026-11-11)
 

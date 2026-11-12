@@ -21,7 +21,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use serde_json::{Value, json};
 use triad_core::envelope::truncate_text;
 
-use crate::tools::{BoxFuture, ToolSpec, Tools};
+use crate::tools::{BoxFuture, CallContext, Scope, ToolSpec, Tools};
 
 /// The name the search key is saved under in `keys.json`.
 pub const SEARCH_VENDOR: &str = "brave";
@@ -235,6 +235,7 @@ impl Tools for Builtin {
                 name: "time.now".into(),
                 description: "The current date and time in UTC, with the day of the week.".into(),
                 schema: json!({"type": "object", "properties": {}}),
+                scope: Scope::Any,
             },
             ToolSpec {
                 name: "web.fetch".into(),
@@ -252,6 +253,7 @@ impl Tools for Builtin {
                     },
                     "required": ["url"]
                 }),
+                scope: Scope::Any,
             },
             ToolSpec {
                 name: "web.search".into(),
@@ -269,11 +271,17 @@ impl Tools for Builtin {
                     },
                     "required": ["query"]
                 }),
+                scope: Scope::Any,
             },
         ]
     }
 
-    fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>> {
+    fn call<'a>(
+        &'a self,
+        _: &'a CallContext,
+        name: &'a str,
+        args: Value,
+    ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             match name {
                 "time.now" => Ok(utc(triad_core::state::now_ms() / 1000)),
@@ -628,24 +636,40 @@ mod tests {
 
         // As shipped, this machine's own addresses are refused.
         let refused = tools
-            .call("web.fetch", json!({"url": format!("{url}/page")}))
+            .call(
+                &CallContext::dm(),
+                "web.fetch",
+                json!({"url": format!("{url}/page")}),
+            )
             .await
             .unwrap_err();
         assert!(refused.contains("not a public address"), "{refused}");
         let refused = tools
-            .call("web.fetch", json!({"url": "http://localhost:1/"}))
+            .call(
+                &CallContext::dm(),
+                "web.fetch",
+                json!({"url": "http://localhost:1/"}),
+            )
             .await
             .unwrap_err();
         assert!(refused.contains("not a public address"), "{refused}");
         let refused = tools
-            .call("web.fetch", json!({"url": "file:///etc/passwd"}))
+            .call(
+                &CallContext::dm(),
+                "web.fetch",
+                json!({"url": "file:///etc/passwd"}),
+            )
             .await
             .unwrap_err();
         assert!(refused.contains("only http and https"), "{refused}");
 
         tools.allow_private = true;
         let page = tools
-            .call("web.fetch", json!({"url": format!("{url}/start")}))
+            .call(
+                &CallContext::dm(),
+                "web.fetch",
+                json!({"url": format!("{url}/start")}),
+            )
             .await
             .unwrap();
         assert!(page.contains("/page (200 OK)"), "{page}");
@@ -654,12 +678,17 @@ mod tests {
             "{page}"
         );
         let image = tools
-            .call("web.fetch", json!({"url": format!("{url}/image")}))
+            .call(
+                &CallContext::dm(),
+                "web.fetch",
+                json!({"url": format!("{url}/image")}),
+            )
             .await
             .unwrap_err();
         assert!(image.contains("image/png, not text"), "{image}");
         let long = tools
             .call(
+                &CallContext::dm(),
                 "web.fetch",
                 json!({"url": format!("{url}/long"), "max_chars": 600}),
             )
@@ -682,14 +711,18 @@ mod tests {
         let tools = Builtin::new(dir.path(), Some(&url));
         if std::env::var(SEARCH_KEY_VAR).is_err() {
             let none = tools
-                .call("web.search", json!({"query": "x"}))
+                .call(&CallContext::dm(), "web.search", json!({"query": "x"}))
                 .await
                 .unwrap_err();
             assert!(none.contains("/bot provider-key brave"), "{none}");
         }
         crate::save_key(dir.path(), SEARCH_VENDOR, "search-key").unwrap();
         let out = tools
-            .call("web.search", json!({"query": "rust & triad", "count": 2}))
+            .call(
+                &CallContext::dm(),
+                "web.search",
+                json!({"query": "rust & triad", "count": 2}),
+            )
             .await
             .unwrap();
         assert!(
@@ -702,6 +735,11 @@ mod tests {
         if std::env::var(SEARCH_KEY_VAR).is_err() {
             assert!(head.contains("x-subscription-token: search-key"), "{head}");
         }
-        assert!(tools.call("web.search", json!({})).await.is_err());
+        assert!(
+            tools
+                .call(&CallContext::dm(), "web.search", json!({}))
+                .await
+                .is_err()
+        );
     }
 }

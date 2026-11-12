@@ -488,11 +488,15 @@ impl Session {
         let member_list: Vec<(String, String)> =
             members.keys().map(|n| (short_id(n), tier(n))).collect();
         let allowed = ToolSet::parse(&job.tools);
-        let tools = offered(&bots.agent.all_tools, &allowed);
+        let kind = if dm { Kind::Dm } else { Kind::Channel };
+        let tools = offered(&bots.agent.all_tools, &allowed, kind);
         let offered_servers = servers(&tools);
-        let unavailable: Vec<String> = bots
-            .agent
-            .servers()
+        // A channel turn is not told about the DM's own servers.
+        let reachable = match kind {
+            Kind::Dm => bots.agent.servers(),
+            Kind::Channel => bots.agent.channel_servers(),
+        };
+        let unavailable: Vec<String> = reachable
             .into_iter()
             .filter(|s| !offered_servers.contains(s))
             .collect();
@@ -505,7 +509,7 @@ impl Session {
         let asker = short_id(&job.asker);
         Ok(context::build(
             Turn {
-                kind: if dm { Kind::Dm } else { Kind::Channel },
+                kind,
                 channel: &channel.meta.name,
                 persona: bots.agent.persona.as_deref(),
                 members: &member_list,
@@ -673,7 +677,7 @@ impl Session {
     fn bot_on_body(&self) -> Result<ChatBody> {
         let bots = self.bots.as_ref().context("this session has no bots")?;
         let provider = bots.agent.provider();
-        let servers = bots.agent.servers();
+        let servers = bots.agent.channel_servers();
         let text = format!(
             "This channel has a bot, run by me. It sends the channel's messages to {provider} and can use: {}.",
             if servers.is_empty() {

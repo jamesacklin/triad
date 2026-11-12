@@ -24,7 +24,7 @@ use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
 use crate::brain::{Brain, MockBrain, ModelBrain, TurnOutput};
 use crate::context::TurnInput;
 use crate::policy::{Limits, ToolSet};
-use crate::tools::{Audit, Both, FakeTools, Gate, NoTools, ToolSpec, Tools};
+use crate::tools::{Audit, Both, CallContext, FakeTools, Gate, NoTools, Scope, ToolSpec, Tools};
 
 /// Model references shown when asking for one. There is no default model:
 /// the user picks the vendor, and with it who sees the bots' messages.
@@ -437,8 +437,21 @@ impl Agent {
         self.brain.provider()
     }
 
+    /// Every server the bots have, the DM's own included.
     pub fn servers(&self) -> Vec<String> {
         tools::servers(&self.all_tools)
+    }
+
+    /// The servers a channel's bot can use: those with a tool of any scope.
+    /// This is what a channel is told about.
+    pub fn channel_servers(&self) -> Vec<String> {
+        let any: Vec<ToolSpec> = self
+            .all_tools
+            .iter()
+            .filter(|t| t.scope == Scope::Any)
+            .cloned()
+            .collect();
+        tools::servers(&any)
     }
 }
 
@@ -475,14 +488,27 @@ pub async fn run_turn(
     audit: &dyn Audit,
     input: &TurnInput,
 ) -> Result<TurnResult> {
-    let gate = Gate::new(agent.tools.as_ref(), allowed, agent.limits.max_steps, audit);
+    let gate = Gate::new(
+        agent.tools.as_ref(),
+        CallContext::of(input),
+        allowed,
+        agent.limits.max_steps,
+        audit,
+    );
     let output = agent.brain.turn(input, &gate).await?;
     let denied = gate.denied();
     // A tool that was offered can only have been refused by the step
-    // limit; the rest were not permitted for this asker.
+    // limit, and a DM-only one in a channel by its scope (the model was
+    // told why); the rest were not permitted for this asker.
+    let dm_only = |t: &str| {
+        agent
+            .all_tools
+            .iter()
+            .any(|s| s.name == t && s.scope == Scope::DmOnly)
+    };
     let refused: Vec<String> = denied
         .iter()
-        .filter(|t| !offered(input, t))
+        .filter(|t| !offered(input, t) && !dm_only(t))
         .cloned()
         .collect();
     let text = if refused.is_empty() {
