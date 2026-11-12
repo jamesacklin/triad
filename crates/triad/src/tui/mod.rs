@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -63,6 +66,7 @@ impl StateStore {
                     text: m.text,
                     mine: m.author == me,
                     bot: accepted,
+                    action: m.action,
                 };
                 (hex::encode(m.op_hash), line)
             })
@@ -128,6 +132,9 @@ pub fn spawn(data_dir: &Path) -> Result<(Events, mpsc::Receiver<String>, Ui)> {
             return Err(anyhow!("starting the terminal interface: {e}"));
         }
     };
+    // The wheel scrolls the sidebar and the pane. Most terminals still
+    // select text with Shift held.
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         PANICKED.store(true, Ordering::SeqCst);
@@ -152,6 +159,7 @@ pub fn spawn(data_dir: &Path) -> Result<(Events, mpsc::Receiver<String>, Ui)> {
 
 /// Leaves raw mode and the alternate screen, and shows the cursor.
 fn restore() {
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
 }
@@ -185,6 +193,17 @@ fn run(
                         return Ok(());
                     }
                     dirty = true;
+                }
+                Event::Mouse(m) => {
+                    let step = match m.kind {
+                        MouseEventKind::ScrollUp => -1,
+                        MouseEventKind::ScrollDown => 1,
+                        _ => 0,
+                    };
+                    if step != 0 {
+                        app.wheel(m.column, m.row, step);
+                        dirty = true;
+                    }
                 }
                 Event::Resize(..) => dirty = true,
                 _ => {}

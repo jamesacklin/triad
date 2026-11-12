@@ -19,6 +19,7 @@
 //! on the focused channel.
 
 mod bots;
+mod clipboard;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -455,10 +456,14 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                     (false, true) => format!("{base} (bot)"),
                     _ => base,
                 };
+                let line = match m.action {
+                    true => format!("* {who} {}", m.text),
+                    false => format!("{who}: {}", m.text),
+                };
                 if channel.is_some() {
-                    println!("{}: {}", who, m.text);
+                    println!("{line}");
                 } else {
-                    println!("#{name} {}: {}", who, m.text);
+                    println!("#{name} {line}");
                 }
             }
         }
@@ -874,6 +879,7 @@ async fn chat(
         asks: VecDeque::new(),
         long_pubs: BTreeMap::new(),
         held_long: None,
+        clipboard: clipboard::Clipboard::default(),
     };
     let mut streams = Streams {
         subs: StreamMap::new(),
@@ -940,6 +946,8 @@ async fn chat(
 }
 
 struct Session {
+    /// Where `/invite` copies to.
+    clipboard: clipboard::Clipboard,
     data_dir: PathBuf,
     me: NodeId,
     identity: Identity,
@@ -1322,6 +1330,12 @@ impl Session {
         let focus = self.focus;
         match cmd {
             "/quit" => return Ok(false),
+            "/me" => {
+                if rest.is_empty() {
+                    bail!("usage: /me <action>");
+                }
+                self.send_body(focus, rest, true).await?;
+            }
             "/channels" | "/list" => {
                 let all = self
                     .sorted()
@@ -1374,9 +1388,26 @@ impl Session {
                     bail!("#{} is your bot DM; it never gains a member", c.meta.name);
                 }
                 let invite = invite_to(&c.meta, &self.me)?;
+                let name = c.meta.name.clone();
+                // Scripts reading --json copy for themselves.
+                let copied = match self.opts.mode {
+                    Mode::Json => None,
+                    _ => self.clipboard.copy(&invite),
+                };
                 self.printer.emit(
-                    json!({"event": "invite", "channel": c.meta.name, "invite": invite}),
-                    || format!("invite to #{}: {invite}", c.meta.name),
+                    json!({"event": "invite", "channel": name, "invite": invite,
+                           "copied": copied.map(clipboard::Copied::as_str)}),
+                    || match copied {
+                        Some(clipboard::Copied::System) => {
+                            format!("invite to #{name} (copied to the clipboard): {invite}")
+                        }
+                        Some(clipboard::Copied::Terminal) => {
+                            format!(
+                                "invite to #{name} (sent to the terminal's clipboard): {invite}"
+                            )
+                        }
+                        None => format!("invite to #{name}: {invite}"),
+                    },
                 );
             }
             "/msg" => {
@@ -1471,6 +1502,11 @@ impl Session {
     }
 
     async fn send(&mut self, topic: Topic, text: &str) -> Result<()> {
+        self.send_body(topic, text, false).await
+    }
+
+    /// Sends a plain message, or an action (`/me`) when `action`.
+    async fn send_body(&mut self, topic: Topic, text: &str, action: bool) -> Result<()> {
         let channel = self.channel(&topic)?;
         if channel.space.is_none() {
             self.printer.error(&format!(
@@ -1485,8 +1521,9 @@ impl Session {
         }
         // The plaintext is stored when our own operation comes back through
         // the stream; spaces do not return its hash here.
-        self.publish_chat(topic, ChatBody::new(text, now_ms())?.asking(ask))
-            .await
+        let body = ChatBody::new(text, now_ms())?.asking(ask);
+        let body = if action { body.as_action() } else { body };
+        self.publish_chat(topic, body).await
     }
 
     /// Publishes a chat message into a space. Text over `SEND_TEXT_BYTES`
@@ -1632,6 +1669,7 @@ impl Session {
             text: body.text.clone(),
             bot: body.bot,
             nickname: body.nickname().map(str::to_owned),
+            action: body.action,
         };
         let incoming = Incoming {
             author,
@@ -1657,12 +1695,15 @@ impl Session {
         let mut value = json!({"event": "message", "channel": name, "author": hex_id(&author),
                "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
                "ts": op_ts / 1000,
-               "bot": shown_as_bot, "ask": body.ask, "long": body.long.is_some()});
+               "bot": shown_as_bot, "ask": body.ask, "long": body.long.is_some(),
+               "action": body.action});
         if body.bot && !shown_as_bot {
             value["bot_claim"] = json!("not accepted");
         }
-        self.printer
-            .emit(value, || format!("[#{name}] {who}: {}", body.text));
+        self.printer.emit(value, || match body.action {
+            true => format!("[#{name}] * {who} {}", body.text),
+            false => format!("[#{name}] {who}: {}", body.text),
+        });
         if let Some(job) = job {
             self.emit_job(
                 &topic,

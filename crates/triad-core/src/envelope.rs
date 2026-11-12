@@ -41,6 +41,10 @@ pub struct ChatBody {
     /// True when this message addresses the channel's bot.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ask: bool,
+    /// An IRC-style action (`/me waves`): `text` is what the author does,
+    /// shown after their name. Older builds show `text` alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub action: bool,
     /// An announcement. `text` holds a readable fallback for old builds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctl: Option<Control>,
@@ -126,6 +130,7 @@ impl ChatBody {
             text: text.to_string(),
             bot: false,
             ask: false,
+            action: false,
             ctl: None,
             long: None,
             nickname: None,
@@ -141,6 +146,12 @@ impl ChatBody {
     /// Marks this message as addressed to the channel's bot.
     pub fn asking(mut self, ask: bool) -> Self {
         self.ask = ask;
+        self
+    }
+
+    /// Makes this message an action (`/me`).
+    pub fn as_action(mut self) -> Self {
+        self.action = true;
         self
     }
 
