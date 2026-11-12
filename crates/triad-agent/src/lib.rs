@@ -7,6 +7,7 @@
 //! turn with [`run_turn`] off its event loop.
 
 pub mod brain;
+pub mod builtin;
 pub mod context;
 pub mod http;
 pub mod mcp;
@@ -23,7 +24,7 @@ use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
 use crate::brain::{Brain, MockBrain, ModelBrain, TurnOutput};
 use crate::context::TurnInput;
 use crate::policy::{Limits, ToolSet};
-use crate::tools::{Audit, FakeTools, Gate, NoTools, ToolSpec, Tools};
+use crate::tools::{Audit, Both, FakeTools, Gate, NoTools, ToolSpec, Tools};
 
 /// Model references shown when asking for one. There is no default model:
 /// the user picks the vendor, and with it who sees the bots' messages.
@@ -63,7 +64,8 @@ pub enum BrainKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolsKind {
-    /// `mcp.json` in the data directory; none if the file is missing.
+    /// The built-in tools (unless turned off) and the servers in `mcp.json`
+    /// in the data directory, if the file is there.
     Mcp,
     /// `TRIAD_AGENT_FAKE_TOOLS`.
     Fake(PathBuf),
@@ -74,6 +76,10 @@ pub enum ToolsKind {
 pub struct AgentConfig {
     pub brain: BrainKind,
     pub tools: ToolsKind,
+    /// Whether the bots have the built-in tools (`web.*`, `time.*`).
+    pub builtin: bool,
+    /// Replaces the search service's endpoint.
+    pub search_url: Option<String>,
     pub persona: Option<PathBuf>,
     pub limits: Limits,
 }
@@ -114,6 +120,8 @@ struct FileConfig {
     base_url: Option<String>,
     /// A file whose text is added to the system prompt.
     persona: Option<PathBuf>,
+    /// `false` leaves out the built-in tools.
+    builtin: Option<bool>,
 }
 
 impl FileConfig {
@@ -128,7 +136,9 @@ impl FileConfig {
     }
 }
 
-fn read_keys(data_dir: &Path) -> Result<std::collections::BTreeMap<String, String>, UsageError> {
+pub(crate) fn read_keys(
+    data_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, UsageError> {
     let path = data_dir.join(KEYS_FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -209,8 +219,9 @@ pub fn save_model(data_dir: &Path, model: &str) -> Result<()> {
 }
 
 /// Saves a key for `vendor` in `keys.json`, which only the user can read.
+/// `vendor` is a model vendor or the search service.
 pub fn save_key(data_dir: &Path, vendor: &str, key: &str) -> Result<()> {
-    if brain::key_vars(vendor).is_empty() {
+    if vendor != builtin::SEARCH_VENDOR && brain::key_vars(vendor).is_empty() {
         brain::vendor_of(&format!("{vendor}/x")).map_err(anyhow::Error::msg)?;
         bail!("{vendor} needs no key");
     }
@@ -293,9 +304,21 @@ impl AgentConfig {
         let persona = env("TRIAD_AGENT_PERSONA")
             .map(PathBuf::from)
             .or(file.persona.map(|p| data_dir.join(p)));
+        let builtin = match env("TRIAD_AGENT_BUILTIN").as_deref() {
+            None => file.builtin.unwrap_or(true),
+            Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                return Err(UsageError(format!(
+                    "TRIAD_AGENT_BUILTIN must be on or off, got {other:?}"
+                )));
+            }
+        };
         Ok(AgentConfig {
             brain,
             tools,
+            builtin,
+            search_url: env("TRIAD_AGENT_SEARCH_URL"),
             persona,
             limits,
         })
@@ -346,12 +369,33 @@ impl Agent {
             ToolsKind::Fake(path) => Arc::new(FakeTools::load(path)?),
             ToolsKind::Mcp => {
                 let path = data_dir.join(mcp::CONFIG_FILE);
-                if path.exists() {
+                let mcp: Option<Arc<dyn Tools>> = if path.exists() {
                     let (tools, failed) = mcp::McpTools::connect(&path).await?;
                     warnings.extend(failed);
-                    Arc::new(tools)
+                    Some(Arc::new(tools))
                 } else {
-                    Arc::new(NoTools)
+                    None
+                };
+                let builtin: Option<Arc<dyn Tools>> = config.builtin.then(|| {
+                    Arc::new(builtin::Builtin::new(
+                        data_dir,
+                        config.search_url.as_deref(),
+                    )) as _
+                });
+                match (builtin, mcp) {
+                    (Some(b), Some(m)) => {
+                        let both = Both::new(b, m);
+                        for name in &both.hidden {
+                            warnings.push(format!(
+                                "MCP server {name} is left out: the built-in tools use that \
+                                 name. Rename it in {}",
+                                mcp::CONFIG_FILE
+                            ));
+                        }
+                        Arc::new(both)
+                    }
+                    (Some(one), None) | (None, Some(one)) => one,
+                    (None, None) => Arc::new(NoTools),
                 }
             }
         };

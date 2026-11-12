@@ -50,14 +50,40 @@ fn build() -> Result<(reqwest::Client, Roots), String> {
     }
 }
 
+fn bundled_roots() -> impl Iterator<Item = reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+}
+
 /// A client that trusts only the bundled roots.
 pub fn bundled() -> Result<reqwest::Client, String> {
     install_crypto_provider();
-    let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-        .iter()
-        .filter_map(|der| reqwest::Certificate::from_der(der).ok());
     reqwest::Client::builder()
-        .tls_certs_only(roots)
+        .tls_certs_only(bundled_roots())
+        .build()
+        .map_err(|e| format!("building HTTP client: {e}"))
+}
+
+/// A client for one request to an address a model chose: it connects to
+/// `host` only at `addr`, which the caller has already checked, and follows
+/// no redirects, so the caller can check each one. It ignores proxy
+/// variables: a proxy would resolve the host itself, past the check.
+pub fn pinned(
+    host: &str,
+    addr: std::net::SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, String> {
+    let (_, roots) = client()?;
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .resolve(host, addr)
+        .timeout(timeout);
+    if roots == Roots::Bundled {
+        builder = builder.tls_certs_only(bundled_roots());
+    }
+    builder
         .build()
         .map_err(|e| format!("building HTTP client: {e}"))
 }

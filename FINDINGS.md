@@ -1075,6 +1075,33 @@ Follow-ups:
 - **Input history** (Up/Down) and multi-line input.
 - **Timestamps** if a time crate is ever in the tree.
 
+## Assistant (2026-11-12)
+
+The personal bot as an assistant, built from [ASSISTANT-PLAN.md](ASSISTANT-PLAN.md)
+on branch `james/rig-tools-assistant-3773ad`.
+
+### Milestones
+
+| # | Milestone | Commit | Result |
+| --- | --- | --- | --- |
+| A0 | Land stage 1 | `A0: ...` | Committed after review; tests, fmt and clippy pass. By-hand check not run: no Brave key (`BRAVE_API_KEY` unset, none in `keys.json`) |
+
+### A0: stage 1
+
+Review of the uncommitted stage 1 diff found one fault, fixed before the
+commit: `http::pinned()` honored `HTTP_PROXY`/`HTTPS_PROXY`. Through a proxy,
+the proxy resolves the host itself, so the checked, pinned address would not
+be the one reached and `web.fetch` could be pointed at private addresses. It
+now calls `no_proxy()`.
+
+The by-hand check (a real question in `#agent` needing a search and a fetch,
+with latency and tokens) was **not run**: this machine has no Brave Search
+key. It still needs doing.
+
+Changed assertions (from stage 1, already noted in the plan): two in
+`crates/triad/tests/bots_tools.rs`, because under the MCP backend the bot now
+also has the built-in `time` and `web` servers.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

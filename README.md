@@ -232,6 +232,7 @@ Set the model in `agent.json` in the data directory, kept between sessions:
 | `model` | `TRIAD_AGENT_MODEL` | `vendor/model`. |
 | `base_url` | `TRIAD_AGENT_BASE_URL` | Replaces the vendor's endpoint: a proxy, or a local server on another port. |
 | `persona` | `TRIAD_AGENT_PERSONA` | A file whose text is added to the system prompt (relative to the data directory). |
+| `builtin` | `TRIAD_AGENT_BUILTIN` (`on` or `off`) | `false` leaves out the [built-in tools](#built-in-tools). |
 
 `TRIAD_AGENT_BRAIN=mock` runs a scripted stand-in with no model (the tests
 use it). The older `TRIAD_AGENT_BRAIN=anthropic` and `=openrouter` still
@@ -241,6 +242,24 @@ must name its vendor. Limits:
 `TRIAD_AGENT_CHANNEL_PER_DAY`, `TRIAD_AGENT_BURST_PER_MINUTE`,
 `TRIAD_AGENT_MAX_STEPS`. MCP servers go in `mcp.json` in the data
 directory, tokens named by environment variable.
+
+#### Built-in tools
+
+Your bots have these without any MCP server. They are named like MCP tools,
+so grants (`/grant <node> web.*`), the audit log and the rule that admins
+get every tool apply to them unchanged.
+
+| Tool | What it does |
+| --- | --- |
+| `web.search` | Searches the web through the [Brave Search API](https://brave.com/search/api/). Needs a key: `/bot provider-key brave <key>`, or `BRAVE_API_KEY`. Queries go to Brave. |
+| `web.fetch` | Fetches a public page over http or https and returns its text. No JavaScript, no logins. The request comes from your machine, so the site sees your address. |
+| `time.now` | The date and time in UTC. |
+
+`web.fetch` connects only to public addresses. It refuses this machine,
+private and shared networks and link-local addresses, and checks every
+redirect, so nobody can have your bot read your own network. A tool's result
+is cut to 24,000 bytes before the model sees it. An MCP server named `web`
+or `time` is left out, with a warning at start.
 
 | In chat mode | Behavior |
 | --- | --- |

@@ -11,13 +11,15 @@ use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use triad_core::envelope::truncate_text;
 
 use crate::policy::ToolSet;
 
@@ -71,6 +73,57 @@ impl Tools for NoTools {
 
     fn call<'a>(&'a self, name: &'a str, _args: Value) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move { Err(format!("no tool named {name}")) })
+    }
+}
+
+/// Two tool sources as one. A tool of `second` whose server name `first`
+/// also uses is left out, so no name is offered twice.
+pub struct Both {
+    first: Arc<dyn Tools>,
+    second: Arc<dyn Tools>,
+    specs: Vec<ToolSpec>,
+    /// How many of `specs` are `first`'s.
+    split: usize,
+    /// Server names of `second` that `first` hides.
+    pub hidden: Vec<String>,
+}
+
+impl Both {
+    pub fn new(first: Arc<dyn Tools>, second: Arc<dyn Tools>) -> Self {
+        let mut specs = first.list();
+        let split = specs.len();
+        let taken = servers(&specs);
+        let theirs = second.list();
+        let hidden: Vec<String> = servers(&theirs)
+            .into_iter()
+            .filter(|s| taken.contains(s))
+            .collect();
+        specs.extend(
+            theirs
+                .into_iter()
+                .filter(|t| !hidden.iter().any(|h| h == t.server())),
+        );
+        Both {
+            first,
+            second,
+            specs,
+            split,
+            hidden,
+        }
+    }
+}
+
+impl Tools for Both {
+    fn list(&self) -> Vec<ToolSpec> {
+        self.specs.clone()
+    }
+
+    fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>> {
+        match self.specs.iter().position(|t| t.name == name) {
+            Some(i) if i < self.split => self.first.call(name, args),
+            Some(_) => self.second.call(name, args),
+            None => Box::pin(async move { Err(format!("no tool named {name}")) }),
+        }
     }
 }
 
@@ -178,6 +231,10 @@ pub trait ToolCaller: Send + Sync {
     fn call<'a>(&'a self, name: &'a str, args: Value) -> BoxFuture<'a, Result<String, String>>;
 }
 
+/// The most bytes of a tool's result the model is given. A web page or a
+/// long listing is cut to this.
+pub const MAX_RESULT_BYTES: usize = 24_000;
+
 /// The permission gate for one turn.
 pub struct Gate<'t> {
     tools: &'t dyn Tools,
@@ -245,7 +302,10 @@ impl ToolCaller for Gate<'_> {
             }
             let id = self.audit.sent(name, &args);
             let started = Instant::now();
-            let result = self.tools.call(name, args).await;
+            let result = match self.tools.call(name, args).await {
+                Ok(text) => Ok(truncate_text(&text, MAX_RESULT_BYTES)),
+                Err(text) => Err(truncate_text(&text, MAX_RESULT_BYTES)),
+            };
             *self.tool_time.lock().unwrap_or_else(|e| e.into_inner()) += started.elapsed();
             match &result {
                 Ok(text) => self.audit.finished(id, true, text.len()),
@@ -342,6 +402,45 @@ mod tests {
                 "denied linear.create_issue"
             ]
         );
+    }
+
+    /// One tool that returns a long result.
+    struct Long(&'static str);
+
+    impl Tools for Long {
+        fn list(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: self.0.into(),
+                description: String::new(),
+                schema: Value::Null,
+            }]
+        }
+        fn call<'a>(&'a self, name: &'a str, _: Value) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move { Ok(format!("{name} {}", "x".repeat(MAX_RESULT_BYTES))) })
+        }
+    }
+
+    #[test]
+    fn two_sources_act_as_one_and_results_are_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = Both::new(Arc::new(Long("calendar.long")), Arc::new(fake(dir.path())));
+        // The first source's `calendar` hides the second's.
+        assert_eq!(both.hidden, ["calendar"]);
+        let names: Vec<_> = both.list().into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["calendar.long", "linear.create_issue"]);
+        let gate = Gate::new(&both, ToolSet::All, 8, &NoAudit);
+        block_on(async {
+            let long = gate.call("calendar.long", Value::Null).await.unwrap();
+            assert!(long.starts_with("calendar.long x"));
+            assert!(long.len() <= MAX_RESULT_BYTES && long.ends_with('…'));
+            assert_eq!(
+                gate.call("linear.create_issue", Value::Null).await.unwrap(),
+                "ok"
+            );
+            let hidden = gate.call("calendar.create_event", Value::Null).await;
+            assert!(hidden.unwrap_err().contains("no such tool"));
+        });
+        assert_eq!(calls(dir.path()).len(), 1);
     }
 
     #[test]

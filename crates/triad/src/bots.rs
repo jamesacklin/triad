@@ -735,8 +735,8 @@ impl Session {
     }
 
     /// `/bot provider-key [vendor] <key>`: saves a key for the configured
-    /// model's vendor (or the one named) and applies it. The key is not
-    /// echoed or logged.
+    /// model's vendor (or the one named, which may be `brave` for
+    /// `web.search`) and applies it. The key is not echoed or logged.
     async fn bot_provider_key(&mut self, arg: &str, streams: &mut Streams) -> Result<()> {
         let usage = "usage: /bot provider-key [vendor] <key>";
         let (vendor, key) = match arg.split_whitespace().collect::<Vec<_>>()[..] {
@@ -760,6 +760,17 @@ impl Session {
             "saved the {vendor} key in {} (readable only by you)",
             self.data_dir.join(KEYS_FILE).display()
         ));
+        if vendor == triad_agent::builtin::SEARCH_VENDOR {
+            // Read at each search, so there is nothing to restart.
+            let var = triad_agent::builtin::SEARCH_KEY_VAR;
+            self.printer
+                .info(&if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+                    format!("{var} is set and wins over the saved key")
+                } else {
+                    "web.search uses it from the next search".to_string()
+                });
+            return Ok(());
+        }
         if let Some(var) = triad_agent::brain::key_var_set(&vendor) {
             self.printer
                 .info(&format!("{var} is set and wins over the saved key"));
