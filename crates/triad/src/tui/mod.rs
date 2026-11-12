@@ -9,6 +9,7 @@
 //! dropped), on Ctrl-C, and on a panic anywhere.
 
 mod app;
+mod commands;
 mod input;
 mod view;
 
@@ -212,7 +213,10 @@ fn submit(app: &mut App, lines: &mpsc::Sender<String>, line: String) -> bool {
             true
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
-            app.error(&format!("the session is busy; not sent: {line}"));
+            app.error(&format!(
+                "the session is busy; not sent: {}",
+                commands::redact(&line)
+            ));
             true
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -240,8 +244,16 @@ fn on_key(app: &mut App, key: KeyEvent, lines: &mpsc::Sender<String>) -> bool {
         }
         submit(app, lines, "/quit".into())
     };
+    // Suggestions keep their selection only while the text is unchanged.
+    if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab) || alt {
+        app.completion = 0;
+    }
+    let suggesting = !app.suggestions().is_empty();
     match key.code {
         KeyCode::Char('c') if ctrl => return quit(app),
+        KeyCode::Tab if suggesting => app.complete(),
+        KeyCode::Up if suggesting && !alt => app.move_completion(-1),
+        KeyCode::Down if suggesting && !alt => app.move_completion(1),
         KeyCode::Char('n') if ctrl => return switch(app, 1, lines),
         KeyCode::Char('p') if ctrl => return switch(app, -1, lines),
         KeyCode::Down if alt => return switch(app, 1, lines),

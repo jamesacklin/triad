@@ -174,6 +174,7 @@ fn no_model_key_runs_without_bots() {
     let no_key = [
         ("TRIAD_NO_BOT", "0"),
         ("ANTHROPIC_API_KEY", ""),
+        ("OPENAI_API_KEY", ""),
         ("TRIAD_AGENT_BRAIN", ""),
         ("TRIAD_AGENT_MODEL", ""),
     ];
@@ -216,5 +217,99 @@ fn no_model_key_runs_without_bots() {
         e["text"].as_str().unwrap().contains("ANTHROPIC_API_KEY"),
         "{e}"
     );
+
+    // /bot model saves the model; without its key the bots stay off and
+    // the session says which key.
+    a.send("/bot model openai/gpt-5.5");
+    a.wait_for("model saved", |v| {
+        is_event(v, "info") && v["text"].as_str().unwrap().contains("openai/gpt-5.5")
+    });
+    let off = a.wait_for("needs key", |v| {
+        is_event(v, "info") && v["text"].as_str().unwrap().contains("bots not started")
+    });
+    assert!(
+        off["text"].as_str().unwrap().contains("OPENAI_API_KEY"),
+        "{off}"
+    );
+    a.send("/bot model");
+    let m = a.wait_for("bot_model", |v| is_event(v, "bot_model"));
+    assert_eq!(m["model"], "openai/gpt-5.5");
+    a.send("/bot model nosuchvendor/x");
+    let e = a.wait_for("bad vendor", |v| is_event(v, "error"));
+    assert!(e["text"].as_str().unwrap().contains("nosuchvendor"), "{e}");
+
+    // /bot provider-key saves a key for the model's vendor and starts the
+    // bots, which create the DM.
+    let key = "sk-test-provider-key-0123";
+    a.send(&format!("/bot provider-key {key}"));
+    let started = a.wait_for("bots_started", |v| is_event(v, "bots_started"));
+    assert_eq!(started["provider"], "openai/gpt-5.5");
+    a.wait_for("DM", |v| is_event(v, "channel") && v["channel"] == "agent");
     a.quit();
+
+    let keys = dir.path().join(triad_agent::KEYS_FILE);
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&keys).unwrap()).unwrap();
+    assert_eq!(saved["openai"], key);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&keys).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let config = std::fs::read_to_string(dir.path().join("agent.json")).unwrap();
+    assert!(
+        config.contains("openai/gpt-5.5") && !config.contains(key),
+        "{config}"
+    );
+    let log = std::fs::read_to_string(dir.path().join("triad.log")).unwrap_or_default();
+    assert!(!log.contains(key), "key in triad.log");
+
+    // The saved key lets the next session start its bots.
+    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--json"], &no_key);
+    let started = a.wait_for("bots_started", |v| {
+        is_event(v, "ready") || is_event(v, "bot_unavailable")
+    });
+    assert!(is_event(&started, "ready"), "{started}");
+    a.send("/bot");
+    let b = a.wait_for("bot", |v| is_event(v, "bot"));
+    assert_eq!(b["enabled"], true, "{b}");
+    assert_eq!(b["provider"], "openai/gpt-5.5", "{b}");
+    a.quit();
+}
+
+/// `triad reset` empties the data directory and makes a new identity. It
+/// asks first (a pipe gets an error), refuses a directory that is not
+/// triad's, and can keep the bot settings.
+#[test]
+fn reset_starts_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, old) = run_cmd(dir.path(), &["whoami"]);
+    std::fs::write(
+        dir.path().join("agent.json"),
+        r#"{"model":"openai/gpt-5.5"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("keys.json"), r#"{"openai":"k"}"#).unwrap();
+
+    let (code, _) = run_cmd(dir.path(), &["reset"]);
+    assert_ne!(code, 0, "reset without --yes from a pipe");
+    assert_eq!(run_cmd(dir.path(), &["whoami"]).1, old);
+
+    let (code, new) = run_cmd(dir.path(), &["reset", "--yes", "--keep-bot-config"]);
+    assert_eq!(code, 0);
+    assert_ne!(new, old);
+    assert_eq!(run_cmd(dir.path(), &["whoami"]).1, new);
+    assert!(dir.path().join("keys.json").exists());
+
+    let (code, _) = run_cmd(dir.path(), &["reset", "--yes"]);
+    assert_eq!(code, 0);
+    assert!(!dir.path().join("keys.json").exists());
+    assert!(!dir.path().join("agent.json").exists());
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("notes.txt"), "mine").unwrap();
+    let (code, _) = run_cmd(other.path(), &["reset", "--yes"]);
+    assert_ne!(code, 0, "reset of a directory that is not triad's");
+    assert!(other.path().join("notes.txt").exists());
 }
