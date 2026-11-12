@@ -1215,6 +1215,14 @@ impl State {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Changes a memory's text and pin. Whether it existed.
+    pub fn memory_update(&self, id: i64, text: &str, pinned: bool) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE bot_memory SET text = ?2, pinned = ?3 WHERE id = ?1",
+            params![id, text, pinned],
+        )? > 0)
+    }
+
     /// Whether a memory with this ID existed.
     pub fn memory_forget(&self, id: i64) -> Result<bool> {
         Ok(self
@@ -1360,6 +1368,28 @@ impl State {
             .conn
             .execute("DELETE FROM bot_schedules WHERE id = ?1", params![id])?
             > 0)
+    }
+
+    /// Changes a schedule. Whether it existed.
+    pub fn schedule_update(
+        &self,
+        id: i64,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE bot_schedules SET name = ?2, prompt = ?3, next_at_ms = ?4, every_ms = ?5
+             WHERE id = ?1",
+            params![
+                id,
+                name,
+                prompt,
+                next_at_ms as i64,
+                every_ms.map(|e| e as i64)
+            ],
+        )? > 0)
     }
 
     /// Sets when a schedule fires next.
@@ -1738,8 +1768,16 @@ mod tests {
         let pinned = state.memory_pinned().unwrap();
         assert_eq!(pinned.len(), 1);
         assert!(pinned[0].pinned && pinned[0].text.contains("Dana"));
+        assert!(
+            state
+                .memory_update(plumber, "The plumber is Lee", true)
+                .unwrap()
+        );
+        assert_eq!(ids("lee"), [plumber]);
+        assert!(ids("dana").len() == 1, "the old text left the index");
         assert!(state.memory_forget(plumber).unwrap());
         assert!(!state.memory_forget(plumber).unwrap());
+        assert!(!state.memory_update(plumber, "x", false).unwrap());
         assert_eq!(ids("plumber"), Vec::<i64>::new());
         assert!(state.memory_pinned().unwrap().is_empty());
     }
@@ -1778,6 +1816,12 @@ mod tests {
         assert_eq!(row.next_at_ms, 3_602_000);
         assert_eq!(row.last_fired_ms, Some(5_000));
         assert_eq!(state.schedules().unwrap().len(), 2);
+        assert!(state.schedule_update(every, "h", "P.", 7, None).unwrap());
+        let row = state.schedule(every).unwrap().unwrap();
+        assert_eq!(
+            (row.name.as_str(), row.next_at_ms, row.every_ms),
+            ("h", 7, None)
+        );
         assert!(state.schedule_remove(every).unwrap());
         assert!(!state.schedule_remove(every).unwrap());
     }

@@ -283,8 +283,28 @@ start, every turn's system prompt lists each skill with a one-line summary
 (the `description:` of YAML front matter, else the file's first line), and
 `skills.read` lets the bot read one before a task it covers. `skills.read`
 works in channels too, for askers whose tools allow it, and reads nothing
-outside `skills/`. Restart the session after adding a skill. `persona` in
-`agent.json` is unchanged.
+outside `skills/`. Skills and the persona (`persona.md` in the data
+directory, or the file `persona` in `agent.json` names) are read again at
+every turn, so edits apply from the next one; only the first skill, which
+creates `skills/`, needs the session restarted before `skills.read` exists.
+
+### Seeing and changing what the bot keeps
+
+Everything is in the data directory (`~/.local/share/triad` by default).
+`triad bot` shows where, and these work whether or not a chat session is
+running:
+
+| Command | What it does |
+| --- | --- |
+| `triad bot` | Counts and paths: memories, schedules, skills, persona, `agent.json`, `mcp.json`. |
+| `triad bot memory [query]` | Lists memories. `--edit` opens them all in `$VISUAL`/`$EDITOR`, one per line (`<id> [*] <text>`, `*` = pinned): delete a line to forget it, change it to edit it, add `+ text` for a new one. |
+| `triad bot schedules` | Lists schedules. `--edit` opens them as `<id> \| <next> \| <every> \| <name> \| <prompt>`, the same way. |
+| `triad bot skills [name]` | Lists skills or prints one. `triad bot skills <name> --edit` writes `skills/<name>.md`. |
+| `triad bot persona [--edit]` | Prints or edits the persona, the standing instructions in every turn. |
+| `/prompt` (in chat) | The system prompt and tools a turn of yours in the focused channel gets right now. |
+
+An edit that cannot be applied changes nothing and leaves your edited file
+in the data directory to copy from.
 
 A schedule fires by posting its prompt in `#agent` as a line from you,
 `[scheduled: <name>] <prompt>`, which the bot answers like any other. It

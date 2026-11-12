@@ -35,6 +35,8 @@ pub const EXAMPLE_MODELS: &str =
     "openrouter/anthropic/claude-opus-5.5, openai/gpt-5.5 or ollama/qwen3:4b";
 /// The bots' settings file in the data directory.
 pub const CONFIG_FILE: &str = "agent.json";
+/// The persona file read when `agent.json` names none.
+pub const PERSONA_FILE: &str = "persona.md";
 /// Keys saved with `/bot provider-key`, by vendor, readable only by the
 /// user. A vendor's environment variable wins over it.
 pub const KEYS_FILE: &str = "keys.json";
@@ -209,6 +211,22 @@ fn reference(brain: Option<&str>, file_model: Option<String>) -> Option<String> 
     })
 }
 
+/// The persona file the bots read: `TRIAD_AGENT_PERSONA`, else `persona` in
+/// `agent.json`, else `persona.md` in the data directory (which need not
+/// exist yet).
+pub fn persona_path(data_dir: &Path) -> Result<PathBuf, UsageError> {
+    let file = FileConfig::read(data_dir)?;
+    Ok(env("TRIAD_AGENT_PERSONA")
+        .map(PathBuf::from)
+        .or(file.persona.map(|p| data_dir.join(p)))
+        .unwrap_or_else(|| data_dir.join(PERSONA_FILE)))
+}
+
+/// `utc_offset_minutes` from `agent.json`, 0 if unset.
+pub fn configured_utc_offset(data_dir: &Path) -> Result<i32, UsageError> {
+    Ok(FileConfig::read(data_dir)?.utc_offset_minutes.unwrap_or(0))
+}
+
 /// Saves `vendor/model` as the bots' model in `agent.json`, keeping its
 /// other fields. Checks the vendor, not the key.
 pub fn save_model(data_dir: &Path, model: &str) -> Result<()> {
@@ -313,7 +331,11 @@ impl AgentConfig {
         };
         let persona = env("TRIAD_AGENT_PERSONA")
             .map(PathBuf::from)
-            .or(file.persona.map(|p| data_dir.join(p)));
+            .or(file.persona.map(|p| data_dir.join(p)))
+            .or_else(|| {
+                let default = data_dir.join(PERSONA_FILE);
+                default.exists().then_some(default)
+            });
         let builtin = match env("TRIAD_AGENT_BUILTIN").as_deref() {
             None => file.builtin.unwrap_or(true),
             Some("on") => true,
@@ -351,8 +373,8 @@ pub struct Agent {
     pub limits: Limits,
     /// Minutes east of UTC that schedule times are written in.
     pub utc_offset_minutes: i32,
-    /// The host's skills, listed in the system prompt.
-    pub skills: Vec<skills::Skill>,
+    /// The persona file, read again at each turn so edits apply at once.
+    pub persona_path: Option<PathBuf>,
     /// Every tool the bots have.
     pub all_tools: Vec<ToolSpec>,
     /// Problems found at start (an MCP server that did not connect), for
@@ -427,9 +449,7 @@ impl Agent {
                 }
             }
         };
-        let mut skill_list = Vec::new();
         if let Some(found) = skills::Skills::load(data_dir) {
-            skill_list = found.list.clone();
             let both = Both::new(Arc::new(found), tools);
             for name in &both.hidden {
                 warnings.push(format!(
@@ -465,7 +485,7 @@ impl Agent {
             persona,
             limits: config.limits,
             utc_offset_minutes: config.utc_offset_minutes,
-            skills: skill_list,
+            persona_path: config.persona.clone(),
             all_tools,
             warnings,
         })
@@ -480,7 +500,7 @@ impl Agent {
             persona: self.persona.clone(),
             limits: self.limits,
             utc_offset_minutes: self.utc_offset_minutes,
-            skills: self.skills.clone(),
+            persona_path: self.persona_path.clone(),
             all_tools: self.all_tools.clone(),
             warnings: Vec::new(),
         })
@@ -488,6 +508,19 @@ impl Agent {
 
     pub fn provider(&self) -> String {
         self.brain.provider()
+    }
+
+    /// The persona as its file reads now: none if the file was removed, the
+    /// text read at start if it cannot be read.
+    pub fn persona_now(&self) -> Option<String> {
+        let Some(path) = &self.persona_path else {
+            return self.persona.clone();
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => self.persona.clone(),
+        }
     }
 
     /// Every server the bots have, the DM's own included.
@@ -609,7 +642,7 @@ mod tests {
             persona: None,
             limits: Limits::default(),
             utc_offset_minutes: 0,
-            skills: Vec::new(),
+            persona_path: None,
             all_tools: Vec::new(),
             warnings: Vec::new(),
         };

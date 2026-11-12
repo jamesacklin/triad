@@ -126,7 +126,7 @@ fn id_arg(args: &Value, tool: &str) -> Result<i64, String> {
 }
 
 /// A schedule's name: one short line, safe inside `[scheduled: …]`.
-fn schedule_name(name: Option<&str>, prompt: &str) -> String {
+pub fn schedule_name(name: Option<&str>, prompt: &str) -> String {
     let raw = name
         .map(str::trim)
         .filter(|n| !n.is_empty())

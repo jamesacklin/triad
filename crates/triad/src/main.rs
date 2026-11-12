@@ -20,6 +20,7 @@
 
 mod bots;
 mod clipboard;
+mod manage;
 #[cfg(feature = "tui")]
 mod tui;
 
@@ -147,6 +148,12 @@ enum Cmd {
     },
     /// Print role, join status and operation counts for every channel.
     Status,
+    /// See and change what your personal bot keeps: memories, schedules,
+    /// skills, persona. Works while a chat session runs.
+    Bot {
+        #[command(subcommand)]
+        cmd: Option<manage::BotCmd>,
+    },
     /// Scan p2panda.sqlite for the text. Exit 0 if absent, 1 if found.
     Inspect {
         #[arg(long, value_name = "TEXT")]
@@ -467,6 +474,10 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 }
             }
         }
+        Cmd::Bot { cmd } => match cmd {
+            None => manage::overview(&data_dir)?,
+            Some(cmd) => manage::run(&data_dir, cmd)?,
+        },
         Cmd::Status => {
             let state = State::open(&data_dir)?;
             let me = Identity::load_or_create(&data_dir)?;

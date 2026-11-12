@@ -195,6 +195,17 @@ pub fn local(ms: u64, offset_minutes: i32) -> String {
     }
 }
 
+/// A UTC time in milliseconds as local `YYYY-MM-DD HH:MM`, without the
+/// zone; [`parse_at`] reads it back.
+pub fn local_stamp(ms: u64, offset_minutes: i32) -> String {
+    local(ms, offset_minutes)[..16].to_string()
+}
+
+/// The zone [`local`] names: `UTC` or `UTC+01:00`.
+pub fn zone(offset_minutes: i32) -> String {
+    local(0, offset_minutes)[17..].to_string()
+}
+
 /// An interval as the shortest of `5m`, `2h`, `1d`, `1w`, or a sum.
 pub fn duration_text(ms: u64) -> String {
     let mut rest = ms;

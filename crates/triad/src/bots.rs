@@ -550,7 +550,7 @@ impl Session {
             );
             return Ok(false);
         }
-        let input = self.turn_input(job, &msg)?;
+        let input = self.turn_input(job, &msg.text)?;
         self.state
             .set_job_state(&job.op_hash, JobState::Started, None)?;
         self.emit_job(
@@ -592,7 +592,7 @@ impl Session {
     }
 
     /// Builds one turn's model input from the job's own channel only.
-    fn turn_input(&self, job: &Job, msg: &StoredMessage) -> Result<context::TurnInput> {
+    fn turn_input(&self, job: &Job, ask: &str) -> Result<context::TurnInput> {
         let bots = self.bots.as_ref().expect("bots are running");
         let channel = self.channel(&job.topic)?;
         let dm = self.is_dm(&job.topic);
@@ -661,25 +661,64 @@ impl Session {
         } else {
             Vec::new()
         };
+        // Read at each turn, so edits apply without a restart.
+        let persona = bots.agent.persona_now();
+        let skill_list = triad_agent::skills::list(&self.data_dir);
         Ok(context::build(
             Turn {
                 kind,
                 channel: &channel.meta.name,
-                persona: bots.agent.persona.as_deref(),
+                persona: persona.as_deref(),
                 members: &member_list,
                 history: &history,
                 ask_hash: job.op_hash,
                 asker: &asker,
                 asker_tier: &asker_tier,
-                ask: &msg.text,
+                ask,
                 tools,
                 unavailable,
                 host: &host,
                 notes: &notes,
-                skills: &bots.agent.skills,
+                skills: &skill_list,
             },
             ContextLimits::default(),
         ))
+    }
+
+    /// `/prompt`: the system prompt and tools a turn of mine in the focused
+    /// channel would get now, shown here only.
+    fn show_prompt(&self, topic: Topic) -> Result<()> {
+        if self.bots.is_none() {
+            bail!("the bots are not running");
+        }
+        if !self.is_dm(&topic) && !self.hosting(&topic) {
+            bail!("#{} has no bot of yours", self.name(&topic));
+        }
+        let job = Job {
+            op_hash: [0; 32],
+            topic,
+            asker: self.me,
+            state: JobState::Queued,
+            reason: None,
+            tools: ToolSet::All.render(),
+            created_at_ms: now_ms(),
+        };
+        let input = self.turn_input(&job, "")?;
+        let tools: Vec<&str> = input.tools.iter().map(|t| t.name.as_str()).collect();
+        let name = self.name(&topic).to_string();
+        self.printer.emit(
+            json!({"event": "prompt", "channel": name, "system": input.system,
+                   "tools": tools, "transcript_lines": input.transcript.len()}),
+            || {
+                format!(
+                    "[#{name}] system prompt for a turn of yours:\n{}\ntools: {}\n                     (plus the last {} messages of #{name} as the transcript)",
+                    input.system.trim_end(),
+                    if tools.is_empty() { "none".into() } else { tools.join(", ") },
+                    input.transcript.len()
+                )
+            },
+        );
+        Ok(())
     }
 
     /// A turn finished: publish the reply with `bot: true`, then mark the
@@ -1248,6 +1287,7 @@ impl Session {
                     },
                 );
             }
+            "/prompt" => self.show_prompt(focus)?,
             "/schedules" => {
                 let offset = self.bots.as_ref().map_or(0, |b| b.agent.utc_offset_minutes);
                 let rows: Vec<Schedule> =

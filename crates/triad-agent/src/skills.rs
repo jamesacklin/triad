@@ -1,7 +1,9 @@
 //! Skills: standing instructions the host writes as `skills/<name>.md` in
 //! the data directory. Each turn's system prompt lists their names and
 //! one-line summaries; the model reads one with `skills.read` when it
-//! applies. The list is read when the bots start.
+//! applies. The folder is read again at every turn, so a skill added or
+//! edited while the bots run applies from the next turn; `skills.read` is
+//! there whenever the folder exists when the bots start.
 
 use std::path::{Path, PathBuf};
 
@@ -71,42 +73,57 @@ fn cut(s: &str) -> String {
     out
 }
 
+/// The skills in `data_dir`, sorted by name. Files whose names are not
+/// skill names are skipped.
+pub fn list(data_dir: &Path) -> Vec<Skill> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join(SKILLS_DIR)) else {
+        return Vec::new();
+    };
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        if !valid_name(name) || !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        list.push(Skill {
+            name: name.to_string(),
+            summary: summary(&text),
+        });
+    }
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list.truncate(MAX_SKILLS);
+    list
+}
+
+/// The path of the skill `name`, checked to be a skill name.
+pub fn path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = name.strip_suffix(".md").unwrap_or(name);
+    if !valid_name(name) {
+        return Err(format!(
+            "{name:?} is not a skill name (letters, digits, - and _ only)"
+        ));
+    }
+    Ok(data_dir.join(SKILLS_DIR).join(format!("{name}.md")))
+}
+
 /// The `skills.read` tool over the skills folder.
 pub struct Skills {
     dir: PathBuf,
-    pub list: Vec<Skill>,
 }
 
 impl Skills {
-    /// The skills in `data_dir`, sorted by name; `None` if there are none.
-    /// Files whose names are not skill names are skipped.
+    /// The skills tool, if `data_dir` has a skills folder.
     pub fn load(data_dir: &Path) -> Option<Skills> {
         let dir = data_dir.join(SKILLS_DIR);
-        let mut list = Vec::new();
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
-            let Some(name) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".md"))
-            else {
-                continue;
-            };
-            if !valid_name(name) || !path.is_file() {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
-            list.push(Skill {
-                name: name.to_string(),
-                summary: summary(&text),
-            });
-        }
-        if list.is_empty() {
-            return None;
-        }
-        list.sort_by(|a, b| a.name.cmp(&b.name));
-        list.truncate(MAX_SKILLS);
-        Some(Skills { dir, list })
+        dir.is_dir().then_some(Skills { dir })
     }
 
     fn read(&self, args: &Value) -> Result<String, String> {
@@ -190,6 +207,7 @@ mod tests {
     async fn reads_only_inside_the_folder() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Skills::load(dir.path()).is_none());
+        assert!(list(dir.path()).is_empty());
         let skills = dir.path().join(SKILLS_DIR);
         std::fs::create_dir(&skills).unwrap();
         std::fs::write(
@@ -202,7 +220,7 @@ mod tests {
         std::fs::write(dir.path().join("secret.md"), "secret").unwrap();
         let s = Skills::load(dir.path()).unwrap();
         assert_eq!(
-            s.list,
+            list(dir.path()),
             [Skill {
                 name: "standup".into(),
                 summary: "Daily standup".into()

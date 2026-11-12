@@ -1257,6 +1257,23 @@ used a DM turn to show a reply is cut to 2,000 bytes. That is now the
 channel's rule, so the test runs it as a channel turn and adds the DM case
 (4,006 bytes whole; 16,200 cut to at most 16,000).
 
+### Seeing and changing what the bot keeps (after A5)
+
+Asked for after A5, outside the plan. The VM (`scripts/vm`) is a test
+guest, not where a user's bot lives, so this works on the data directory:
+`triad bot` (overview), `triad bot memory|schedules [--edit]`,
+`triad bot skills [name] [--edit]`, `triad bot persona [--edit]`
+(`crates/triad/src/manage.rs`), and `/prompt` in chat, which builds the
+turn input the way a real turn does and prints its system prompt and
+tools locally. `--edit` writes the rows to a private file in the data
+directory, runs `$VISUAL`/`$EDITOR`, and applies only what changed against
+the rows it started from, so rows the bot adds meanwhile are kept; an edit
+that does not parse changes nothing and the file is kept. To make edits
+apply without a restart, the persona file and the skills list are now read
+at each turn, `persona.md` in the data directory is the default persona,
+and `skills.read` exists whenever `skills/` exists at start (before, only
+when it held a skill). `bots_manage.rs` covers it end to end.
+
 ### Answers to the plan's questions
 
 - **Does a real model save and recall without being told to in each
