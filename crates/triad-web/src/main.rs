@@ -16,12 +16,12 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
-use rooms::{Account, Start};
+use rooms::{Account, Outgoing, Start};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
 use triad_core::{
-    envelope::{ChatBody, Invite},
+    envelope::{ChatBody, Invite, normalize_nickname},
     state::now_ms,
 };
 
@@ -148,11 +148,16 @@ impl App {
                     return Err(bad_request("enter one line of text"));
                 }
                 let message = ChatBody::new(text, now_ms()).map_err(bad_request)?;
-                tokio::time::timeout(Duration::from_secs(10), account.send(message))
-                    .await
-                    .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "send timed out".into()))?
-                    .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
-                ok(&json!({"Accepted": true}))
+                publish(&account, Outgoing::Chat(message)).await
+            }
+            (&Method::POST, "/api/profile") => {
+                let account = self.account(&request).await?;
+                let input: ProfileInput = body(request).await?;
+                let nickname = normalize_nickname(&input.nickname)
+                    .map_err(bad_request)?
+                    .unwrap_or_default()
+                    .to_owned();
+                publish(&account, Outgoing::Nickname(nickname)).await
             }
             _ => Err((StatusCode::NOT_FOUND, "not found".into())),
         }
@@ -227,6 +232,20 @@ struct RoomInput {
 #[serde(rename_all = "PascalCase")]
 struct SendInput {
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProfileInput {
+    nickname: String,
+}
+
+async fn publish(account: &Account, event: Outgoing) -> ApiResult {
+    tokio::time::timeout(Duration::from_secs(10), account.send(event))
+        .await
+        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "send timed out".into()))?
+        .map_err(|err| (StatusCode::CONFLICT, err.to_string()))?;
+    ok(&json!({"Accepted": true}))
 }
 
 async fn body<T: DeserializeOwned>(

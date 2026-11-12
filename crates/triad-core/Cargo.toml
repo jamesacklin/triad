@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 p2panda = { workspace = true }
+p2panda-core = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 ciborium = { workspace = true }

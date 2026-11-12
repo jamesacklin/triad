@@ -5172,6 +5172,7 @@ dependencies = [
  "ciborium",
  "hex",
  "p2panda",
+ "p2panda-core",
  "rusqlite",
  "serde",
  "tempfile",

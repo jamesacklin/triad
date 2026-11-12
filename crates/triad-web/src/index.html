@@ -64,6 +64,7 @@
     button:disabled { opacity: .5; cursor: default; }
     input { flex: 1; min-width: 0; width: 100%; }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #users { max-width: min(46vw, 14rem); }
     #empty, #setup { padding: 28px 0 10px; }
     #join { margin-top: 22px; }
     label { display: block; margin-bottom: 6px; }
@@ -92,6 +93,7 @@
     #send { padding: 12px 0; }
     details { margin-top: 8px; }
     summary { cursor: pointer; width: fit-content; }
+    #nickname-form { margin-top: 10px; }
     #key { display: block; margin: 8px 0; overflow-wrap: anywhere; }
     #notice { margin-top: 12px; color: var(--muted); overflow-wrap: anywhere; }
     #notice:empty { display: none; }
@@ -137,6 +139,13 @@
     </div>
     <details id="details" class="muted">
       <summary>Details</summary>
+      <form id="nickname-form">
+        <label for="nickname">Nickname</label>
+        <div class="form">
+          <input id="nickname" placeholder="Optional" autocomplete="off" dir="auto">
+          <button>Save</button>
+        </div>
+      </form>
       <code id="key"></code>
       <div id="sharing" hidden>
         <label for="share-code">Invite code</label>
@@ -154,6 +163,7 @@
   let active = sessionStorage.getItem(activeKey) || users.at(-1)?.Token || "";
   let busy = false;
   let messageCount = -1;
+  let profiles = {};
   let joined = false;
   let audio;
   let lastError = "";
@@ -177,6 +187,7 @@
     active = token;
     sessionStorage.setItem(activeKey, token);
     messageCount = -1;
+    profiles = {};
     joined = false;
     lastError = "";
     notice("");
@@ -188,9 +199,28 @@
     el("setup").hidden = true;
     el("account").hidden = !token;
     el("empty").hidden = !!token;
+    drawIdentities();
+    el("nickname").value = ownNickname();
+  }
+
+  function ownNickname() {
+    return users.find(user => user.Token === active)?.Nickname || "";
+  }
+
+  function rememberNickname(nickname, pending) {
+    users = JSON.parse(localStorage.getItem(savedKey) || "[]");
+    const user = users.find(user => user.Token === active);
+    if (!user || (!pending && user.Nickname !== nickname)) return;
+    user.Nickname = nickname;
+    user.NicknamePending = pending;
+    localStorage.setItem(savedKey, JSON.stringify(users));
+    drawIdentities();
+  }
+
+  function drawIdentities() {
     el("users").hidden = users.length === 0;
-    el("users").replaceChildren(...users.map(user => new Option(user.Node.slice(0, 12), user.Token)));
-    el("users").value = token;
+    el("users").replaceChildren(...users.map(user => new Option(user.Nickname || user.Node.slice(0, 12), user.Token)));
+    el("users").value = active;
   }
 
   function draw(state) {
@@ -218,12 +248,26 @@
     }
     const canChime = joined && state.Status === "joined";
     joined = state.Status === "joined";
+    drawProfiles(state.Profiles);
     drawMessages(state.Messages, canChime);
   }
 
   function notice(text, isError = false) {
     el("notice").textContent = text;
     el("notice").toggleAttribute("data-error", isError);
+  }
+
+  function drawProfiles(next) {
+    if (JSON.stringify(next) === JSON.stringify(profiles)) return;
+    profiles = next;
+    for (const author of el("messages").querySelectorAll("[data-author]")) {
+      labelAuthor(author);
+    }
+  }
+
+  function labelAuthor(author) {
+    const { author: node, legacyNickname } = author.dataset;
+    author.textContent = (profiles[node] ?? legacyNickname) || node.slice(0, 8);
   }
 
   function drawMessages(messages, canChime) {
@@ -240,7 +284,15 @@
       item.className = message.Mine ? "message mine" : "message";
       const author = document.createElement("span");
       author.className = "author";
-      author.textContent = message.Mine ? "You" : message.Author.slice(0, 8);
+      author.dir = "auto";
+      author.title = message.Author;
+      if (message.Mine) {
+        author.textContent = "You";
+      } else {
+        author.dataset.author = message.Author;
+        author.dataset.legacyNickname = message.Nickname || "";
+        labelAuthor(author);
+      }
       item.append(author, document.createTextNode(message.Text));
       fragment.append(item);
     }
@@ -277,7 +329,16 @@
     if (!active) return;
     const token = active;
     const state = await api("state");
-    if (active === token) draw(state);
+    if (active !== token) return;
+    draw(state);
+    const user = users.find(user => user.Token === token);
+    if (state.Status === "joined" && user?.Nickname !== undefined && user.NicknamePending !== false) {
+      const nickname = user.Nickname;
+      if (nickname !== (state.Profiles[state.Node] ?? "")) {
+        await api("profile", { Nickname: nickname });
+      }
+      if (active === token) rememberNickname(nickname, false);
+    }
   }
 
   async function action(callback) {
@@ -299,6 +360,23 @@
     users.push(user);
     localStorage.setItem(savedKey, JSON.stringify(users));
     selectIdentity(user.Token);
+  });
+  el("nickname-form").onsubmit = event => {
+    event.preventDefault();
+    const nickname = el("nickname").value.trim();
+    if ([...nickname].length > 24 || /[\p{Cc}\u2028\u2029]/u.test(nickname)) {
+      notice("Nickname must be one line and at most 24 characters.", true);
+      return;
+    }
+    rememberNickname(nickname, true);
+    el("nickname").value = nickname;
+    notice(nickname ? "Nickname saved." : "Nickname cleared.");
+  };
+  window.addEventListener("storage", event => {
+    if (event.key !== savedKey) return;
+    users = JSON.parse(event.newValue || "[]");
+    drawIdentities();
+    if (document.activeElement !== el("nickname")) el("nickname").value = ownNickname();
   });
   el("users").onchange = () => action(async () => selectIdentity(el("users").value));
   el("create").onclick = () => action(() => api("room", { Action: "create" }));

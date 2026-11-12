@@ -1,4 +1,4 @@
-use std::{future::pending, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, future::pending, path::PathBuf, sync::Arc};
 
 use anyhow::{Result, anyhow, bail};
 use p2panda::{
@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::StreamExt;
 use triad_core::{
-    envelope::{ChatBody, Invite},
+    envelope::{ChatBody, Invite, ProfileUpdate, RoomEvent},
     identity::{Identity, NodeId},
     net::{DEFAULT_RELAY, P2PANDA_FILE},
     state::{JoinStatus, Meta, Outcome, Role, State, StoredMessage, channel_name},
@@ -45,18 +45,25 @@ pub struct View {
     error: String,
     running: bool,
     messages: Vec<Message>,
+    profiles: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct Message {
     author: String,
+    nickname: Option<String>,
     text: String,
     mine: bool,
 }
 
+pub enum Outgoing {
+    Chat(ChatBody),
+    Nickname(String),
+}
+
 struct Send {
-    body: ChatBody,
+    body: Outgoing,
     result: oneshot::Sender<Result<()>>,
 }
 
@@ -73,9 +80,15 @@ impl Account {
             error: String::new(),
             running: false,
             messages: Vec::new(),
+            profiles: BTreeMap::new(),
         };
         if let Some(meta) = &meta {
             view.room(meta)?;
+            view.profiles = state
+                .profiles(&meta.topic)?
+                .into_iter()
+                .map(|(author, nickname)| (hex::encode(author), nickname))
+                .collect();
             view.messages = state
                 .history(&meta.topic, None)?
                 .into_iter()
@@ -113,7 +126,7 @@ impl Account {
         Ok(())
     }
 
-    pub async fn send(&self, body: ChatBody) -> Result<()> {
+    pub async fn send(&self, body: Outgoing) -> Result<()> {
         let session = self.session.lock().await;
         if session.view.status != "joined" {
             bail!("wait until the room is connected");
@@ -225,22 +238,34 @@ impl Account {
                 }
                 command = commands.recv() => {
                     let Some(command) = command else { return Ok(()) };
-                    let _ = command.result.send(publish(space.as_ref(), command.body).await);
+                    let _ = command.result.send(publish(space.as_ref(), store, &meta.topic, &self.identity, command.body).await);
                 }
                 event = events.next() => {
                     match event {
                         Some(StreamEvent::Processed { operation, .. }) => {
                             let hash = *operation.id().as_bytes();
-                            if store.outcome(&hash)?.is_none() {
-                                let message = StoredMessage {
-                                    op_hash: hash,
-                                    author: *operation.author().as_bytes(),
-                                    sent_at_ms: operation.message().sent_at_ms,
-                                    op_ts: Some(operation.timestamp()),
-                                    text: operation.message().text.clone(),
-                                };
-                                store.record(&meta.topic, &hash, Outcome::Ok, None, Some(&message))?;
-                                self.session.lock().await.view.messages.push(Message::from_stored(message, me));
+                            let author = *operation.author().as_bytes();
+                            match operation.message() {
+                                RoomEvent::Chat(body) if store.outcome(&hash)?.is_none() => {
+                                    let message = StoredMessage {
+                                        op_hash: hash,
+                                        author,
+                                        sent_at_ms: body.sent_at_ms,
+                                        op_ts: Some(operation.timestamp()),
+                                        text: body.text.clone(),
+                                        nickname: body.nickname().map(str::to_owned),
+                                    };
+                                    store.record(&meta.topic, &hash, Outcome::Ok, None, Some(&message))?;
+                                    self.session.lock().await.view.messages.push(Message::from_stored(message, me));
+                                }
+                                RoomEvent::Profile(profile) => {
+                                    if let Ok((author, revision, nickname)) = profile.verify(&meta.topic)
+                                        && store.record_profile(&meta.topic, &author, revision, nickname)?
+                                    {
+                                        self.session.lock().await.view.profiles.insert(hex::encode(author), nickname.to_owned());
+                                    }
+                                }
+                                _ => {}
                             }
                             operation.ack().await?;
                         }
@@ -267,9 +292,9 @@ impl Account {
 
 struct Room {
     meta: Meta,
-    events: SpaceSubscription<ChatBody>,
-    space: Option<Space<ChatBody>>,
-    joining: Option<PendingSpace<ChatBody>>,
+    events: SpaceSubscription<RoomEvent>,
+    space: Option<Space<RoomEvent>>,
+    joining: Option<PendingSpace<RoomEvent>>,
 }
 
 async fn open_room(
@@ -281,7 +306,7 @@ async fn open_room(
 ) -> Result<Room> {
     match start {
         Start::Create => {
-            let (space, events) = node.create_space::<ChatBody>().await?;
+            let (space, events) = node.create_space::<RoomEvent>().await?;
             let topic = *space.id().as_bytes();
             let meta = room_meta("general".into(), topic, me, relay, Role::Creator);
             store.insert_group(&meta)?;
@@ -299,7 +324,7 @@ async fn open_room(
                 .and_then(|name| channel_name(name).ok())
                 .unwrap_or_else(|| hex::encode(&invite.topic[..4]));
             let meta = room_meta(name, invite.topic, invite.creator, relay, Role::Member);
-            let (joining, events) = node.space::<ChatBody>(Hash::from(meta.topic)).await?;
+            let (joining, events) = node.space::<RoomEvent>(Hash::from(meta.topic)).await?;
             store.insert_group(&meta)?;
             Ok(Room {
                 meta,
@@ -310,7 +335,7 @@ async fn open_room(
         }
         Start::Resume => {
             let meta = store.meta()?.ok_or_else(|| anyhow!("no saved room"))?;
-            let (joining, events) = node.space::<ChatBody>(Hash::from(meta.topic)).await?;
+            let (joining, events) = node.space::<RoomEvent>(Hash::from(meta.topic)).await?;
             Ok(Room {
                 meta,
                 events,
@@ -336,8 +361,24 @@ fn room_meta(name: String, topic: [u8; 32], creator: NodeId, relay: String, role
     }
 }
 
-async fn publish(space: Option<&Space<ChatBody>>, body: ChatBody) -> Result<()> {
+async fn publish(
+    space: Option<&Space<RoomEvent>>,
+    store: &mut State,
+    topic: &[u8; 32],
+    identity: &Identity,
+    outgoing: Outgoing,
+) -> Result<()> {
     let space = space.ok_or_else(|| anyhow!("room is not connected"))?;
+    let body = match outgoing {
+        Outgoing::Chat(body) => RoomEvent::Chat(body),
+        Outgoing::Nickname(name) => {
+            if store.profile(topic, &identity.node_id())?.as_deref() == Some(&name) {
+                return Ok(());
+            }
+            let revision = store.next_profile_revision(topic)?;
+            RoomEvent::Profile(ProfileUpdate::sign(identity, topic, revision, &name)?)
+        }
+    };
     space.publish(body).await?.await?;
     Ok(())
 }
@@ -358,6 +399,7 @@ impl Message {
     fn from_stored(message: StoredMessage, me: NodeId) -> Self {
         Self {
             author: hex::encode(message.author),
+            nickname: message.nickname,
             text: message.text,
             mine: message.author == me,
         }

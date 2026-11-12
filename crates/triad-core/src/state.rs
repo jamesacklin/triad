@@ -5,10 +5,10 @@
 //! locally unique name, and every operation and message is filed under its
 //! group's topic.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::identity::NodeId;
 
@@ -132,6 +132,7 @@ pub struct StoredMessage {
     /// p2panda operation timestamp (microseconds), once known.
     pub op_ts: Option<u64>,
     pub text: String,
+    pub nickname: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,7 +152,7 @@ impl State {
     }
 
     pub fn open_path(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -176,10 +177,22 @@ impl State {
                  sent_at_ms INTEGER NOT NULL,
                  op_ts INTEGER,
                  text TEXT NOT NULL,
-                 topic BLOB
+                 topic BLOB,
+                 nickname TEXT
+             );
+             CREATE TABLE IF NOT EXISTS room_profiles (
+                 topic BLOB NOT NULL,
+                 author BLOB NOT NULL,
+                 revision INTEGER NOT NULL,
+                 nickname TEXT NOT NULL,
+                 PRIMARY KEY (topic, author)
+             );
+             CREATE TABLE IF NOT EXISTS room_profile_revisions (
+                 topic BLOB PRIMARY KEY,
+                 revision INTEGER NOT NULL
              );",
         )?;
-        migrate_single_group(&conn)?;
+        migrate_layout(&mut conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS messages_topic ON messages (topic);
              CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);",
@@ -265,6 +278,65 @@ impl State {
         Ok(())
     }
 
+    pub fn profiles(&self, topic: &[u8; 32]) -> Result<BTreeMap<NodeId, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT author, nickname FROM room_profiles WHERE topic = ?1")?;
+        let rows = stmt.query_map([topic.as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut profiles = BTreeMap::new();
+        for row in rows {
+            let (author, nickname) = row?;
+            profiles.insert(to_32(&author)?, nickname);
+        }
+        Ok(profiles)
+    }
+
+    pub fn profile(&self, topic: &[u8; 32], author: &NodeId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT nickname FROM room_profiles WHERE topic = ?1 AND author = ?2",
+                params![topic.as_slice(), author.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn next_profile_revision(&self, topic: &[u8; 32]) -> Result<u64> {
+        let revision: i64 = self.conn.query_row(
+            "INSERT INTO room_profile_revisions (topic, revision) VALUES (?1, 1)
+             ON CONFLICT (topic) DO UPDATE SET revision = revision + 1
+             RETURNING revision",
+            [topic.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(revision)?)
+    }
+
+    pub fn record_profile(
+        &self,
+        topic: &[u8; 32],
+        author: &NodeId,
+        revision: u64,
+        nickname: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT INTO room_profiles (topic, author, revision, nickname)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (topic, author) DO UPDATE
+             SET revision = excluded.revision, nickname = excluded.nickname
+             WHERE excluded.revision > room_profiles.revision",
+            params![
+                topic.as_slice(),
+                author.as_slice(),
+                i64::try_from(revision)?,
+                nickname
+            ],
+        )? != 0)
+    }
+
     pub fn outcome(&self, op_hash: &[u8; 32]) -> Result<Option<Outcome>> {
         let s: Option<String> = self
             .conn
@@ -291,8 +363,8 @@ impl State {
         let tx = self.conn.transaction()?;
         if let Some(m) = message {
             tx.execute(
-                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, nickname)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     m.op_hash.as_slice(),
                     m.author.as_slice(),
@@ -300,6 +372,7 @@ impl State {
                     m.op_ts.map(|t| t as i64),
                     m.text,
                     topic.as_slice(),
+                    m.nickname,
                 ],
             )?;
         }
@@ -332,7 +405,7 @@ impl State {
     /// `limit` messages.
     pub fn history(&self, topic: &[u8; 32], limit: Option<usize>) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT op_hash, author, sent_at_ms, op_ts, text FROM messages
+            "SELECT op_hash, author, sent_at_ms, op_ts, text, nickname FROM messages
              WHERE topic = ?1
              ORDER BY COALESCE(op_ts, sent_at_ms * 1000) ASC, op_hash ASC",
         )?;
@@ -343,17 +416,19 @@ impl State {
                 r.get::<_, i64>(2)?,
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (h, a, sent, ts, text) = row?;
+            let (h, a, sent, ts, text, nickname) = row?;
             out.push(StoredMessage {
                 op_hash: to_32(&h)?,
                 author: to_32(&a)?,
                 sent_at_ms: sent as u64,
                 op_ts: ts.map(|t| t as u64),
                 text,
+                nickname,
             });
         }
         if let Some(limit) = limit
@@ -385,12 +460,10 @@ impl State {
     }
 }
 
-/// Moves a database written when a data directory held exactly one group
-/// (a single `meta` row, no `topic` columns) to the multi-group layout. The
-/// old group becomes the channel `main`.
-fn migrate_single_group(conn: &Connection) -> Result<()> {
+fn migrate_layout(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let has_column = |table: &str, column: &str| -> Result<bool> {
-        let n: i64 = conn.query_row(
+        let n: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
             params![table, column],
             |r| r.get(0),
@@ -399,21 +472,23 @@ fn migrate_single_group(conn: &Connection) -> Result<()> {
     };
     for table in ["processed_ops", "messages"] {
         if !has_column(table, "topic")? {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN topic BLOB;"))?;
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN topic BLOB;"))?;
         }
     }
-    if !has_column("meta", "topic")? {
-        return Ok(());
+    if !has_column("messages", "nickname")? {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN nickname TEXT;")?;
     }
-    conn.execute_batch(
-        "BEGIN;
-         INSERT OR IGNORE INTO groups (topic, name, creator, relay, role, status)
-             SELECT topic, 'main', creator, relay, role, status FROM meta;
-         UPDATE processed_ops SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
-         UPDATE messages SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
-         DROP TABLE meta;
-         COMMIT;",
-    )?;
+    if has_column("meta", "topic")? {
+        // The old single room becomes the channel called main.
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO groups (topic, name, creator, relay, role, status)
+                 SELECT topic, 'main', creator, relay, role, status FROM meta;
+             UPDATE processed_ops SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
+             UPDATE messages SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
+             DROP TABLE meta;",
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -452,6 +527,7 @@ mod tests {
             sent_at_ms: 1,
             op_ts: Some(ts),
             text: text.into(),
+            nickname: None,
         }
     }
 
@@ -493,11 +569,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::open(dir.path()).unwrap();
         let (a, b) = ([1; 32], [3; 32]);
-        let (m1, m2, other) = (
+        let (mut m1, m2, other) = (
             msg(1, 1_000, "first"),
             msg(2, 2_000, "second"),
             msg(5, 1_500, "elsewhere"),
         );
+        m1.nickname = Some("Alice".into());
         state
             .record(&a, &[2; 32], Outcome::Ok, None, Some(&m2))
             .unwrap();
@@ -518,6 +595,10 @@ mod tests {
             h.into_iter().map(|m| m.text).collect()
         };
         assert_eq!(texts(&a), ["first", "second"]);
+        assert_eq!(
+            state.history(&a, None).unwrap()[0].nickname.as_deref(),
+            Some("Alice")
+        );
         assert_eq!(texts(&b), ["elsewhere"]);
         assert_eq!(state.history(&a, Some(1)).unwrap()[0].text, "second");
         assert_eq!(state.outcome(&[3; 32]).unwrap(), Some(Outcome::Skipped));
@@ -525,6 +606,32 @@ mod tests {
         let c = state.counts(&a).unwrap();
         assert_eq!((c.ok, c.skipped, c.failed), (2, 1, 0));
         assert_eq!(state.counts(&b).unwrap().ok, 1);
+    }
+
+    #[test]
+    fn profiles_keep_the_latest_update_per_author_and_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let (room, other, author) = ([1; 32], [2; 32], [3; 32]);
+        {
+            let state = State::open(dir.path()).unwrap();
+            assert_eq!(state.next_profile_revision(&room).unwrap(), 1);
+            assert!(state.record_profile(&room, &author, 2, "Renée").unwrap());
+            assert!(!state.record_profile(&room, &author, 1, "Old").unwrap());
+            assert!(state.record_profile(&other, &author, 1, "Other").unwrap());
+            assert!(state.record_profile(&room, &author, 3, "").unwrap());
+            assert!(!state.record_profile(&room, &author, 2, "Renée").unwrap());
+        }
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.profile(&room, &author).unwrap().as_deref(), Some(""));
+        assert_eq!(state.next_profile_revision(&room).unwrap(), 2);
+        assert_eq!(
+            state
+                .profiles(&other)
+                .unwrap()
+                .get(&author)
+                .map(String::as_str),
+            Some("Other")
+        );
     }
 
     #[test]
@@ -567,7 +674,9 @@ mod tests {
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].name, "main");
             assert_eq!(groups[0].role, Role::Creator);
-            assert_eq!(state.history(&[7; 32], None).unwrap()[0].text, "old");
+            let history = state.history(&[7; 32], None).unwrap();
+            assert_eq!(history[0].text, "old");
+            assert_eq!(history[0].nickname, None);
             assert_eq!(state.counts(&[7; 32]).unwrap().ok, 1);
         }
     }

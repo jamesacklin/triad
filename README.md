@@ -178,7 +178,11 @@ invite holders in rooms it creates. It stores credentials and decrypted
 history under `demo-data/` by default. Use `--data <dir>` to choose another
 directory. After a restart, opening a saved identity reconnects its room.
 The browser enables the incoming message chime after you interact with the
-page.
+page. Set a nickname under **Details**. Triad shares the change as an
+encrypted room event. The current name appears on all messages from that
+identity in the room, including earlier ones. Pass `--nickname "Sam"` to set
+your nickname in the channels the CLI opens, or `--nickname ""` to clear it.
+Peers with older clients can still exchange chat and show node IDs.
 
 ## Acceptance run (two machines)
 

@@ -32,7 +32,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::{StreamExt, StreamMap};
-use triad_core::envelope::{ChatBody, Invite};
+use triad_core::envelope::{ChatBody, Invite, ProfileUpdate, RoomEvent, normalize_nickname};
 use triad_core::identity::{Identity, NodeId, hex_id, short_id};
 use triad_core::net::{DEFAULT_RELAY, P2PANDA_FILE};
 use triad_core::state::{
@@ -49,6 +49,9 @@ struct Cli {
     /// Use this data directory.
     #[arg(long, global = true, value_name = "PATH")]
     data_dir: Option<PathBuf>,
+    /// Set your nickname in the channels opened by this session.
+    #[arg(long, global = true, value_name = "NAME")]
+    nickname: Option<String>,
     /// Also print sync and connection events.
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -138,8 +141,8 @@ enum ProbeCmd {
     },
 }
 
-#[derive(Clone, Copy)]
 struct Opts {
+    nickname: Option<String>,
     auto_accept: bool,
     json: bool,
     verbose: bool,
@@ -153,6 +156,17 @@ fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn message_sender(message: &StoredMessage, me: &NodeId, profile: Option<String>) -> String {
+    if &message.author == me {
+        "me".into()
+    } else {
+        profile
+            .or_else(|| message.nickname.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| short_id(&message.author))
     }
 }
 
@@ -198,6 +212,11 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
     }
     let rt = tokio::runtime::Runtime::new()?;
     let verbose = cli.verbose;
+    let nickname = cli
+        .nickname
+        .as_deref()
+        .map(|name| normalize_nickname(name).map(|name| name.unwrap_or_default().to_owned()))
+        .transpose()?;
     match cli.cmd {
         Cmd::Whoami => println!("{}", Identity::load_or_create(&data_dir)?.node_hex()),
         Cmd::Create {
@@ -207,6 +226,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             json,
         } => {
             let opts = Opts {
+                nickname,
                 auto_accept,
                 json,
                 verbose,
@@ -221,6 +241,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         } => {
             let invite = Invite::parse(&invite)?;
             let opts = Opts {
+                nickname,
                 auto_accept,
                 json,
                 verbose,
@@ -233,6 +254,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             json,
         } => {
             let opts = Opts {
+                nickname,
                 auto_accept,
                 json,
                 verbose,
@@ -268,9 +290,11 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             };
             let mut lines = Vec::new();
             for g in &groups {
+                let profiles = state.profiles(&g.topic)?;
                 for m in state.history(&g.topic, limit)? {
                     let key = (m.op_ts.unwrap_or(m.sent_at_ms * 1000), m.op_hash);
-                    lines.push((key, g.name.as_str(), m));
+                    let profile = profiles.get(&m.author).cloned();
+                    lines.push((key, &g.name, m, profile));
                 }
             }
             lines.sort_by_key(|(key, ..)| *key);
@@ -279,12 +303,8 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             {
                 lines.drain(..lines.len() - limit);
             }
-            for (_, name, m) in lines {
-                let who = if m.author == me {
-                    "me".into()
-                } else {
-                    short_id(&m.author)
-                };
+            for (_, name, m, profile) in lines {
+                let who = message_sender(&m, &me, profile);
                 if channel.is_some() {
                     println!("{}: {}", who, m.text);
                 } else {
@@ -459,12 +479,12 @@ type Topic = [u8; 32];
 /// The live p2panda side of every channel: one event stream per space, and
 /// one task per space this node is still waiting to be let into.
 struct Streams {
-    subs: StreamMap<Topic, SpaceSubscription<ChatBody>>,
-    joining: JoinSet<(Topic, Result<Space<ChatBody>, String>)>,
+    subs: StreamMap<Topic, SpaceSubscription<RoomEvent>>,
+    joining: JoinSet<(Topic, Result<Space<RoomEvent>, String>)>,
 }
 
 impl Streams {
-    fn wait_joined(&mut self, topic: Topic, pending: PendingSpace<ChatBody>) {
+    fn wait_joined(&mut self, topic: Topic, pending: PendingSpace<RoomEvent>) {
         self.joining
             .spawn(async move { (topic, pending.joined().await.map_err(|e| e.to_string())) });
     }
@@ -473,7 +493,7 @@ impl Streams {
 struct Channel {
     meta: Meta,
     /// Set once this node has been added to the space.
-    space: Option<Space<ChatBody>>,
+    space: Option<Space<RoomEvent>>,
     members: BTreeMap<NodeId, AccessLevel>,
     /// True once this node has seen itself in the member list.
     seen_self: bool,
@@ -525,6 +545,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
 
     let mut session = Session {
         me,
+        identity,
         node,
         state,
         home_relay,
@@ -578,6 +599,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
 
 struct Session {
     me: NodeId,
+    identity: Identity,
     node: Node,
     state: State,
     home_relay: String,
@@ -631,7 +653,7 @@ impl Session {
             .with_context(|| format!("no channel named #{name}; see /channels"))
     }
 
-    fn joined_space(&self, topic: &Topic) -> Result<&Space<ChatBody>> {
+    fn joined_space(&self, topic: &Topic) -> Result<&Space<RoomEvent>> {
         let channel = self.channel(topic)?;
         channel
             .space
@@ -644,7 +666,7 @@ impl Session {
         let topic = meta.topic;
         let (pending, rx) = self
             .node
-            .space::<ChatBody>(Hash::from(topic))
+            .space::<RoomEvent>(Hash::from(topic))
             .await
             .with_context(|| format!("subscribing to #{}", meta.name))?;
         streams.subs.insert(topic, rx);
@@ -672,7 +694,7 @@ impl Session {
         if self.channels.values().any(|c| c.meta.name == name) {
             bail!("a channel named #{name} already exists; pick another name");
         }
-        let (space, rx) = self.node.create_space::<ChatBody>().await?;
+        let (space, rx) = self.node.create_space::<RoomEvent>().await?;
         let topic = *space.id().as_bytes();
         let meta = Meta {
             name,
@@ -694,6 +716,7 @@ impl Session {
                 seen_self: true,
             },
         );
+        self.publish_nickname(topic).await?;
         Ok(topic)
     }
 
@@ -864,7 +887,7 @@ impl Session {
         Ok(())
     }
 
-    async fn on_joined(&mut self, topic: Topic, space: Space<ChatBody>) -> Result<()> {
+    async fn on_joined(&mut self, topic: Topic, space: Space<RoomEvent>) -> Result<()> {
         let Some(channel) = self.channels.get_mut(&topic) else {
             return Ok(());
         };
@@ -874,7 +897,7 @@ impl Session {
             channel.meta.status = JoinStatus::Joined;
         }
         self.refresh_members(topic).await;
-        Ok(())
+        self.publish_nickname(topic).await
     }
 
     async fn on_line(&mut self, line: &str, streams: &mut Streams) -> Result<bool> {
@@ -1028,10 +1051,23 @@ impl Session {
             ));
             return Ok(());
         };
-        let body = ChatBody::new(text, now_ms())?;
+        let body = RoomEvent::Chat(ChatBody::new(text, now_ms())?);
         // The plaintext is stored when our own operation comes back through
         // the stream; spaces do not return its hash here.
         space.publish(body).await?;
+        Ok(())
+    }
+
+    async fn publish_nickname(&self, topic: Topic) -> Result<()> {
+        if let Some(nickname) = &self.opts.nickname
+            && self.state.profile(&topic, &self.me)?.as_deref() != Some(nickname)
+        {
+            let revision = self.state.next_profile_revision(&topic)?;
+            let profile = ProfileUpdate::sign(&self.identity, &topic, revision, nickname)?;
+            self.joined_space(&topic)?
+                .publish(RoomEvent::Profile(profile))
+                .await?;
+        }
         Ok(())
     }
 
@@ -1117,31 +1153,44 @@ impl Session {
         }
     }
 
-    async fn on_event(&mut self, topic: Topic, ev: StreamEvent<ChatBody>) -> Result<()> {
+    async fn on_event(&mut self, topic: Topic, ev: StreamEvent<RoomEvent>) -> Result<()> {
         let name = self.name(&topic).to_string();
         match ev {
             StreamEvent::Processed { operation, .. } => {
                 let hash = *operation.id().as_bytes();
+                let body = match operation.message() {
+                    RoomEvent::Profile(profile) => {
+                        if let Ok((author, revision, nickname)) = profile.verify(&topic) {
+                            self.state
+                                .record_profile(&topic, &author, revision, nickname)?;
+                        }
+                        operation.ack().await?;
+                        return Ok(());
+                    }
+                    RoomEvent::Chat(body) => body,
+                };
                 if self.state.outcome(&hash)?.is_some() {
                     operation.ack().await?;
                     return Ok(());
                 }
                 let author = *operation.author().as_bytes();
-                let body = operation.message().clone();
                 let msg = StoredMessage {
                     op_hash: hash,
                     author,
                     sent_at_ms: body.sent_at_ms,
                     op_ts: Some(operation.timestamp()),
                     text: body.text.clone(),
+                    nickname: body.nickname().map(str::to_owned),
                 };
                 self.state
                     .record(&topic, &hash, Outcome::Ok, None, Some(&msg))?;
                 let mine = author == self.me;
-                let who = if mine { "me".into() } else { short_id(&author) };
+                let profile = self.state.profile(&topic, &author)?;
+                let who = message_sender(&msg, &self.me, profile.clone());
+                let nickname = profile.or(msg.nickname).filter(|name| !name.is_empty());
                 self.printer.emit(
                     json!({"event": "message", "channel": name, "author": hex_id(&author),
-                           "text": body.text, "op": hex::encode(hash), "mine": mine,
+                           "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
                            "ts": operation.timestamp() / 1000}),
                     || format!("[#{name}] {who}: {}", body.text),
                 );
