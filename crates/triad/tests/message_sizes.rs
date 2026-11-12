@@ -3,14 +3,17 @@
 //! the header: with 460 bytes of text a message still arrived, with 470 it
 //! was published but never synced, and the author's next publish failed
 //! ("could not decode corrupted 'header' value"). Found while running the
-//! bots on the real model. triad now refuses lines over `SEND_TEXT_BYTES`.
+//! bots on the real model. Text over `SEND_TEXT_BYTES` now goes as a long
+//! message (`triad_core::long`): ciphertext in an operation body on a plain
+//! stream, its key in a short space message.
 //!
-//! Every size up to the limit reaches the other member, a longer line is
-//! refused locally, and the author can still send after it.
+//! Every size up to `MAX_TEXT_BYTES` reaches the other member, the ones over
+//! `SEND_TEXT_BYTES` as long messages; a longer line is refused locally, and
+//! the author can still send after it.
 
 use std::time::Duration;
 
-use triad_core::envelope::SEND_TEXT_BYTES;
+use triad_core::envelope::{MAX_TEXT_BYTES, SEND_TEXT_BYTES};
 
 mod support;
 use support::*;
@@ -22,7 +25,7 @@ fn sized(n: usize) -> String {
 }
 
 #[test]
-fn messages_up_to_the_send_limit_arrive() {
+fn messages_up_to_the_limit_arrive() {
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let mut a = Proc::spawn("A", da.path(), &["create", "--auto-accept", "--json"]);
     let invite = a.wait_for("ready", |v| is_event(v, "ready"))["invite"]
@@ -41,23 +44,34 @@ fn messages_up_to_the_send_limit_arrive() {
         is_event(v, "joined") && v["member"] == node_b.as_str()
     });
 
-    let sizes = [100, 300, SEND_TEXT_BYTES];
+    let sizes = [
+        100,
+        300,
+        SEND_TEXT_BYTES,
+        SEND_TEXT_BYTES + 1,
+        1000,
+        MAX_TEXT_BYTES,
+    ];
     for n in sizes {
         a.send(&sized(n));
     }
     // Over the limit: refused before it is published.
-    a.send(&sized(SEND_TEXT_BYTES + 1));
+    a.send(&sized(MAX_TEXT_BYTES + 1));
     a.wait_for("refused", |v| {
-        is_event(v, "error") && v["text"].as_str().unwrap().contains("at most")
+        is_event(v, "error") && v["text"].as_str().unwrap().contains("limit is")
     });
     a.send("still-here");
-    let got = receive(&mut b, 4);
+    let got = receive(&mut b, sizes.len() + 1);
     let want: Vec<String> = sizes
         .iter()
         .map(|n| sized(*n))
         .chain(["still-here".to_string()])
         .collect();
     assert_eq!(got, want);
+    for v in b.seen.iter().filter(|v| foreign_text(v).is_some()) {
+        let len = v["text"].as_str().unwrap().len();
+        assert_eq!(v["long"], len > SEND_TEXT_BYTES, "{len} bytes");
+    }
     let errors = a
         .drain(Duration::from_secs(2))
         .iter()

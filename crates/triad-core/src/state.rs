@@ -142,6 +142,20 @@ pub struct StoredMessage {
     pub nickname: Option<String>,
 }
 
+/// A space message whose long text has not arrived yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitingLong {
+    pub op_hash: [u8; 32],
+    pub topic: [u8; 32],
+    /// Hash of the ciphertext it waits for.
+    pub hash: [u8; 32],
+    pub author: NodeId,
+    /// p2panda operation timestamp (microseconds).
+    pub op_ts: u64,
+    /// The space message, CBOR encoded.
+    pub body: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OutcomeCounts {
     pub ok: u64,
@@ -352,6 +366,21 @@ impl State {
                  result_bytes INTEGER,
                  at_ms INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS long_bodies (
+                 hash BLOB PRIMARY KEY,
+                 topic BLOB NOT NULL,
+                 ciphertext BLOB NOT NULL,
+                 received_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS long_waiting (
+                 op_hash BLOB PRIMARY KEY,
+                 topic BLOB NOT NULL,
+                 hash BLOB NOT NULL,
+                 author BLOB NOT NULL,
+                 op_ts INTEGER NOT NULL,
+                 body BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS long_waiting_hash ON long_waiting (hash);
              CREATE INDEX IF NOT EXISTS messages_topic ON messages (topic);
              CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);",
         )?;
@@ -493,6 +522,100 @@ impl State {
                 nickname
             ],
         )? != 0)
+    }
+
+    /// Stores a long message's ciphertext from the plain stream beside a
+    /// space. False when it was already stored.
+    pub fn put_long_body(
+        &self,
+        topic: &[u8; 32],
+        hash: &[u8; 32],
+        ciphertext: &[u8],
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO long_bodies (hash, topic, ciphertext, received_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                hash.as_slice(),
+                topic.as_slice(),
+                ciphertext,
+                now_ms() as i64
+            ],
+        )? != 0)
+    }
+
+    pub fn long_body(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM long_bodies WHERE hash = ?1",
+                [hash.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Keeps a space message whose long text has not arrived yet.
+    pub fn wait_long(&self, w: &WaitingLong) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO long_waiting (op_hash, topic, hash, author, op_ts, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                w.op_hash.as_slice(),
+                w.topic.as_slice(),
+                w.hash.as_slice(),
+                w.author.as_slice(),
+                w.op_ts as i64,
+                w.body
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes and returns the space messages waiting for this ciphertext.
+    pub fn take_waiting(&mut self, hash: &[u8; 32]) -> Result<Vec<WaitingLong>> {
+        let tx = self.conn.transaction()?;
+        let mut out = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT op_hash, topic, author, op_ts, body FROM long_waiting WHERE hash = ?1
+                 ORDER BY op_ts",
+            )?;
+            let rows = stmt.query_map([hash.as_slice()], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Vec<u8>>(4)?,
+                ))
+            })?;
+            for row in rows {
+                let (op_hash, topic, author, op_ts, body) = row?;
+                out.push(WaitingLong {
+                    op_hash: to_32(&op_hash)?,
+                    topic: to_32(&topic)?,
+                    hash: *hash,
+                    author: to_32(&author)?,
+                    op_ts: op_ts as u64,
+                    body,
+                });
+            }
+        }
+        tx.execute(
+            "DELETE FROM long_waiting WHERE hash = ?1",
+            [hash.as_slice()],
+        )?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// How many space messages wait for their long text.
+    pub fn waiting_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM long_waiting", [], |r| r.get(0))?;
+        Ok(n as u64)
     }
 
     pub fn outcome(&self, op_hash: &[u8; 32]) -> Result<Option<Outcome>> {
@@ -1317,6 +1440,31 @@ mod tests {
                 .map(String::as_str),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn long_bodies_and_waiting_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        let (t, h) = ([1; 32], [2; 32]);
+        assert_eq!(state.long_body(&h).unwrap(), None);
+        let w = WaitingLong {
+            op_hash: [3; 32],
+            topic: t,
+            hash: h,
+            author: [4; 32],
+            op_ts: 9,
+            body: vec![1, 2, 3],
+        };
+        state.wait_long(&w).unwrap();
+        state.wait_long(&w).unwrap();
+        assert_eq!(state.waiting_count().unwrap(), 1);
+        assert!(state.put_long_body(&t, &h, b"ct").unwrap());
+        assert!(!state.put_long_body(&t, &h, b"ct").unwrap());
+        assert_eq!(state.long_body(&h).unwrap().as_deref(), Some(&b"ct"[..]));
+        assert_eq!(state.take_waiting(&h).unwrap(), vec![w]);
+        assert!(state.take_waiting(&h).unwrap().is_empty());
+        assert_eq!(state.waiting_count().unwrap(), 0);
     }
 
     #[test]

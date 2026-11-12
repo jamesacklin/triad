@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use triad_core::envelope::{SEND_TEXT_BYTES, truncate_text};
+use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
 
 use crate::brain::{AnthropicBrain, Brain, MockBrain, TurnOutput};
 use crate::context::TurnInput;
@@ -235,7 +235,7 @@ impl Agent {
 /// What a turn sends back to the event loop.
 #[derive(Clone, Debug, Default)]
 pub struct TurnResult {
-    /// The reply, at most `SEND_TEXT_BYTES`.
+    /// The reply, at most `MAX_TEXT_BYTES`.
     pub text: String,
     /// Tools the gate refused.
     pub denied: Vec<String>,
@@ -286,7 +286,7 @@ pub async fn run_turn(
         text
     };
     Ok(TurnResult {
-        text: truncate_text(&text, SEND_TEXT_BYTES),
+        text: truncate_text(&text, MAX_TEXT_BYTES),
         denied,
         tool_time: gate.tool_time(),
         output,
@@ -320,7 +320,7 @@ mod tests {
             transcript: Vec::new(),
             asker: "a".into(),
             asker_tier: "host".into(),
-            ask: "é".repeat(300),
+            ask: "é".repeat(1100),
             tools: Vec::new(),
             unavailable: Vec::new(),
             host: "a".into(),
@@ -328,7 +328,7 @@ mod tests {
         let r = run_turn(&agent, ToolSet::All, &crate::tools::NoAudit, &input)
             .await
             .unwrap();
-        assert!(r.text.len() <= SEND_TEXT_BYTES, "{}", r.text.len());
+        assert!(r.text.len() <= MAX_TEXT_BYTES, "{}", r.text.len());
         assert!(r.text.ends_with('…'));
     }
 

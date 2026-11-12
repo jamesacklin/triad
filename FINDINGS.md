@@ -334,7 +334,8 @@ Personal bots and channel-hosted bots, built to
 H7 and H8 on the real model (Claude Opus 5.5, reached through OpenRouter),
 H9 behind a cargo feature. The real-model runs found a p2panda limit that
 wedges a member's log on any message over about 460 bytes; triad now
-refuses to send one (see H7). The code is in the new
+sends longer text as a long message, encrypted in an operation body beside
+the space (see H7 and "Long messages"). The code is in the new
 `crates/triad-agent` (policy, context, brain, tools, MCP) and in
 `crates/triad/src/main.rs` (wiring). Every automated test uses the mock brain
 and fake or fixture tools; none calls a model or a third-party service.
@@ -631,7 +632,8 @@ replies (cut with `…`), the system prompt asks for at most 350 characters,
 and a typed line over 400 bytes is refused locally before it can wedge
 the log (`tests/message_sizes.rs`). Longer messages need p2panda to raise
 the limit or carry the ciphertext in the body; that is an upstream issue
-worth filing.
+worth filing. Since then triad carries longer text itself: see "Long
+messages" below.
 
 **OpenRouter, not Anthropic directly.** The runs went through OpenRouter's
 OpenAI-format API to the same model. The Anthropic path (`TRIAD_AGENT_BRAIN=
@@ -724,6 +726,56 @@ it fails to open), `credentials.cbor` (still plain, mode 0600), and where
 the key comes from (the environment, as the plan said; a keychain or file
 descriptor would be better).
 
+### Long messages (2026-11-12)
+
+Text over `SEND_TEXT_BYTES` (400), up to `MAX_TEXT_BYTES` (2,000), now
+travels in two parts (`crates/triad-core/src/long.rs`):
+
+1. The sender encrypts the text with a fresh random key (ChaCha20-Poly1305,
+   already in the build through p2panda-encryption) and publishes the
+   ciphertext as the body of an operation on a plain p2panda stream, one
+   per space, on a topic derived from the space's (`stream_topic`).
+   Operation bodies are not decoded with the 512-byte header limit.
+2. It then publishes an ordinary chat message in the space whose `text` is
+   a fallback ("a long message; this version of triad cannot show it") and
+   whose new optional `long` field holds the key, the ciphertext's BLAKE3
+   hash and the length. That message stays under 200 bytes.
+
+A reader that gets the space message looks up the ciphertext by hash;
+whichever part arrives second completes the message, which is then
+recorded, shown and (for an `@bot` ask) queued exactly as a short one. A
+space message waiting for its body is kept in `state.sqlite`
+(`long_waiting`), so a restart in between loses nothing; ciphertext is kept
+in `long_bodies`. Bot replies use the same path and are now capped at 2,000
+bytes; the prompt asks for at most 1,500 characters.
+
+What it gives and what it costs:
+
+- Members read long messages; nobody else can. The key only travels inside
+  the space, so a member removed before a message was sent never gets its
+  key, though it can still sync the ciphertext.
+- Outsiders who sync the plain stream (anyone who knows the space's topic,
+  including removed members) see each long message's size and time, and
+  can link the stream to the space. They see nothing of short messages
+  beyond what spaces already show.
+- Anyone who knows the topic can publish to the plain stream. A reader only
+  stores bodies up to 2,016 bytes and only reads the one whose hash a
+  member's space message names, but nothing deletes unreferenced bodies.
+- Each long message is two operations. Bodies stay under p2panda's
+  4,096-byte gossip message limit at the 2,000-byte cap.
+- Old builds show the fallback text. `triad-web` has not learned long
+  messages yet.
+
+`tests/long_messages.rs`: a 1,500-byte message from the host reaches two
+members whole; a 900-byte `@bot` ask gets the mock bot's long echo back; a
+removed member never shows a long message sent after its removal, and
+nothing of it is in any file in its data directory; no node's
+`p2panda.sqlite` holds any of the texts. A second test holds the ciphertext
+back with a test hook (`/debug-long-hold`, `/debug-long-release`): the
+reader shows nothing until the body arrives, also across a restart, and
+then shows it once. `tests/message_sizes.rs` now sends 100 to 2,000 bytes
+and checks that exactly the ones over 400 went as long messages.
+
 ### Answers to the plan's questions
 
 - **Did the real model act on a planted instruction during an admin's
@@ -775,7 +827,8 @@ descriptor would be better).
 - `chat --agent` with no channels now starts and creates the DM (H2).
 - `scripts/vm/build.sh` built a package that no longer exists (H8).
 - `MAX_TEXT_BYTES` (2,000) is not what spaces can carry; about 460 bytes
-  is (H7). Replies are capped at 400 and longer typed lines refused.
+  is (H7). Text over 400 bytes now goes as a long message ("Long
+  messages"); replies are capped at 2,000.
 - The brain has a second route to the model, OpenRouter (H7).
 - Test-only additions the plan did not list: `TRIAD_AGENT_MOCK_DELAY_MS`,
   `TRIAD_AGENT_TEST_HOOKS` (`/debug-bot-on`, `/debug-bot-says`), `{ask}` in
@@ -789,7 +842,11 @@ descriptor would be better).
 
 - **File upstream: p2panda-core's 512-byte header limit makes spaces
   messages over about 460 bytes unreadable** and wedges the author's log.
-  Until then, longer bot replies need splitting into several messages.
+  Long messages work around it; an upstream fix (ciphertext in the body, as
+  p2panda's own TODO says, or a matching check when encoding) would make
+  them unnecessary.
+- **Long messages in the web demo.** `triad-web` shows a long message's
+  fallback text and still refuses lines over 400 bytes.
 - **Run the live checks against Anthropic directly** (`ANTHROPIC_API_KEY=...
   scripts/live-check.sh`) and with more planted-instruction phrasings,
   including an admin who asks for a tool action.

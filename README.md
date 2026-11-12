@@ -136,7 +136,7 @@ channel.
 
 | In chat mode | Behavior |
 | --- | --- |
-| plain text | Send to the focused channel. |
+| plain text | Send to the focused channel, up to 2,000 bytes. Over 400 bytes it goes as a long message: encrypted beside the space, because p2panda 0.8 cannot read back a longer space message ([FINDINGS.md](FINDINGS.md#long-messages-2026-11-12)). |
 | `/create <name>` | Create a channel, focus it, print its invite. |
 | `/join <invite> [name]` | Join a channel and focus it. Messages there stay disabled until a manager adds you. |
 | `/switch <name>` (`/s`) | Focus another channel. |
@@ -207,7 +207,9 @@ page. Set a nickname under **Details**. Triad shares the change as an
 encrypted room event. The current name appears on all messages from that
 identity in the room, including earlier ones. Pass `--nickname "Sam"` to set
 your nickname in the channels the CLI opens, or `--nickname ""` to clear it.
-Peers with older clients can still exchange chat and show node IDs.
+Peers with older clients can still exchange chat and show node IDs. The demo
+does not read long messages yet: it shows their fallback text, and refuses
+lines over 400 bytes.
 
 ## Acceptance run (two machines)
 

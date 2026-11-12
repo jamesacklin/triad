@@ -3,5 +3,6 @@
 
 pub mod envelope;
 pub mod identity;
+pub mod long;
 pub mod net;
 pub mod state;

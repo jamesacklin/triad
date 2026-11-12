@@ -206,6 +206,7 @@ impl Session {
         self.dm = Some(topic);
         tracing::info!(space = %hex::encode(&topic[..4]), "created bot DM");
         streams.subs.insert(topic, rx);
+        self.open_long(topic, streams).await?;
         self.channels.insert(
             topic,
             Channel {
@@ -526,9 +527,7 @@ impl Session {
             Ok(turn) => {
                 let published = async {
                     let body = ChatBody::new(&turn.text, now_ms())?.from_bot();
-                    self.joined_space(&topic)?
-                        .publish(RoomEvent::Chat(body))
-                        .await?;
+                    self.publish_chat(topic, body).await?;
                     anyhow::Ok(())
                 }
                 .await;
@@ -685,9 +684,7 @@ impl Session {
             bail!("only the channel's creator can run its bot");
         }
         let body = self.bot_on_body()?;
-        self.joined_space(&topic)?
-            .publish(RoomEvent::Chat(body))
-            .await?;
+        self.publish_chat(topic, body).await?;
         Ok(())
     }
 
@@ -700,9 +697,7 @@ impl Session {
             bail!("only the channel's creator can run its bot");
         }
         let body = ChatBody::new("This channel's bot is off.", now_ms())?.with_ctl(Control::BotOff);
-        self.joined_space(&topic)?
-            .publish(RoomEvent::Chat(body))
-            .await?;
+        self.publish_chat(topic, body).await?;
         Ok(())
     }
 
@@ -916,15 +911,30 @@ impl Session {
                         provider: "forged".into(),
                         servers: vec![],
                     });
-                self.joined_space(&focus)?
-                    .publish(RoomEvent::Chat(body))
-                    .await?;
+                self.publish_chat(focus, body).await?;
             }
             "/debug-bot-says" if std::env::var_os("TRIAD_AGENT_TEST_HOOKS").is_some() => {
                 // Test hook: a message with the bot flag from a non-host.
                 let body = ChatBody::new(rest, now_ms())?.from_bot();
+                self.publish_chat(focus, body).await?;
+            }
+            "/debug-long-hold" if std::env::var_os("TRIAD_AGENT_TEST_HOOKS").is_some() => {
+                // Test hook: publish a long message's space message and keep
+                // its ciphertext back until `/debug-long-release`, so readers
+                // see the key before the body.
+                let (long, payload) = triad_core::long::seal(rest)?;
+                let body = ChatBody::new(rest, now_ms())?.into_long(long);
                 self.joined_space(&focus)?
                     .publish(RoomEvent::Chat(body))
+                    .await?;
+                self.held_long = Some((focus, payload));
+            }
+            "/debug-long-release" if std::env::var_os("TRIAD_AGENT_TEST_HOOKS").is_some() => {
+                let (topic, payload) = self.held_long.take().context("nothing held")?;
+                self.long_pubs
+                    .get(&topic)
+                    .context("no long-message stream")?
+                    .publish(payload)
                     .await?;
             }
             _ => return Ok(false),

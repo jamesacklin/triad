@@ -5469,12 +5469,15 @@ name = "triad-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chacha20poly1305 0.10.1",
  "ciborium",
+ "getrandom 0.3.4",
  "hex",
  "p2panda",
  "p2panda-core",
  "rusqlite",
  "serde",
+ "serde_bytes",
  "tempfile",
  "tracing",
 ]
