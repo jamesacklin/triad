@@ -9,6 +9,9 @@ description = "Multi-channel chat on p2panda encrypted spaces"
 name = "triad"
 path = "src/main.rs"
 
+[features]
+sqlcipher = ["triad-core/sqlcipher"]
+
 [dependencies]
 triad-core = { workspace = true }
 triad-probe = { workspace = true }

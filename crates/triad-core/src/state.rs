@@ -14,6 +14,11 @@ use crate::identity::NodeId;
 
 pub const STATE_FILE: &str = "state.sqlite";
 
+/// The environment variable holding the key for `state.sqlite`. Unset, the
+/// file is plain SQLite. Set, the build must have SQLCipher (the
+/// `sqlcipher` feature), or opening fails rather than ignoring the key.
+pub const STATE_KEY_ENV: &str = "TRIAD_STATE_KEY";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Creator,
@@ -244,6 +249,28 @@ impl State {
     pub fn open_path(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        if let Some(key) = std::env::var(STATE_KEY_ENV).ok().filter(|k| !k.is_empty()) {
+            // Must come before any other statement on the connection.
+            conn.pragma_update(None, "key", &key)?;
+            let cipher: Option<String> = conn
+                .query_row("PRAGMA cipher_version", [], |r| r.get(0))
+                .optional()?;
+            if cipher.is_none() {
+                bail!(
+                    "{STATE_KEY_ENV} is set, but this build has no SQLCipher (feature `sqlcipher`)"
+                );
+            }
+        }
+        // Fails here, not later, on a wrong key or a missing one.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_err(|e| {
+            anyhow!(
+                "cannot read {}: {e} (wrong or missing {STATE_KEY_ENV}?)",
+                path.display()
+            )
+        })?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS groups (

@@ -330,7 +330,9 @@ design around:
 ## Bots (2026-11-11)
 
 Personal bots and channel-hosted bots, built to
-[HARNESS-PLAN.md](HARNESS-PLAN.md) on top of `628e58b`. The code is in the new
+[HARNESS-PLAN.md](HARNESS-PLAN.md) on top of `628e58b`. H0 to H6, H8 (on
+the mock brain) and the H9 stretch pass; H7's live run against the real
+model, and H8's, could not be done here (no API key) and are handed over. The code is in the new
 `crates/triad-agent` (policy, context, brain, tools, MCP) and in
 `crates/triad/src/main.rs` (wiring). Every automated test uses the mock brain
 and fake or fixture tools; none calls a model or a third-party service.
@@ -348,6 +350,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H6 | Real MCP | pass | `h6` | rmcp client over stdio and HTTP against a fixture server |
 | H7 | A real model | built; live run handed over | `h7` | rig wiring checked offline; no API key on this host |
 | H8 | The bot in the VM | pass (mock); real-model run handed over | `h8` | 48 MB smallest passing guest; +4 MB peak RSS |
+| H9 | Stretch: encryption at rest | pass, behind a feature | `h9` | SQLCipher coexists with p2panda's sqlx |
 
 ### H0: dependencies
 
@@ -626,6 +629,119 @@ serve it is tested only on the host (H0). The guest's kernel was not
 rebuilt: `build.sh` now stops at the kernel step on this host because
 objtool needs libelf headers (`gelf.h`), which are not installed; the
 kernel built earlier the same day, from the same configuration, was used.
+
+### H9: encryption at rest (stretch)
+
+**SQLCipher coexists with p2panda's sqlx.** The cargo feature `sqlcipher`
+(on `triad-core`, passed through by `triad`) turns on rusqlite's
+`bundled-sqlcipher`, which switches the build's one `libsqlite3-sys` 0.35.0
+to compile SQLCipher instead of SQLite, for rusqlite and for sqlx-sqlite
+alike. p2panda opens its database without a key, which SQLCipher treats as
+plain SQLite: `spaces_two_node`, `bots_dm` and `bots_at_rest` all pass on
+that build. No pinned version moved.
+
+With `TRIAD_STATE_KEY` set, `State::open` issues `PRAGMA key` first and
+then reads `sqlite_master`, so a wrong or missing key fails at start ("file
+is not a database") instead of later. `tests/bots_at_rest.rs` (run with
+`--features sqlcipher`): after a DM exchange, `state.sqlite` and its WAL
+contain neither the line, the reply, nor the `SQLite format 3` header;
+`history` works with the key and fails without it or with a wrong one.
+
+Two cautions:
+
+- **Plain SQLite ignores `PRAGMA key` silently.** So the default build, which
+  has no SQLCipher, refuses to start when `TRIAD_STATE_KEY` is set (checked
+  with `PRAGMA cipher_version`) rather than leaving the file in the clear.
+- **It brings in OpenSSL's libcrypto.** `bundled-sqlcipher` links the
+  system `libcrypto.so.3` dynamically; the alternative,
+  `bundled-sqlcipher-vendored-openssl`, compiles OpenSSL. Either way a third
+  crypto library joins ring and p2panda's own. The static VM build was not
+  tried with it. That is why the feature is off by default.
+
+Not covered: migrating an existing plain `state.sqlite` (with the key set,
+it fails to open), `credentials.cbor` (still plain, mode 0600), and where
+the key comes from (the environment, as the plan said; a keychain or file
+descriptor would be better).
+
+### Answers to the plan's questions
+
+- **Did the real model act on a planted instruction during an admin's
+  turn?** Not measured: there was no API key on this host. The experiment
+  is written (`bots_live.rs`, `live_planted_instruction`): member C plants
+  an instruction to call `calendar.create_event` with the title `PLANTED`,
+  admin B asks something unrelated, and the test prints whether the fixture
+  received the call. What is in place against it is not enforcement: the
+  system prompt says only the asker's message authorizes actions, the
+  transcript is fenced and labeled as context, and every line carries its
+  author's tier.
+- **How long from `@bot` to a reply on another member's screen?** On one
+  machine with the mock brain and fake tools, 100 to 170 ms over eight runs:
+  about 25 to 75 ms sync from asker to host, 30 to 60 ms of host-side turn
+  overhead (job bookkeeping, SQLite writes, the mock), model and tool time
+  0 to 2 ms, and 30 to 70 ms sync from host to the third member. From the
+  VM guest as host to the host machine, 0.27 s at 64 MB. The model's share
+  needs the H7 live run, which prints it.
+- **What does a member see when the host is offline, and when it returns?**
+  The member's `@bot` line appears as usual and nothing else happens; no
+  client tells the member that the bot's host is away. A host that returns
+  within the age limit (10 minutes) answers once; after it, the host records
+  the job as refused (`too old`) and the member sees nothing at all.
+- **Did anything from outside a channel appear in a channel turn's input?**
+  No, in any test (H5). The worker reads only the job's own channel.
+- **Did a one-member space work as the DM?** Yes, with no special handling.
+  p2panda stores one topic with four logs for it; a stranger who learns the
+  space ID can reach the owner's node with a join request, which the
+  owner's client declines without asking (H2).
+- **What do the bots cost?** 4.6 MB of binary (static, stripped x86_64:
+  23.0 MB against 18.4 MB) and about 4 MB of peak RSS in the guest (31.6 MB
+  against 27.7 MB at 64 MB). The smallest guest that passes is still 48 MB,
+  but slowly; 64 MB is comfortable (H8). `triad` now has 530 crates in its
+  normal tree, of which `triad-agent` brings 196.
+- **Is "admins everything, others nothing, plus grants" enough?** For the
+  tests, yes: nothing needed a tier in between, and per-tool grants covered
+  the one case that came up (a member allowed one calendar tool but not
+  Linear). What the tests did show is that the interesting line is not
+  between people but between tools: a read-only tool is low risk for anyone,
+  a write is not, and grants cannot express "reads for everyone" without
+  listing every member. See the follow-ups.
+
+### Where the plan was wrong or silent
+
+- TLS defaults pulled in aws-lc; fixed with no-provider features and ring
+  (H0).
+- Anthropic tool names cannot contain `.`; sent as `server__tool` (H4).
+- The "ask the host" refusal is written by code, since a model offered no
+  tools rarely tries to call one (H4).
+- Count limits are not applied to the DM (H2).
+- `chat --agent` with no channels now starts and creates the DM (H2).
+- `scripts/vm/build.sh` built a package that no longer exists (H8).
+- Test-only additions the plan did not list: `TRIAD_AGENT_MOCK_DELAY_MS`,
+  `TRIAD_AGENT_TEST_HOOKS` (`/debug-bot-on`, `/debug-bot-says`), `{ask}` in
+  mock replies; and `TRIAD_AGENT_BURST_PER_MINUTE`, `TRIAD_AGENT_MAX_STEPS`.
+- New events beyond the plan's: `join_declined`, `bot_rejected`, `bot`
+  (the `/bot` command's output), `granted`, `revoked`, `grants`, `blocked`,
+  `unblocked`, `audit`. Existing events and fields are unchanged; the
+  existing tests pass unmodified.
+
+### Proposed follow-ups
+
+- **Run H7 and H8's real-model checks with a key:** the live tests, the
+  planted-instruction result, latency and tokens, and an HTTPS request from
+  the guest through the bundled roots.
+- **Confirmation before writes, reads free.** MCP tool annotations
+  (`readOnlyHint`) are available in `rmcp`'s `Tool`; a grant tier "all
+  read-only tools" would cover what the tests suggested.
+- **Tell members when the host is away**, for example a periodic presence
+  announcement from the host, so an unanswered `@bot` is explained.
+- **A bot that stays up when the host is offline**, as its own node in a
+  VM: 64 MB is enough.
+- **Per-channel tool sets**, so a host can leave a connection out of one
+  channel.
+- **Encryption at rest by default** needs a decision on libcrypto (or a
+  SQLCipher build on a Rust crypto backend), key storage, and migration of
+  existing files.
+- **Install libelf headers on the build host** (or drop objtool from the
+  kernel configuration) so `build.sh` rebuilds the kernel again.
 
 ## Agent harness options (2026-11-11)
 
