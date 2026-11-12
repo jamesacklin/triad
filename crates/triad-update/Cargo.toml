@@ -1,0 +1,21 @@
+[package]
+name = "triad-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Over-the-air updates for triad: signed manifest, verified download, A/B slots"
+
+[dependencies]
+p2panda-core = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+p2panda-core = { workspace = true }
+rustls = { workspace = true }

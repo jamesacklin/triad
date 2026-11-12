@@ -15,6 +15,12 @@
 #   VM_ENV       KEY=VALUE lines for triad's environment in the guest
 #   VM_DATA      a directory whose files are copied into the guest's /data
 #   VM_LINE      the chat line the guest sends (default "hello from the vm")
+#   VM_DATA_DISK an ext4 image attached as a second disk and mounted on /data,
+#                so the guest's data (and installed updates) outlive the run
+#   VM_RESUME    triad arguments for a restart by the supervisor (default: chat)
+#
+# With TRIAD_SUPERVISE=1 in VM_ENV the guest's init keeps triad running and
+# updated instead of doing the test run; see init.c and update-test.sh.
 #   VM_ACCEL     QEMU accelerator (default: kvm for x86_64, tcg for arm64)
 #   VM_CPU       QEMU CPU model
 #   QEMU         QEMU binary
@@ -64,6 +70,11 @@ echo "$*" >"$WORK/root/etc/triad.args"
 echo "$WAIT $SETTLE" >"$WORK/root/etc/triad.wait"
 printf '%s\n' "${VM_ENV:-}" >"$WORK/root/etc/triad.env"
 printf '%s\n' "${VM_LINE:-}" >"$WORK/root/etc/triad.line"
+printf '%s\n' "${VM_RESUME:-}" >"$WORK/root/etc/triad.resume"
+DATA_DISK=()
+if [ -n "${VM_DATA_DISK:-}" ]; then
+  DATA_DISK=(-drive "id=data,file=$VM_DATA_DISK,format=raw,if=none" -device virtio-blk-device,drive=data)
+fi
 mkfs.ext4 -q -d "$WORK/root" -L root "$WORK/rootfs.ext4" 64M
 
 timeout "$TIMEOUT" "$QEMU" -M "$MACHINE" -accel "$ACCEL" -cpu "$CPU" -m "$MEM" -smp 1 \
@@ -71,6 +82,7 @@ timeout "$TIMEOUT" "$QEMU" -M "$MACHINE" -accel "$ACCEL" -cpu "$CPU" -m "$MEM" -
   -kernel "$A/kernel" \
   -append "console=$CONSOLE root=/dev/vda rw ip=dhcp panic=-1 quiet $EXTRA" \
   -drive id=root,file="$WORK/rootfs.ext4",format=raw,if=none -device virtio-blk-device,drive=root \
+  "${DATA_DISK[@]}" \
   -netdev user,id=net -device virtio-net-device,netdev=net \
   -device virtio-rng-device \
   -serial file:"$LOG"

@@ -18,7 +18,8 @@ for every run.
 | [run-vm.sh](run-vm.sh) | Boots the guest once with a given memory size and `triad` arguments. |
 | [chat-test.sh](chat-test.sh) | Host creates a group, the guest joins, each sends one message. Exits 0 on success. |
 | [bot-test.sh](bot-test.sh) | The guest creates a channel (with its bot, the default; mock brain) and hosts it; the host joins and asks it. Exits 0 on the bot's reply. |
-| [init.c](init.c) | Guest PID 1: mounts, DNS, sets `/etc/triad.env`, runs `triad --json`, prints memory figures, reboots. |
+| [update-test.sh](update-test.sh) | The guest updates itself from a release served by the host, then rolls back a bad release. Exits 0 on success. |
+| [init.c](init.c) | Guest PID 1: mounts, DNS, sets `/etc/triad.env`. Then either the test run (`triad --json`, one line, memory figures, reboot) or, with `TRIAD_SUPERVISE=1`, the supervisor that keeps `triad` running and updated. |
 | `kernel-*.config` | Kernel options added on top of `tinyconfig`, shared and per architecture. |
 
 ## Prerequisites
@@ -90,6 +91,54 @@ hello from the host`. Same kernel, `triad` 23.0 MB static and stripped.
 
 For comparison, the same binary without bots (`chat-test.sh`, guest
 joining) at 64 MB: peak 27.7 MB, RssAnon 10.9 MB, 9.9 MB free.
+
+## Updates in the guest
+
+With `TRIAD_SUPERVISE=1` in `VM_ENV`, init keeps `triad` running instead of
+doing one test run, and updates it (the release format and the commands are
+in the top-level [README](../../README.md#updates)):
+
+- `VM_DATA_DISK=<image>` attaches an ext4 image as a second disk, mounted on
+  `/data`. Channels, history and installed releases live there and outlive
+  the root filesystem, which is still rebuilt for every run.
+- Init starts the binary in the slot named by `/data/bin/current`, or
+  `/bin/triad` from the image when there is none.
+- 30 seconds after boot and then every 6 hours it runs that same binary as
+  `triad update --slots /data/bin`: a separate process that checks the
+  source, and exits. Between checks it costs nothing.
+- When the updater has installed a release (exit status 10), init sends
+  `/quit` to `triad` and starts the new slot with the arguments in
+  `VM_RESUME` (default `chat`).
+- A new binary is on trial for 30 seconds. If `triad` exits in that time,
+  init switches back to the slot before and the updater does not install
+  that release again.
+
+The kernel and init are not updated this way; they come from the host. Init
+does not check the slots' contents at boot, so the data disk is trusted as
+much as the root image is.
+
+```sh
+scripts/vm/build.sh x86_64
+TRIAD_VERSION=0.1.1-next VM_TRIAD_NAME=triad-next VM_KERNEL=skip scripts/vm/build.sh x86_64
+scripts/vm/update-test.sh x86_64 64
+```
+
+`update-test.sh` signs two releases with a throwaway key, serves them with
+`python3 -m http.server`, and boots the guest twice on one data disk.
+
+### Measured (2026-11-12)
+
+x86_64 with KVM, one vCPU, `triad` 24.9 MB static and stripped, one channel,
+no bot and no peer. Both boots passed at both sizes. The figures are from
+the end of boot 1, after the update, with the new version running.
+
+| Guest RAM | Result | Peak RSS (VmHWM) | RssAnon | Free | Available |
+| --- | --- | --- | --- | --- | --- |
+| 64 MB | pass | 27.3 MB | 9.6 MB | 2.4 MB | 33.6 MB |
+| 48 MB | pass | 21.2 MB | 11.0 MB | 5.0 MB | 12.5 MB |
+
+Memory was not sampled during the download itself, the arm64 guest was not
+run, and neither was a guest with a bot or a connected peer.
 
 ## Limits
 

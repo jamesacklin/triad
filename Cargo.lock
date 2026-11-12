@@ -5841,6 +5841,7 @@ dependencies = [
  "triad-agent",
  "triad-core",
  "triad-probe",
+ "triad-update",
 ]
 
 [[package]]
@@ -5890,6 +5891,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "triad-update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "p2panda-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

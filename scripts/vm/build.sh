@@ -14,6 +14,11 @@
 #   CROSS_COMPILE      kernel cross prefix for arm64 (default: aarch64-linux-gnu-)
 #   KERNEL_MAKE_ARGS   extra arguments for the kernel `make`
 #   VM_KERNEL=skip     rebuild only triad and init; keep the existing kernel
+#   VM_TRIAD_NAME      file name for the binary in the output (default: triad).
+#                      With TRIAD_VERSION=<v>, which sets what `--version`
+#                      prints, this builds a second version for update-test.sh:
+#                        TRIAD_VERSION=0.1.1 VM_TRIAD_NAME=triad-next VM_KERNEL=skip \
+#                          scripts/vm/build.sh x86_64
 set -euo pipefail
 
 ARCH=${1:?usage: build.sh <x86_64|arm64>}
@@ -68,7 +73,7 @@ T_LOWER=${TRIPLE//-/_}
       --config 'profile.release.codegen-units=1' \
       --config 'profile.release.opt-level="s"'
 )
-cp "$ROOT/target/$TRIPLE/release/triad" "$A/triad"
+cp "$ROOT/target/$TRIPLE/release/triad" "$A/${VM_TRIAD_NAME:-triad}"
 
 # --- guest init ---
 log "building init"
