@@ -1,5 +1,5 @@
 //! H3: the channel bot, talking only, on the mock brain. Host A creates a
-//! channel with `--agent`; B and C are members.
+//! channel (with its bot, the default); B and C are members.
 //!
 //! B and C see `bot_on` from A on joining. B's `@bot` line gets one reply,
 //! shown as the bot's; lines without `@bot` get none. A bot reply that
@@ -89,7 +89,7 @@ fn channel_bot_talking_only() {
     let mut a = Proc::spawn_env(
         "A",
         da.path(),
-        &["create", "--name", "garden", "--agent", "--json"],
+        &["create", "--name", "garden", "--json"],
         &host_env(&[]),
     );
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));
@@ -219,12 +219,7 @@ fn channel_bot_talking_only() {
     b.wait_for("own ask stored", |v| {
         own_text(v).as_deref() == Some("@bot while you were out")
     });
-    let mut a = Proc::spawn_env(
-        "A",
-        da.path(),
-        &["chat", "--agent", "--json"],
-        &host_env(&[]),
-    );
+    let mut a = Proc::spawn_env("A", da.path(), &["chat", "--json"], &host_env(&[]));
     a.wait_for("ready", |v| is_event(v, "ready"));
     wait_reply(&mut b, "@bot while you were out");
     let done = wait_job(&mut a, "done");
@@ -245,7 +240,7 @@ fn channel_bot_talking_only() {
     let mut a = Proc::spawn_env(
         "A",
         da.path(),
-        &["chat", "--agent", "--json"],
+        &["chat", "--json"],
         &host_env(&[("TRIAD_AGENT_MAX_AGE_SECS", "5")]),
     );
     a.wait_for("ready", |v| is_event(v, "ready"));
@@ -258,4 +253,75 @@ fn channel_bot_talking_only() {
     b.quit();
     a.quit();
     let _ = BIN;
+}
+
+/// The creator adds the bot after the fact: a channel created with
+/// `--no-bot` has none; `/bot on` starts the bots in that session, creates
+/// the DM without moving the focus, announces the bot, and B's `@bot` is
+/// answered. `/create <name> --no-bot` makes a channel with no bot while
+/// the bots run, and `/bot on` there adds it too.
+#[test]
+fn creator_adds_the_bot_later() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut a = Proc::spawn_env(
+        "A",
+        da.path(),
+        &[
+            "create",
+            "--name",
+            "garden",
+            "--no-bot",
+            "--auto-accept",
+            "--json",
+        ],
+        &host_env(&[]),
+    );
+    let ready = a.wait_for("ready", |v| is_event(v, "ready"));
+    assert_eq!(
+        ready["channels"].as_array().unwrap().len(),
+        1,
+        "no DM: {ready}"
+    );
+    let invite = ready["invite"].as_str().unwrap().to_string();
+    let node_a = ready["node"].as_str().unwrap().to_string();
+
+    let (mut b, node_b) = join("B", db.path(), &invite, &[]);
+    wait_member(&mut b, &node_b);
+    wait_member(&mut a, &node_b);
+    b.send("/bot");
+    let none = b.wait_for("/bot on B", |v| is_event(v, "bot"));
+    assert_eq!(none["enabled"], false);
+    b.send("@bot anyone there");
+    b.wait_for("refused locally", |v| is_event(v, "error"));
+
+    a.send("/bot on");
+    a.wait_for("bots started", |v| is_event(v, "bots_started"));
+    let dm = a.wait_for("DM reported", |v| is_event(v, "channel"));
+    assert_eq!(dm["channel"], "agent");
+    assert_eq!(dm["focused"], false);
+    a.wait_for("own bot_on", |v| {
+        is_event(v, "bot_on") && v["host"] == node_a.as_str()
+    });
+    let on = b.wait_for("bot_on on B", |v| is_event(v, "bot_on"));
+    assert_eq!(on["host"], node_a.as_str());
+    b.send("@bot are you here now");
+    let r = wait_reply(&mut b, "@bot are you here now");
+    assert_eq!(r["author"], node_a.as_str());
+
+    // A channel made with /create --no-bot has no bot until /bot on.
+    a.send("/create shed --no-bot");
+    a.wait_for("#shed", |v| {
+        is_event(v, "channel") && v["channel"] == "shed"
+    });
+    let quiet = a.drain(Duration::from_secs(2));
+    assert!(
+        !quiet.iter().any(|v| is_event(v, "bot_on")),
+        "a bot in #shed: {quiet:?}"
+    );
+    a.send("/bot on");
+    a.wait_for("bot_on in #shed", |v| {
+        is_event(v, "bot_on") && v["channel"] == "shed"
+    });
+    a.quit();
+    b.quit();
 }

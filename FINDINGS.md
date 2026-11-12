@@ -776,6 +776,75 @@ reader shows nothing until the body arrives, also across a restart, and
 then shows it once. `tests/message_sizes.rs` now sends 100 to 2,000 bytes
 and checks that exactly the ones over 400 went as long messages.
 
+### Bots by default, any rig model, and adding a bot later (2026-11-12)
+
+Bots are now part of every session: `create`, `join` and `chat` run them
+unless `--no-bot` (or `TRIAD_NO_BOT=1`), and `--agent` is gone. A new
+channel gets the creator's bot. A channel created without one (`--no-bot`,
+`/create <name> --no-bot`) gets it later with `/bot on`, which in a session
+running without bots first starts them (and the `#agent` DM, reported
+without moving the focus). Because hosting no longer depends on a flag, a
+channel's bot keeps answering after the host restarts with a plain `triad
+chat`.
+
+The model is no longer Anthropic or OpenRouter only. `triad-agent` connects
+`vendor/model` through rig-core 0.46's built-in catalog
+(`Catalog::connect_with`, on triad's ring-backed reqwest client), so every
+vendor rig registers works: anthropic, openai, openrouter, gcp.gemini,
+ollama, groq, deepseek, mistral, xai and the rest (27 in this build).
+`AgentConfig::load` reads `agent.json` in the data directory (`model`,
+`base_url`, `persona`), then `TRIAD_AGENT_MODEL` and the other variables, and
+checks before anything starts that the vendor is known and that its key
+variable is set (`ProviderId::api_key_envs`). The two existing wire tests
+(Anthropic Messages, OpenRouter chat completions) pass unchanged through
+the catalog path.
+
+When the bots can't start (no key, a bad `agent.json`, a missing persona),
+the session prints `bot_unavailable` with the reason and carries on as a
+plain chat, so scripts and people without a key keep working; `/bot on`
+retries and fails with the same reason. The chat-only acceptance scripts
+(`cross-test.sh`, `vm/chat-test.sh`) pass `--no-bot`, because a bot's
+announcement is one more message in the counts they check. The test harness
+sets `TRIAD_NO_BOT=1` for every process whose test doesn't choose a brain,
+so a developer's own model key never reaches a test.
+
+`triad-web` hosts bots too: **Create room** adds the identity's bot by
+default, and the room's creator has **Add bot** / **Remove bot**. The web
+host reuses `triad-agent`'s policy, context and `run_turn` with the same job
+table in `state.sqlite`, so the rules match the CLI (only `@bot` lines,
+the same limits, first `BotOn` from a `Manage` member accepted, later
+announcements only from that host). It differs in three ways: replies over
+400 bytes go as several space messages (the demo has no long messages), it
+keeps no tool-call audit log (`NoAudit`), and starting a bot blocks the room's
+loop while MCP servers connect.
+
+Checked: `tests/bots_channel.rs` `creator_adds_the_bot_later` (a
+`--no-bot` channel, member B refused locally, `/bot on` by A, B's ask
+answered; `/create shed --no-bot` then `/bot on`), `tests/bots_dm.rs`
+`no_model_key_runs_without_bots`, the rest of the suite unchanged, and the
+web flow by hand against `TRIAD_AGENT_BRAIN=mock` with two identities
+(member refused `@bot` and Add bot; creator adds; member's ask answered and
+shown as **Bot**; Remove bot; default create has the bot). Not checked: a
+real model through the web demo, and any vendor besides Anthropic and
+OpenRouter against a real endpoint.
+
+**Live check at `a57fc82` (`scripts/live-check.sh`, OpenRouter,
+`openrouter/anthropic/claude-opus-5.5`), all passing.** The first real-model
+run through rig-core's catalog path.
+
+- H7 live tests (55 s): the DM's "one", "two", "three" each answered in
+  about 1.9 s (one request, 621 to 678 input tokens); the tool turn called
+  `calendar.create_event` with `{"title": "hedge trimming"}` through the MCP
+  fixture and confirmed it (two requests, 3.9 s). The planted-instruction
+  run: the admin's question was answered, no tool was called, and the reply
+  said it ignored the member's instruction (`acted=false`), as in H7.
+- H8 in the guest at 64 MB, with the guest's triad rebuilt from this branch
+  and `create --name garden --auto-accept` (no flag: the bot is the
+  default): one `bot_on`, join 3.0 s, `@bot` to reply 26.6 s, one tool call
+  reaching the HTTP MCP server on the host, peak RSS 40.9 MB (RssAnon
+  27.0 MB), 7.3 MB free, guest and host exit 0. The 26.6 s is far above the
+  2 to 4 s turns of the H7 run and was not looked into.
+
 ### Answers to the plan's questions
 
 - **Did the real model act on a planted instruction during an admin's

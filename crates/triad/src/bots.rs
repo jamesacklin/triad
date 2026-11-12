@@ -29,7 +29,8 @@ pub const DM_NAME: &str = "agent";
 /// A line for the display, sent from a worker task to the event loop.
 pub type BotEvent = (Value, String);
 
-/// The running bots of a session started with `--agent`.
+/// The running bots of a session (all but `--no-bot` sessions, once a
+/// model is configured).
 pub struct Bots {
     pub agent: Arc<Agent>,
     /// A second connection to `state.sqlite`, for the audit log, written
@@ -133,13 +134,18 @@ impl Session {
         self.dm == Some(*topic)
     }
 
+    /// Reports that this session runs without bots, and why.
+    pub fn bots_unavailable(&self, why: &str) {
+        self.printer
+            .emit(json!({"event": "bot_unavailable", "reason": why}), || {
+                format!("bots off: {why}. /bot on retries; --no-bot silences this.")
+            });
+    }
+
     /// Starts the bots: the brain, tools, the DM, and any jobs left queued.
-    pub async fn start_bots(
-        &mut self,
-        config: &AgentConfig,
-        data_dir: &Path,
-        streams: &mut Streams,
-    ) -> Result<()> {
+    pub async fn start_bots(&mut self, config: &AgentConfig, streams: &mut Streams) -> Result<()> {
+        let data_dir = self.data_dir.clone();
+        let data_dir = data_dir.as_path();
         let agent = Agent::start(config, data_dir).await?;
         for w in &agent.warnings {
             self.printer.info(w);
@@ -178,7 +184,7 @@ impl Session {
     }
 
     /// The personal bot's DM: a space named `agent` with this node as its
-    /// only member, created the first time chat mode starts with `--agent`.
+    /// only member, created the first time chat mode starts with bots.
     async fn ensure_dm(&mut self, streams: &mut Streams) -> Result<Topic> {
         if let Some(t) = self.dm
             && self.channels.contains_key(&t)
@@ -657,10 +663,7 @@ impl Session {
 
     /// The readable announcement members see, and the control itself.
     fn bot_on_body(&self) -> Result<ChatBody> {
-        let bots = self
-            .bots
-            .as_ref()
-            .context("run with --agent to host a bot")?;
+        let bots = self.bots.as_ref().context("this session has no bots")?;
         let provider = bots.agent.provider();
         let servers = bots.agent.servers();
         let text = format!(
@@ -674,8 +677,10 @@ impl Session {
         Ok(ChatBody::new(&text, now_ms())?.with_ctl(Control::BotOn { provider, servers }))
     }
 
-    /// Turns the bot on in a channel this node created, and announces it.
-    pub async fn bot_on(&mut self, topic: Topic) -> Result<()> {
+    /// Adds my bot to a channel this node created, and announces it. In a
+    /// session running without bots (`--no-bot`, or no model at start),
+    /// starts them first, so a bot can join a channel at any time.
+    pub async fn bot_on(&mut self, topic: Topic, streams: &mut Streams) -> Result<()> {
         let c = self.channel(&topic)?;
         if self.is_dm(&topic) {
             bail!("the bot DM always has your bot");
@@ -683,8 +688,39 @@ impl Session {
         if c.meta.role != Role::Creator {
             bail!("only the channel's creator can run its bot");
         }
+        if c.meta.status != JoinStatus::Joined {
+            bail!("not a member of #{} yet", c.meta.name);
+        }
+        self.ensure_bots(streams).await?;
         let body = self.bot_on_body()?;
         self.publish_chat(topic, body).await?;
+        Ok(())
+    }
+
+    /// Starts the bots in a session running without them.
+    async fn ensure_bots(&mut self, streams: &mut Streams) -> Result<()> {
+        if self.bots.is_some() {
+            return Ok(());
+        }
+        let config = AgentConfig::load(&self.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let had_dm = self.dm.is_some_and(|t| self.channels.contains_key(&t));
+        self.start_bots(&config, streams).await?;
+        let bots = self.bots.as_ref().expect("just started");
+        let (provider, servers) = (bots.agent.provider(), bots.agent.servers());
+        self.printer.emit(
+            json!({"event": "bots_started", "provider": provider, "servers": servers}),
+            || format!("bots started: {provider}"),
+        );
+        if !had_dm && let Some(dm) = self.dm {
+            // Report the new DM without moving the focus off the channel.
+            let c = self.channel(&dm)?;
+            let mut value = self.channel_json(c)?;
+            value["event"] = json!("channel");
+            self.printer.emit(value, || {
+                format!("your bot's DM is #{DM_NAME}; /switch {DM_NAME} to talk to it")
+            });
+        }
+        self.resume_jobs(streams).await;
         Ok(())
     }
 
@@ -734,12 +770,17 @@ impl Session {
     }
 
     /// The bot commands. Returns false if `cmd` is not one of them.
-    pub async fn on_bot_command(&mut self, cmd: &str, rest: &str) -> Result<bool> {
+    pub async fn on_bot_command(
+        &mut self,
+        cmd: &str,
+        rest: &str,
+        streams: &mut Streams,
+    ) -> Result<bool> {
         let focus = self.focus;
         let name = self.name(&focus).to_string();
         match cmd {
             "/bot" => match rest {
-                "on" => self.bot_on(focus).await?,
+                "on" => self.bot_on(focus, streams).await?,
                 "off" => self.bot_off(focus).await?,
                 "" => {
                     let bot = self.state.bot(&focus)?;

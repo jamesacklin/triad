@@ -46,7 +46,7 @@ fn turns_see_only_their_own_channel() {
     let mut a = Proc::spawn_env(
         "A",
         dir.path(),
-        &["create", "--name", "garden", "--agent", "--json"],
+        &["create", "--name", "garden", "--json"],
         &env,
     );
     a.wait_for("ready", |v| is_event(v, "ready"));

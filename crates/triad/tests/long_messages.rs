@@ -64,14 +64,7 @@ fn long_messages_between_members_and_not_to_a_removed_one() {
     let mut a = Proc::spawn_env(
         "A",
         da.path(),
-        &[
-            "create",
-            "--name",
-            "garden",
-            "--agent",
-            "--auto-accept",
-            "--json",
-        ],
+        &["create", "--name", "garden", "--auto-accept", "--json"],
         &[("TRIAD_AGENT_BRAIN", "mock")],
     );
     let invite = a.wait_for("ready", |v| is_event(v, "ready"))["invite"]

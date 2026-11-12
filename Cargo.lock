@@ -5510,6 +5510,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "triad-agent",
  "triad-core",
 ]
 

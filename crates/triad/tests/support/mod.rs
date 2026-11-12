@@ -25,8 +25,18 @@ impl Proc {
         Self::spawn_env(name, dir, args, &[])
     }
 
+    /// Bots run by default. So a model key in the developer's environment
+    /// never reaches a test, a process runs without bots (`TRIAD_NO_BOT`)
+    /// unless its test chooses a brain or model, or sets `TRIAD_NO_BOT`.
     pub fn spawn_env(name: &'static str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Proc {
-        let mut child = Command::new(crate::BIN)
+        let mut cmd = Command::new(crate::BIN);
+        if !env
+            .iter()
+            .any(|(k, _)| ["TRIAD_AGENT_BRAIN", "TRIAD_AGENT_MODEL", "TRIAD_NO_BOT"].contains(k))
+        {
+            cmd.env("TRIAD_NO_BOT", "1");
+        }
+        let mut child = cmd
             .envs(env.iter().copied())
             .arg("--data-dir")
             .arg(dir)
