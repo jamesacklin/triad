@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad", "crates/triad-web"]
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad"]
 
 [workspace.package]
 version = "0.1.0"

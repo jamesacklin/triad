@@ -35,7 +35,7 @@ The app is one binary with a terminal interface, one group per data directory, a
 | Messages | UTF-8 text up to 2,000 bytes | Attachments, edits, reactions, threads |
 | Authority | Group creator is the only member who commits MLS changes | Leaderless membership changes |
 | Identity | One Ed25519 key per install, shown as hex | Names, key rotation, Azimuth, any PKI |
-| Interface | CLI commands and a line-based chat prompt | GUI, TUI widgets, notifications |
+| Interface | CLI commands, a line-based chat prompt, and (added 2026-11-12) a full-screen terminal interface over the same session | GUI, notifications |
 | Network | Public iroh relays and discovery defaults | Self-hosted relays, Tor, LAN-only modes |
 | Security | Honest peers, confidentiality against the transport and storage layers | Audit-grade key storage, metadata privacy, malicious members |
 

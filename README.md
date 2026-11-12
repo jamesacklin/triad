@@ -121,6 +121,7 @@ always-on node.
 | `--relay <url>` | `create`, `probe` | Override the default relay (`https://use1-1.relay.n0.iroh.link./`). Joiners take the relay from the invite. |
 | `--auto-accept` | `create`, `join`, `chat` | Accept every join request, in every channel this node manages, without asking. |
 | `--no-bot` | `create`, `join`, `chat` | Run without your bots ([Bots](#bots)). Also `TRIAD_NO_BOT=1`. |
+| `--plain` | `create`, `join`, `chat` | Use the line-based prompt instead of the [terminal interface](#terminal-interface). |
 | `--json` | chat mode | Print one JSON object per event (`ready`, `channel`, `switched`, `join_request`, `joined`, `removed`, `promoted`, `message`, `sync_started`, `sync_ended`, `error`). |
 | `-v` | All | Also print sync and connection events. |
 
@@ -146,6 +147,7 @@ channel.
 | `/invite [name]` | Print an invite to the focused or named channel. |
 | `/members`, `/status` | Show the focused channel's members and counts. |
 | `/add <node>`, `/remove <node>`, `/promote <node>` | Change the focused channel's membership. Needs `Manage` access. |
+| `/nick <name>` | Change your nickname in every channel. |
 | `/quit` | Leave chat mode. |
 
 Names are local labels: 1 to 32 characters of `a-z`, `0-9`, `-` and `_`, with
@@ -228,46 +230,65 @@ directory, tokens named by environment variable.
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
 
-## Local web demo
+## Terminal interface
 
-`triad-web` serves a small chat page for trying multiple Triad identities
-inside one Rust process. Each identity has its own keys and SQLite files
-and can create or join one p2panda space.
+On a terminal, `create`, `join` and `chat` open a full-screen interface:
 
-```sh
-cargo run --locked -p triad-web
+```
+┌ channels ────────┐┌ #garden · 2 members · creator ───────────────────┐
+│  agent (DM)      ││sam: hello                                        │
+│* garden          ││me: @bot what's on the calendar?                  │
+│  ops (…)       2 ││bot: …                                            │
+└──────────────────┘└──────────────────────────────────────────────────┘
+ bot on (mine) · anthropic · tools calendar │ turn running 4s → calendar.list_events ok │ queue 1
+┌──────────────────────────────────────────────────────────────────────┐
+│> message #garden or /command                                         │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-Open the local address printed at startup (by default
-`http://127.0.0.1:8765`). Create an identity and a room, then copy the
-invite link into a second tab and create a second identity there. The
-raw invite code under **Details** also works with the current CLI via
-`triad join <invite-code>`. To join a CLI-created room in the browser,
-paste its invite code into the **Room invite** field.
+- **Channels** on the left: your bot's DM first, `*` on the focused one,
+  `(…)` on one still waiting to be let in, and a count of unread messages.
+  Hidden below 60 columns.
+- **The chat pane**: the focused channel's stored history (the last 500
+  messages), then live messages and that channel's notices. Its title gives
+  the member count and your role.
+- **The status line**: the focused channel's bot (yours, someone else's, or
+  none; the provider and tool servers), the running turn with its elapsed
+  time and current tool call, the queue, the last turn's time and tokens, a
+  join request waiting for you, and the last error.
+- **The input line**: plain text goes to the focused channel; a line
+  starting with `/` is a command, the same as in plain mode.
 
-The demo binds its web interface to loopback and automatically accepts
-invite holders in rooms it creates. It stores credentials and decrypted
-history under `demo-data/` by default. Use `--data <dir>` to choose another
-directory. After a restart, opening a saved identity reconnects its room.
-The browser enables the incoming message chime after you interact with the
-page. Set a nickname under **Details**. Triad shares the change as an
-encrypted room event. The current name appears on all messages from that
-identity in the room, including earlier ones. Pass `--nickname "Sam"` to set
-your nickname in the channels the CLI opens, or `--nickname ""` to clear it.
-Peers with older clients can still exchange chat and show node IDs. The demo
-does not read long messages yet: it shows their fallback text, and refuses
-lines over 400 bytes.
+| Key | Action |
+| --- | --- |
+| Enter | Send the line. |
+| Ctrl-N / Ctrl-P, Alt-Down / Alt-Up | Focus the next or previous channel. |
+| PgUp / PgDn | Scroll the chat pane. It stays put while new messages arrive, until you scroll back down. |
+| Left, Right, Home, End, Ctrl-A, Ctrl-E | Move in the line. |
+| Backspace, Delete, Ctrl-U, Ctrl-W | Delete a character, everything before the cursor, or a word. |
+| Ctrl-C, or Ctrl-D on an empty line | Quit (`/quit`). |
 
-**Bots in the demo.** **Create room** adds the identity's bot unless **With
-my bot** is unticked, and the room's creator gets **Add bot** / **Remove
-bot** in the room header to change that later. Members ask it with `@bot`;
-its replies show as **Bot**. The bot runs in the `triad-web` process as that
-identity, with the CLI's policy and limits and the model from the server's
-environment or the identity's `agent.json` ([Choosing the
-model](#choosing-the-model)); `TRIAD_AGENT_BRAIN=mock cargo run -p
-triad-web` tries it with no key. A reply over 400 bytes goes as several
-messages, since the demo sends no long messages. The demo keeps no tool-call
-audit log.
+A join request shows in the status line as `join request for #garden from
+7c1d09ee — y/N`; the next plain line answers it, as at the plain prompt.
+`/nick <name>` changes your nickname in every channel, as `--nickname` does
+at start. Mouse capture is off, so the terminal's own selection copies text
+such as an invite (`/invite` prints one again).
+
+`--plain` keeps the line-based prompt. So does output to a pipe or input from
+one, and a build without the `tui` feature (`cargo build -p triad
+--no-default-features`). `--json` is unaffected.
+
+To try two identities on one machine, open two terminals and give each its
+own data directory:
+
+```sh
+TRIAD_AGENT_BRAIN=mock triad --data-dir /tmp/alice --nickname alice create --name garden
+# copy the invite from alice's pane, then in the second terminal:
+triad --data-dir /tmp/bob --nickname bob join triad1-…
+```
+
+Alice answers `y` to bob's join request. `TRIAD_AGENT_BRAIN=mock` gives
+alice a bot that echoes `@bot` asks with no model key.
 
 ## Acceptance run (two machines)
 

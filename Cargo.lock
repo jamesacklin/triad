@@ -5767,26 +5767,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "triad-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "p2panda",
- "rand 0.10.3",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "triad-agent",
- "triad-core",
-]
-
-[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

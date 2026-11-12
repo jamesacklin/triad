@@ -11,7 +11,8 @@
 //! spaces, each a named channel with its own members and history. Chat mode
 //! opens all of them at once. Plain lines go to the focused channel, and
 //! `/create`, `/join`, `/switch`, `/channels`, `/msg` and `/invite` manage
-//! the rest, as in an IRC client.
+//! the rest, as in an IRC client. `/nick <name>` changes the nickname in
+//! every channel.
 //!
 //! Membership commands in chat mode, for the offline-membership tests:
 //! `/add <node>`, `/remove <node>`, `/promote <node>` (to `Manage`). They act
@@ -1315,6 +1316,27 @@ impl Session {
                     .promote(key(&member)?, AccessLevel::Manage)
                     .await?;
                 tracing::info!(member = %short_id(&member), "promoted member");
+            }
+            "/nick" => {
+                let name = normalize_nickname(rest)?
+                    .context("usage: /nick <name>")?
+                    .to_owned();
+                self.opts.nickname = Some(name.clone());
+                // Every channel this node is in now; one still waiting to be
+                // let in publishes it on joining, as with --nickname.
+                let joined: Vec<Topic> = self
+                    .channels
+                    .values()
+                    .filter(|c| c.space.is_some())
+                    .map(|c| c.meta.topic)
+                    .collect();
+                for topic in joined {
+                    self.publish_nickname(topic).await?;
+                }
+                self.printer
+                    .emit(json!({"event": "nick", "nickname": name}), || {
+                        format!("you are now {name}")
+                    });
             }
             "/status" => {
                 let c = self.channel(&focus)?;
