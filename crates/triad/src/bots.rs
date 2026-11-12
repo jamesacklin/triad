@@ -477,7 +477,12 @@ impl Session {
                 author: short_id(&m.author),
                 tier: tier(&m.author),
                 bot: m.bot && self.bot_accepted(&job.topic, &m.author),
-                text: m.text,
+                // The model reads an action as IRC writes it.
+                text: if m.action {
+                    format!("/me {}", m.text)
+                } else {
+                    m.text
+                },
             })
             .collect();
         let member_list: Vec<(String, String)> =

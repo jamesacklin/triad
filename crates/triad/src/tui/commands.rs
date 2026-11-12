@@ -22,6 +22,7 @@ pub const COMMANDS: &[Command] = &[
         "<name> <text>",
         "send to a channel without switching",
     ),
+    c("/me", "<action>", "say what you are doing: * you waves"),
     c("/channels", "", "list channels"),
     c("/list", "", "list channels"),
     c("/create", "<name> [--no-bot]", "create a channel"),

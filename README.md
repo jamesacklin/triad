@@ -144,8 +144,9 @@ channel.
 | `/join <invite> [name]` | Join a channel and focus it. Messages there stay disabled until a manager adds you. |
 | `/switch <name>` (`/s`) | Focus another channel. |
 | `/msg <name> <text>` | Send to a channel without switching. |
+| `/me <action>` | Send an action, shown as `* name action`, as in IRC. Builds older than this show only the action text. |
 | `/channels` (`/list`) | List channels; `*` marks the focused one. |
-| `/invite [name]` | Print an invite to the focused or named channel. |
+| `/invite [name]` | Print an invite to the focused or named channel and copy it to the clipboard (not with `--json`). With no system clipboard (over SSH, say) it asks the terminal to copy instead (OSC 52), which most terminals allow. On Linux the copy may be lost when triad quits, unless a clipboard manager keeps it. |
 | `/members`, `/status` | Show the focused channel's members and counts. |
 | `/add <node>`, `/remove <node>`, `/promote <node>` | Change the focused channel's membership. Needs `Manage` access. |
 | `/nick <name>` | Change your nickname in every channel. |
@@ -282,6 +283,7 @@ On a terminal, `create`, `join` and `chat` open a full-screen interface:
 | Enter | Send the line. |
 | Ctrl-N / Ctrl-P, Alt-Down / Alt-Up | Focus the next or previous channel. |
 | PgUp / PgDn | Scroll the chat pane. It stays put while new messages arrive, until you scroll back down. |
+| Mouse wheel | Scroll the chat pane or the channel list, whichever is under the pointer. |
 | Tab, Up / Down | When a line starts with `/`, the matching commands (and channel names after `/switch`, `/s`, `/msg`, `/invite`) are listed above the input box. Up and Down pick one; Tab puts it in the line. |
 | Left, Right, Home, End, Ctrl-A, Ctrl-E | Move in the line. |
 | Backspace, Delete, Ctrl-U, Ctrl-W | Delete a character, everything before the cursor, or a word. |
@@ -290,8 +292,9 @@ On a terminal, `create`, `join` and `chat` open a full-screen interface:
 A join request shows in the status line as `join request for #garden from
 7c1d09ee — y/N`; the next plain line answers it, as at the plain prompt.
 `/nick <name>` changes your nickname in every channel, as `--nickname` does
-at start. Mouse capture is off, so the terminal's own selection copies text
-such as an invite (`/invite` prints one again).
+at start. The interface takes the mouse for the wheel, so select text with
+Shift held (Option on macOS Terminal and iTerm2). `/invite` copies the
+invite for you.
 
 `--plain` keeps the line-based prompt. So does output to a pipe or input from
 one, and a build without the `tui` feature (`cargo build -p triad

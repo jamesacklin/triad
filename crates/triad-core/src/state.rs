@@ -140,6 +140,8 @@ pub struct StoredMessage {
     /// The author's bot wrote it (as the author claimed; see `bots`).
     pub bot: bool,
     pub nickname: Option<String>,
+    /// An action (`/me waves`), shown as `* name waves`.
+    pub action: bool,
 }
 
 /// A space message whose long text has not arrived yet.
@@ -673,8 +675,8 @@ impl State {
         }
         if let Some(m) = message {
             tx.execute(
-                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, bot, nickname)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, bot, nickname, action)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     m.op_hash.as_slice(),
                     m.author.as_slice(),
@@ -684,6 +686,7 @@ impl State {
                     topic.as_slice(),
                     m.bot,
                     m.nickname,
+                    m.action,
                 ],
             )?;
         }
@@ -716,7 +719,7 @@ impl State {
     /// `limit` messages.
     pub fn history(&self, topic: &[u8; 32], limit: Option<usize>) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT op_hash, author, sent_at_ms, op_ts, text, bot, nickname FROM messages
+            "SELECT op_hash, author, sent_at_ms, op_ts, text, bot, nickname, action FROM messages
              WHERE topic = ?1
              ORDER BY COALESCE(op_ts, sent_at_ms * 1000) ASC, op_hash ASC",
         )?;
@@ -729,11 +732,12 @@ impl State {
                 r.get::<_, String>(4)?,
                 r.get::<_, bool>(5)?,
                 r.get::<_, Option<String>>(6)?,
+                r.get::<_, bool>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (h, a, sent, ts, text, bot, nickname) = row?;
+            let (h, a, sent, ts, text, bot, nickname, action) = row?;
             out.push(StoredMessage {
                 op_hash: to_32(&h)?,
                 author: to_32(&a)?,
@@ -742,6 +746,7 @@ impl State {
                 text,
                 bot,
                 nickname,
+                action,
             });
         }
         if let Some(limit) = limit
@@ -757,7 +762,7 @@ impl State {
         let row = self
             .conn
             .query_row(
-                "SELECT author, sent_at_ms, op_ts, text, bot, topic, nickname FROM messages WHERE op_hash = ?1",
+                "SELECT author, sent_at_ms, op_ts, text, bot, topic, nickname, action FROM messages WHERE op_hash = ?1",
                 params![op_hash.as_slice()],
                 |r| {
                     Ok((
@@ -768,11 +773,12 @@ impl State {
                         r.get::<_, bool>(4)?,
                         r.get::<_, Vec<u8>>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, bool>(7)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(a, sent, ts, text, bot, topic, nickname)| {
+        row.map(|(a, sent, ts, text, bot, topic, nickname, action)| {
             Ok((
                 StoredMessage {
                     op_hash: *op_hash,
@@ -782,6 +788,7 @@ impl State {
                     text,
                     bot,
                     nickname,
+                    action,
                 },
                 to_32(&topic)?,
             ))
@@ -1161,6 +1168,9 @@ fn migrate_layout(conn: &mut Connection) -> Result<()> {
     if !has_column("messages", "nickname")? {
         tx.execute_batch("ALTER TABLE messages ADD COLUMN nickname TEXT;")?;
     }
+    if !has_column("messages", "action")? {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN action INTEGER NOT NULL DEFAULT 0;")?;
+    }
     if has_column("meta", "topic")? {
         // The old single room becomes the channel called main.
         tx.execute_batch(
@@ -1212,6 +1222,7 @@ mod tests {
             text: text.into(),
             bot: hash.is_multiple_of(2),
             nickname: None,
+            action: hash == 3,
         }
     }
 

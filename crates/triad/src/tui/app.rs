@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Instant;
 
+use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 
 use super::commands::{Suggestion, suggest};
@@ -18,6 +19,8 @@ pub enum Line {
         text: String,
         mine: bool,
         bot: bool,
+        /// `/me`: shown as `* who text`.
+        action: bool,
     },
     /// A dim line: membership changes, bot notes, command output.
     Notice(String),
@@ -121,6 +124,13 @@ pub struct App {
     store: Box<dyn Store>,
     /// Rows in the focused pane and its height, as last drawn.
     pub pane: Cell<(usize, usize)>,
+    /// Where the sidebar and the pane were last drawn, for the mouse. The
+    /// sidebar is `None` on a terminal too narrow for it.
+    pub areas: Cell<(Option<Rect>, Rect)>,
+    /// The first channel the sidebar shows, and how many fit, as last
+    /// drawn.
+    pub sidebar_top: usize,
+    pub sidebar_rows: Cell<usize>,
     /// Whether this session runs my bots, and with what.
     pub bots: bool,
     pub bot_provider: String,
@@ -180,6 +190,9 @@ impl App {
             early: Vec::new(),
             store,
             pane: Cell::new((0, 0)),
+            areas: Cell::new((None, Rect::default())),
+            sidebar_top: 0,
+            sidebar_rows: Cell::new(0),
             bots: false,
             bot_provider: String::new(),
             bot_servers: Vec::new(),
@@ -462,6 +475,7 @@ impl App {
         };
         self.focus = Some(name.to_string());
         self.selected = self.focus.clone();
+        self.reveal_selected();
         if let Some(c) = self.focused_mut() {
             c.unread = 0;
         }
@@ -503,17 +517,26 @@ impl App {
             .as_deref()
             .and_then(|s| self.channels.iter().position(|c| c.name == s))
             .unwrap_or(0) as isize;
-        let next = &self.channels[(at + step).rem_euclid(n) as usize].name;
+        let next = self.channels[(at + step).rem_euclid(n) as usize]
+            .name
+            .clone();
         self.selected = Some(next.clone());
+        self.reveal_selected();
         Some(format!("/switch {next}"))
     }
 
     /// Scrolls the focused pane by `pages` (negative is up).
     pub fn scroll(&mut self, pages: isize) {
+        let (_, height) = self.pane.get();
+        self.scroll_rows(height.saturating_sub(1).max(1) as isize * pages);
+    }
+
+    /// Scrolls the focused pane by `step` rows; down past the end follows
+    /// the bottom again.
+    pub fn scroll_rows(&mut self, step: isize) {
         let (rows, height) = self.pane.get();
         let Some(c) = self.focused_mut() else { return };
         let bottom = rows.saturating_sub(height);
-        let step = height.saturating_sub(1).max(1) as isize * pages;
         let top = c.scroll_top.unwrap_or(bottom) as isize + step;
         c.scroll_top = if top >= bottom as isize {
             None
@@ -522,6 +545,57 @@ impl App {
         };
     }
 }
+
+impl App {
+    /// The sidebar's first channel, kept in range for `rows` visible rows.
+    pub fn sidebar_start(&self, rows: usize) -> usize {
+        self.sidebar_top
+            .min(self.channels.len().saturating_sub(rows))
+    }
+
+    /// Scrolls the channel list by `step` channels.
+    pub fn scroll_sidebar(&mut self, step: isize) {
+        let rows = self.sidebar_rows.get();
+        let top = (self.sidebar_start(rows) as isize + step).max(0) as usize;
+        self.sidebar_top = top.min(self.channels.len().saturating_sub(rows));
+    }
+
+    /// Moves the sidebar's view so the selected channel shows.
+    fn reveal_selected(&mut self) {
+        let rows = self.sidebar_rows.get();
+        let Some(i) = self
+            .selected
+            .as_deref()
+            .and_then(|s| self.channels.iter().position(|c| c.name == s))
+        else {
+            return;
+        };
+        if rows == 0 {
+            return;
+        }
+        let top = self.sidebar_start(rows);
+        if i < top {
+            self.sidebar_top = i;
+        } else if i >= top + rows {
+            self.sidebar_top = i + 1 - rows;
+        }
+    }
+
+    /// A mouse wheel turn of `step` at a screen cell: the sidebar or the
+    /// pane under it scrolls.
+    pub fn wheel(&mut self, column: u16, row: u16, step: isize) {
+        let (sidebar, pane) = self.areas.get();
+        let at = Position::new(column, row);
+        if sidebar.is_some_and(|s| s.contains(at)) {
+            self.scroll_sidebar(step);
+        } else if pane.contains(at) {
+            self.scroll_rows(step * WHEEL_ROWS);
+        }
+    }
+}
+
+/// Pane rows one notch of the mouse wheel scrolls.
+const WHEEL_ROWS: isize = 3;
 
 /// A finished turn's figures from its `done` event.
 fn turn_figures(v: &Value) -> String {
@@ -566,6 +640,7 @@ pub fn message_line(v: &Value, dm: bool) -> Line {
         text: str_of(v, "text").unwrap_or_default().to_string(),
         mine,
         bot: accepted,
+        action: bool_of(v, "action"),
     }
 }
 
@@ -596,6 +671,7 @@ pub mod tests {
                 text: text.into(),
                 mine: who == "me",
                 bot: false,
+                action: false,
             };
             Ok(match channel {
                 "garden" => Backfill {
@@ -683,7 +759,8 @@ pub mod tests {
                 who: "bb112233".into(),
                 text: "new".into(),
                 mine: false,
-                bot: false
+                bot: false,
+                action: false,
             }
         );
     }
@@ -906,5 +983,47 @@ pub mod tests {
         assert_eq!(app.focused().unwrap().scroll_top, None);
         app.scroll(-20);
         assert_eq!(app.focused().unwrap().scroll_top, Some(0));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_what_is_under_it() {
+        let mut app = started();
+        let side = Rect::new(0, 0, 20, 10);
+        let pane = Rect::new(20, 0, 60, 10);
+        app.areas.set((Some(side), pane));
+        app.pane.set((100, 10));
+        app.wheel(30, 5, -1);
+        assert_eq!(app.focused().unwrap().scroll_top, Some(87));
+        app.wheel(30, 5, 1);
+        assert_eq!(app.focused().unwrap().scroll_top, None);
+
+        // Twelve channels in a sidebar with room for five.
+        for i in 0..10 {
+            app.apply(
+                &json!({"event": "channel", "channel": format!("c{i:02}"), "role": "creator", "status": "joined"}),
+                "",
+            );
+        }
+        let n = app.channels.len();
+        assert!(n > 5, "{n}");
+        app.sidebar_rows.set(5);
+        app.wheel(3, 3, 1);
+        assert_eq!(app.sidebar_start(5), 1);
+        app.wheel(3, 3, 100);
+        assert_eq!(app.sidebar_start(5), n - 5);
+        assert_eq!(app.focused().unwrap().scroll_top, None, "pane untouched");
+        app.wheel(3, 3, -100);
+        assert_eq!(app.sidebar_start(5), 0);
+        // Selecting past the bottom brings the selection into view.
+        for _ in 0..n - 1 {
+            app.select(1);
+        }
+        let i = app
+            .channels
+            .iter()
+            .position(|c| Some(&c.name) == app.selected.as_ref())
+            .unwrap();
+        let top = app.sidebar_start(5);
+        assert!((top..top + 5).contains(&i), "{i} not in {top}..");
     }
 }

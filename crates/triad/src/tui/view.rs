@@ -79,9 +79,15 @@ fn rows_of(line: &Line, cols: usize) -> Vec<TextLine<'static>> {
             text,
             mine,
             bot,
+            action,
         } => {
             let who = clean(who);
-            let full = format!("{who}: {}", clean(text));
+            let label = if *action {
+                format!("* {who}")
+            } else {
+                format!("{who}:")
+            };
+            let full = format!("{label} {}", clean(text));
             let who_style = if *bot {
                 Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
             } else if *mine {
@@ -89,7 +95,6 @@ fn rows_of(line: &Line, cols: usize) -> Vec<TextLine<'static>> {
             } else {
                 Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
             };
-            let label = format!("{who}:");
             wrap(&full, cols)
                 .into_iter()
                 .enumerate()
@@ -134,14 +139,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(3),
     ])
     .areas(area);
-    let pane = if area.width >= SIDEBAR_MIN_COLS {
+    let (side, pane) = if area.width >= SIDEBAR_MIN_COLS {
         let [side, pane] =
             Layout::horizontal([Constraint::Length(SIDEBAR_COLS), Constraint::Min(1)]).areas(main);
         draw_sidebar(frame, app, side);
-        pane
+        (Some(side), pane)
     } else {
-        main
+        (None, main)
     };
+    app.areas.set((side, pane));
     draw_pane(frame, app, pane);
     draw_status(frame, app, status);
     draw_suggestions(frame, app, &suggestions, popup);
@@ -189,9 +195,13 @@ fn draw_suggestions(frame: &mut Frame, app: &App, suggestions: &[Suggestion], ar
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let cols = area.width.saturating_sub(2) as usize;
+    let rows = area.height.saturating_sub(2) as usize;
+    app.sidebar_rows.set(rows);
     let lines: Vec<TextLine> = app
         .channels
         .iter()
+        .skip(app.sidebar_start(rows))
+        .take(rows)
         .map(|c| {
             let focused = app.focus.as_deref() == Some(c.name.as_str());
             let selected = app.selected.as_deref() == Some(c.name.as_str());
@@ -573,13 +583,29 @@ mod tests {
     }
 
     #[test]
+    fn actions_read_as_irc_does() {
+        let line = Line::Msg {
+            who: "sam".into(),
+            text: "waves".into(),
+            mine: false,
+            bot: false,
+            action: true,
+        };
+        let rows: Vec<String> = rows_of(&line, 40).iter().map(|r| r.to_string()).collect();
+        assert_eq!(rows, ["* sam waves"]);
+    }
+
+    #[test]
     fn command_suggestions_and_hidden_keys() {
         let mut app = started();
         for c in "/bot ".chars() {
             app.input.insert(c);
         }
         let rows = screen(&app, 80, 20);
-        assert!(rows.iter().any(|r| r.contains("/bot model [vendor/model]")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("/bot model [vendor/model]")),
+            "{rows:#?}"
+        );
         // Down then Tab takes the second suggestion.
         app.move_completion(1);
         app.complete();
@@ -590,7 +616,10 @@ mod tests {
         }
         let rows = screen(&app, 80, 20);
         assert!(!rows.iter().any(|r| r.contains("sk-secret")), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains("/bot provider-key •••")), "{rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains("/bot provider-key •••")),
+            "{rows:#?}"
+        );
     }
 
     #[test]
