@@ -622,10 +622,22 @@ binary**: the static, stripped x86_64 `triad` is 23.0 MB against 18.4 MB at
 `75ba1fc`. (The two runs differ in role, creator against joiner, which
 also moves the figure a little.)
 
-Not done here: the manual run on the real model with an HTTP MCP server
-(no API key on this host), so an HTTPS request from the guest, which has no
-certificate store, has not been made; the bundled-roots fallback that would
-serve it is tested only on the host (H0). The guest's kernel was not
+**The guest's bot through an HTTP MCP server, everything but the model.**
+`LIVE=1 LIVE_BRAIN=mock scripts/vm/bot-test.sh x86_64 64` runs the fixture
+server on the host machine, gives the guest an `mcp.json` pointing at
+QEMU's host address (`http://10.0.2.2:<port>/mcp`, through `VM_DATA`), and
+has the guest, as the bot's host, ask its own bot (the line comes from
+`VM_LINE`; a member asking would correctly be refused the tool). The guest's
+bot called `calendar.create_event` on the host machine's server and the
+member on the host machine saw the reply. Peak RSS 32.2 MB at 64 MB. The
+fixture needed `--allow-host 10.0.2.2`: rmcp's HTTP server accepts only
+localhost `Host` headers by default.
+
+Not done here: the same run on the real model (`LIVE=1` without
+`LIVE_BRAIN`), for lack of an API key, so an HTTPS request from the guest,
+which has no certificate store, has not been made; the bundled-roots
+fallback that would serve it is tested only on the host (H0).
+`scripts/live-check.sh` runs it together with H7's live tests. The guest's kernel was not
 rebuilt: `build.sh` now stops at the kernel step on this host because
 objtool needs libelf headers (`gelf.h`), which are not installed; the
 kernel built earlier the same day, from the same configuration, was used.
@@ -725,9 +737,11 @@ descriptor would be better).
 
 ### Proposed follow-ups
 
-- **Run H7 and H8's real-model checks with a key:** the live tests, the
-  planted-instruction result, latency and tokens, and an HTTPS request from
-  the guest through the bundled roots.
+- **Run H7 and H8's real-model checks with a key:**
+  `ANTHROPIC_API_KEY=... scripts/live-check.sh` runs the live tests (the
+  planted-instruction result, latency and tokens) and the guest on the real
+  model with an HTTP MCP server (an HTTPS request through the bundled
+  roots), logging to `target/live-check.log`.
 - **Confirmation before writes, reads free.** MCP tool annotations
   (`readOnlyHint`) are available in `rmcp`'s `Tool`; a grant tier "all
   read-only tools" would cover what the tests suggested.

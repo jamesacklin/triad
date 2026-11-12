@@ -4,7 +4,7 @@
 //!
 //!   mcp_fixture --server calendar --tool create_event --log calls.log --stdio
 //!   mcp_fixture --server linear --tool create_issue --log calls.log \
-//!       --http 127.0.0.1:0 [--token T]
+//!       --http 127.0.0.1:0 [--token T] [--allow-host 10.0.2.2]
 //!
 //! Over HTTP it prints `listening http://<addr>/mcp` on its first line and,
 //! with `--token`, answers 401 to any request without `Bearer <T>`.
@@ -101,11 +101,14 @@ async fn main() -> anyhow::Result<()> {
     }
     let addr = arg(&args, "--http").expect("--stdio or --http ADDR");
     let token = arg(&args, "--token");
-    let service: StreamableHttpService<Fixture, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok(fixture.clone()),
-        Default::default(),
-        StreamableHttpServerConfig::default(),
-    );
+    let mut config = StreamableHttpServerConfig::default();
+    // rmcp accepts only localhost Host headers by default; a VM guest
+    // reaches this server through QEMU's host address instead.
+    if let Some(host) = arg(&args, "--allow-host") {
+        config = config.with_allowed_hosts(["localhost", "127.0.0.1", host.as_str()]);
+    }
+    let service: StreamableHttpService<Fixture, LocalSessionManager> =
+        StreamableHttpService::new(move || Ok(fixture.clone()), Default::default(), config);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("listening http://{}/mcp", listener.local_addr()?);
     std::io::stdout().flush()?;

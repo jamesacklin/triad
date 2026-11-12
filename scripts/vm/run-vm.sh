@@ -13,6 +13,8 @@
 #   VM_SETTLE    seconds the guest waits after sending, before measuring
 #   VM_TIMEOUT   seconds before QEMU is killed
 #   VM_ENV       KEY=VALUE lines for triad's environment in the guest
+#   VM_DATA      a directory whose files are copied into the guest's /data
+#   VM_LINE      the chat line the guest sends (default "hello from the vm")
 #   VM_ACCEL     QEMU accelerator (default: kvm for x86_64, tcg for arm64)
 #   VM_CPU       QEMU CPU model
 #   QEMU         QEMU binary
@@ -57,9 +59,11 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK"/root/{bin,sbin,proc,sys,dev,tmp,etc,data}
 cp "$A/triad" "$WORK/root/bin/triad"
 cp "$A/init" "$WORK/root/sbin/init"
+if [ -n "${VM_DATA:-}" ]; then cp -r "$VM_DATA"/. "$WORK/root/data/"; fi
 echo "$*" >"$WORK/root/etc/triad.args"
 echo "$WAIT $SETTLE" >"$WORK/root/etc/triad.wait"
 printf '%s\n' "${VM_ENV:-}" >"$WORK/root/etc/triad.env"
+printf '%s\n' "${VM_LINE:-}" >"$WORK/root/etc/triad.line"
 mkfs.ext4 -q -d "$WORK/root" -L root "$WORK/rootfs.ext4" 64M
 
 timeout "$TIMEOUT" "$QEMU" -M "$MACHINE" -accel "$ACCEL" -cpu "$CPU" -m "$MEM" -smp 1 \

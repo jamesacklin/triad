@@ -2,7 +2,7 @@
 // copies the DHCP nameserver into /etc/resolv.conf, sets the KEY=VALUE
 // lines of /etc/triad.env in its environment, runs
 // `triad --data-dir /data <args from /etc/triad.args> --json` with a pipe on
-// stdin, sends one chat line, prints memory figures, sends /quit and reboots.
+// stdin, sends one chat line (/etc/triad.line, if present), prints memory figures, sends /quit and reboots.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,7 +60,13 @@ int main(void) {
     if (pid == 0) { dup2(p[0], 0); close(p[0]); close(p[1]); execv(argv[0], argv); perror("execv"); _exit(127); }
     close(p[0]);
     sleep(wait_s);
-    dprintf(p[1], "hello from the vm\n");
+    // /etc/triad.line: the line to send (default "hello from the vm").
+    static char send_line[1024] = "hello from the vm";
+    FILE *sl = fopen("/etc/triad.line", "r");
+    if (sl) { if (!fgets(send_line, sizeof send_line, sl)) strcpy(send_line, "hello from the vm"); fclose(sl); }
+    send_line[strcspn(send_line, "\n")] = 0;
+    if (!send_line[0]) strcpy(send_line, "hello from the vm");
+    dprintf(p[1], "%s\n", send_line);
     sleep(settle_s);
     puts("---MEM---");
     const char *mk[] = {"MemTotal", "MemFree", "MemAvailable", "Cached", "AnonPages", "Slab", NULL};
