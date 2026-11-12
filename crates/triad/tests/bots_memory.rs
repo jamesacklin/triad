@@ -116,6 +116,16 @@ fn memory_survives_a_restart_and_pins_reach_the_dm_prompt() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["memory.forget", "memory.save", "memory.search"]);
+    assert_eq!(
+        names,
+        [
+            "memory.forget",
+            "memory.save",
+            "memory.search",
+            "schedule.add",
+            "schedule.list",
+            "schedule.remove"
+        ]
+    );
     let _ = BIN;
 }

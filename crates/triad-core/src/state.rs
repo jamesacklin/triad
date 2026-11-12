@@ -405,7 +405,16 @@ impl State {
                  INSERT INTO bot_memory_fts (bot_memory_fts, rowid, text)
                  VALUES ('delete', old.id, old.text);
                  INSERT INTO bot_memory_fts (rowid, text) VALUES (new.id, new.text);
-             END;",
+             END;
+             CREATE TABLE IF NOT EXISTS bot_schedules (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT NOT NULL,
+                 prompt TEXT NOT NULL,
+                 next_at_ms INTEGER NOT NULL,
+                 every_ms INTEGER,
+                 last_fired_ms INTEGER,
+                 created_at_ms INTEGER NOT NULL
+             );",
         )?;
         Ok(State { conn })
     }
@@ -1268,6 +1277,131 @@ impl State {
     }
 }
 
+/// One schedule of the personal bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduleRow {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub next_at_ms: u64,
+    /// `None` for a one-shot.
+    pub every_ms: Option<u64>,
+    pub last_fired_ms: Option<u64>,
+    pub created_at_ms: u64,
+}
+
+impl State {
+    // --- the personal bot's schedules ----------------------------------
+
+    pub fn schedule_add(
+        &self,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO bot_schedules (name, prompt, next_at_ms, every_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                prompt,
+                next_at_ms as i64,
+                every_ms.map(|e| e as i64),
+                now_ms() as i64
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn schedules_where(
+        &self,
+        clause: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<ScheduleRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, name, prompt, next_at_ms, every_ms, last_fired_ms, created_at_ms
+             FROM bot_schedules {clause}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(ScheduleRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                prompt: r.get(2)?,
+                next_at_ms: r.get::<_, i64>(3)? as u64,
+                every_ms: r.get::<_, Option<i64>>(4)?.map(|e| e as u64),
+                last_fired_ms: r.get::<_, Option<i64>>(5)?.map(|e| e as u64),
+                created_at_ms: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every schedule, soonest first.
+    pub fn schedules(&self) -> Result<Vec<ScheduleRow>> {
+        self.schedules_where("ORDER BY next_at_ms, id", &[])
+    }
+
+    pub fn schedule(&self, id: i64) -> Result<Option<ScheduleRow>> {
+        Ok(self.schedules_where("WHERE id = ?1", &[&id])?.pop())
+    }
+
+    /// Schedules whose time has come, soonest first.
+    pub fn due_schedules(&self, now_ms: u64) -> Result<Vec<ScheduleRow>> {
+        self.schedules_where(
+            "WHERE next_at_ms <= ?1 ORDER BY next_at_ms, id",
+            &[&(now_ms as i64)],
+        )
+    }
+
+    /// Whether a schedule with this ID existed.
+    pub fn schedule_remove(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM bot_schedules WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    /// Sets when a schedule fires next.
+    pub fn schedule_set_next(&self, id: i64, next_at_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE bot_schedules SET next_at_ms = ?2 WHERE id = ?1",
+            params![id, next_at_ms as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records a fire before its message is posted, in one transaction: a
+    /// recurring schedule moves to `next`, a one-shot (`next` is `None`) is
+    /// removed. Returns false if the row was no longer due as `due_at_ms`
+    /// (another fire, or an edit, got there first), in which case nothing
+    /// changed and the caller must not post.
+    pub fn schedule_fired(
+        &mut self,
+        id: i64,
+        due_at_ms: u64,
+        now_ms: u64,
+        next: Option<u64>,
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = match next {
+            Some(next) => tx.execute(
+                "UPDATE bot_schedules SET next_at_ms = ?3, last_fired_ms = ?4
+                 WHERE id = ?1 AND next_at_ms = ?2",
+                params![id, due_at_ms as i64, next as i64, now_ms as i64],
+            )?,
+            None => tx.execute(
+                "DELETE FROM bot_schedules WHERE id = ?1 AND next_at_ms = ?2",
+                params![id, due_at_ms as i64],
+            )?,
+        };
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+}
+
 fn migrate_layout(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let has_column = |table: &str, column: &str| -> Result<bool> {
@@ -1608,6 +1742,44 @@ mod tests {
         assert!(!state.memory_forget(plumber).unwrap());
         assert_eq!(ids("plumber"), Vec::<i64>::new());
         assert!(state.memory_pinned().unwrap().is_empty());
+    }
+
+    #[test]
+    fn schedules_fire_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::open(dir.path()).unwrap();
+        let once = state.schedule_add("once", "Say hi.", 1_000, None).unwrap();
+        let every = state
+            .schedule_add("hourly", "Check.", 2_000, Some(3_600_000))
+            .unwrap();
+        state.schedule_add("later", "Later.", 9_000, None).unwrap();
+        let due: Vec<i64> = state
+            .due_schedules(5_000)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(due, [once, every]);
+        assert!(state.schedule_fired(once, 1_000, 5_000, None).unwrap());
+        // A second fire of the same due time changes nothing.
+        assert!(!state.schedule_fired(once, 1_000, 5_000, None).unwrap());
+        assert!(state.schedule(once).unwrap().is_none());
+        assert!(
+            state
+                .schedule_fired(every, 2_000, 5_000, Some(3_602_000))
+                .unwrap()
+        );
+        assert!(
+            !state
+                .schedule_fired(every, 2_000, 5_000, Some(3_602_000))
+                .unwrap()
+        );
+        let row = state.schedule(every).unwrap().unwrap();
+        assert_eq!(row.next_at_ms, 3_602_000);
+        assert_eq!(row.last_fired_ms, Some(5_000));
+        assert_eq!(state.schedules().unwrap().len(), 2);
+        assert!(state.schedule_remove(every).unwrap());
+        assert!(!state.schedule_remove(every).unwrap());
     }
 
     #[test]

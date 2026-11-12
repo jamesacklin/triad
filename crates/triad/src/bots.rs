@@ -14,15 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::Value;
-use triad_agent::assistant::{self, Memory, Store};
+use triad_agent::assistant::{self, Memory, Schedule, Store};
 use triad_agent::context::{self, ContextLimits, HistoryLine, Kind, Turn};
 use triad_agent::policy::{self, ChannelView, Decision, Incoming, Tier, ToolSet};
+use triad_agent::schedule::{self as sched, Due};
 use triad_agent::tools::{Audit, offered, servers};
 use triad_agent::{
     Agent, AgentConfig, KEYS_FILE, TurnResult, configured_model, save_key, save_model,
 };
 use triad_core::envelope::Control;
-use triad_core::state::{BotRow, Job, JobState, MemoryRow, NewJob};
+use triad_core::state::{BotRow, Job, JobState, MemoryRow, NewJob, ScheduleRow};
 
 use super::*;
 
@@ -144,6 +145,16 @@ fn memory(m: MemoryRow) -> Memory {
     }
 }
 
+fn schedule(s: ScheduleRow) -> Schedule {
+    Schedule {
+        id: s.id,
+        name: s.name,
+        prompt: s.prompt,
+        next_at_ms: s.next_at_ms,
+        every_ms: s.every_ms,
+    }
+}
+
 /// A storage error as the model sees it; the detail goes to the log.
 fn store_error(e: anyhow::Error) -> String {
     tracing::error!("bot store: {e:#}");
@@ -151,6 +162,27 @@ fn store_error(e: anyhow::Error) -> String {
 }
 
 impl Store for StateStore {
+    fn schedule_count(&self) -> Result<u64, String> {
+        Ok(self.db().schedules().map_err(store_error)?.len() as u64)
+    }
+    fn schedule_add(
+        &self,
+        name: &str,
+        prompt: &str,
+        next_at_ms: u64,
+        every_ms: Option<u64>,
+    ) -> Result<i64, String> {
+        self.db()
+            .schedule_add(name, prompt, next_at_ms, every_ms)
+            .map_err(store_error)
+    }
+    fn schedules(&self) -> Result<Vec<Schedule>, String> {
+        let rows = self.db().schedules().map_err(store_error)?;
+        Ok(rows.into_iter().map(schedule).collect())
+    }
+    fn schedule_remove(&self, id: i64) -> Result<bool, String> {
+        self.db().schedule_remove(id).map_err(store_error)
+    }
     fn memory_count(&self) -> Result<u64, String> {
         self.db().memory_count().map_err(store_error)
     }
@@ -273,6 +305,67 @@ impl Session {
             },
         );
         Ok(topic)
+    }
+
+    /// Fires the personal bot's due schedules: each posts its prompt in the
+    /// DM as a line from this node, which becomes a job by the normal path.
+    /// The fire is recorded (a one-shot removed, a recurring one moved on)
+    /// before the line is posted, so a crash can lose a fire but never
+    /// repeat one. Waits while the bots are off or the DM is not open.
+    pub async fn fire_schedules(&mut self) {
+        let Some(dm) = self.dm else { return };
+        if self.bots.is_none() || !self.channels.get(&dm).is_some_and(|c| c.space.is_some()) {
+            return;
+        }
+        let now = now_ms();
+        let due = match self.state.due_schedules(now) {
+            Ok(due) => due,
+            Err(e) => {
+                self.printer.error(&format!("reading schedules: {e:#}"));
+                return;
+            }
+        };
+        for s in due {
+            let decision = sched::on_due(s.next_at_ms, s.every_ms, now);
+            let next = match decision {
+                Due::Fire { next } => next,
+                Due::Drop => None,
+            };
+            match self.state.schedule_fired(s.id, s.next_at_ms, now, next) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    self.printer.error(&format!("recording a schedule: {e:#}"));
+                    continue;
+                }
+            }
+            let late_ms = now.saturating_sub(s.next_at_ms);
+            if decision == Due::Drop {
+                self.printer.emit(
+                    json!({"event": "schedule_missed", "id": s.id, "name": s.name,
+                           "late_ms": late_ms}),
+                    || {
+                        format!(
+                            "schedule #{} \"{}\" was due {} ago, while triad was not running; \
+                             dropped",
+                            s.id,
+                            s.name,
+                            ago(late_ms)
+                        )
+                    },
+                );
+                continue;
+            }
+            self.printer.emit(
+                json!({"event": "schedule_fired", "id": s.id, "name": s.name,
+                       "late_ms": late_ms, "next_at_ms": next}),
+                || format!("schedule #{} \"{}\" fired", s.id, s.name),
+            );
+            if let Err(e) = self.send(dm, &sched::fired_text(&s.name, &s.prompt)).await {
+                self.printer
+                    .error(&format!("posting schedule #{}: {e:#}", s.id));
+            }
+        }
     }
 
     /// Whether `@bot` can address a bot in the channel.
@@ -1149,6 +1242,47 @@ impl Session {
                             "no saved memories match".to_string()
                         } else {
                             lines.join("\n")
+                        }
+                    },
+                );
+            }
+            "/schedules" => {
+                let offset = self.bots.as_ref().map_or(0, |b| b.agent.utc_offset_minutes);
+                let rows: Vec<Schedule> =
+                    self.state.schedules()?.into_iter().map(schedule).collect();
+                let list: Vec<Value> = rows
+                    .iter()
+                    .map(|s| {
+                        json!({"id": s.id, "name": s.name, "prompt": s.prompt,
+                                    "next_at_ms": s.next_at_ms, "every_ms": s.every_ms})
+                    })
+                    .collect();
+                self.printer
+                    .emit(json!({"event": "schedules", "schedules": list}), || {
+                        if rows.is_empty() {
+                            "no schedules".to_string()
+                        } else {
+                            rows.iter()
+                                .map(|s| assistant::schedule_line(s, offset))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    });
+            }
+            "/unschedule" => {
+                let id: i64 = rest
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .context("usage: /unschedule <id>")?;
+                let removed = self.state.schedule_remove(id)?;
+                self.printer.emit(
+                    json!({"event": "unscheduled", "id": id, "removed": removed}),
+                    || {
+                        if removed {
+                            format!("removed schedule #{id}")
+                        } else {
+                            format!("no schedule #{id}")
                         }
                     },
                 );

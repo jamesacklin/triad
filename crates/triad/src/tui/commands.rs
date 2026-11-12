@@ -59,6 +59,8 @@ pub const COMMANDS: &[Command] = &[
     c("/audit", "[N]", "the focused channel's last tool calls"),
     c("/memory", "[query]", "what your bot remembers"),
     c("/forget", "<id>", "delete one of your bot's memories"),
+    c("/schedules", "", "your bot's schedules"),
+    c("/unschedule", "<id>", "remove one of your bot's schedules"),
     c("/quit", "", "leave"),
 ];
 

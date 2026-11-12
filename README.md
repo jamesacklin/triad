@@ -264,9 +264,20 @@ between conversations:
 | `memory.search` | Finds memories by their words, newest first. |
 | `memory.forget` | Deletes one by its ID. |
 
-Memories are rows in `state.sqlite` (encrypted with it under SQLCipher).
-Channel turns are never offered these tools and never see a memory, and a
-channel is not told they exist.
+| `schedule.add` | Schedules a prompt: once (`at`: `in 20m`, `09:00`, `2026-11-13 09:00`) or repeating (`every`: `30m`, `1d`, at least `5m`, with an optional `time` of day). At most 50. |
+| `schedule.list`, `schedule.remove` | Lists schedules, or removes one by its ID. |
+
+Memories and schedules are rows in `state.sqlite` (encrypted with it under
+SQLCipher). Channel turns are never offered these tools and never see a
+memory, and a channel is not told they exist.
+
+A schedule fires by posting its prompt in `#agent` as a line from you,
+`[scheduled: <name>] <prompt>`, which the bot answers like any other. It
+fires only while triad is running with bots: a one-shot that came due while
+it was not running fires on the next start if it is less than a day late and
+is dropped otherwise; a repeating one fires once for everything it missed.
+Times are UTC, or set `"utc_offset_minutes"` in `agent.json` (`-300` for
+UTC-5; there is no time zone database, so change it for daylight saving).
 
 `web.fetch` connects only to public addresses. It refuses this machine,
 private and shared networks and link-local addresses, and checks every
@@ -283,6 +294,7 @@ or `time` is left out, with a warning at start.
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
 | `/memory [query]`, `/forget <id>` | List (or search) what your personal bot remembers, or delete one memory. |
+| `/schedules`, `/unschedule <id>` | List your personal bot's schedules, or remove one. |
 
 ## Terminal interface
 

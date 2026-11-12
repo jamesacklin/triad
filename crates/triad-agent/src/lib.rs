@@ -13,6 +13,7 @@ pub mod context;
 pub mod http;
 pub mod mcp;
 pub mod policy;
+pub mod schedule;
 pub mod tools;
 
 use std::path::{Path, PathBuf};
@@ -83,6 +84,8 @@ pub struct AgentConfig {
     pub search_url: Option<String>,
     pub persona: Option<PathBuf>,
     pub limits: Limits,
+    /// Minutes east of UTC that schedule times are written in.
+    pub utc_offset_minutes: i32,
 }
 
 /// A configuration the user must fix before the bots can run.
@@ -123,6 +126,10 @@ struct FileConfig {
     persona: Option<PathBuf>,
     /// `false` leaves out the built-in tools.
     builtin: Option<bool>,
+    /// Minutes east of UTC for schedule times (`-300` for UTC-5). There is
+    /// no time zone database, so a change of daylight saving time means
+    /// changing this.
+    utc_offset_minutes: Option<i32>,
 }
 
 impl FileConfig {
@@ -315,6 +322,13 @@ impl AgentConfig {
                 )));
             }
         };
+        let utc_offset_minutes = file.utc_offset_minutes.unwrap_or(0);
+        if !(-14 * 60..=14 * 60).contains(&utc_offset_minutes) {
+            return Err(UsageError(format!(
+                "utc_offset_minutes in {CONFIG_FILE} must be between -840 and 840, got \
+                 {utc_offset_minutes}"
+            )));
+        }
         Ok(AgentConfig {
             brain,
             tools,
@@ -322,6 +336,7 @@ impl AgentConfig {
             search_url: env("TRIAD_AGENT_SEARCH_URL"),
             persona,
             limits,
+            utc_offset_minutes,
         })
     }
 }
@@ -332,6 +347,8 @@ pub struct Agent {
     pub tools: Arc<dyn Tools>,
     pub persona: Option<String>,
     pub limits: Limits,
+    /// Minutes east of UTC that schedule times are written in.
+    pub utc_offset_minutes: i32,
     /// Every tool the bots have.
     pub all_tools: Vec<ToolSpec>,
     /// Problems found at start (an MCP server that did not connect), for
@@ -407,7 +424,8 @@ impl Agent {
             }
         };
         if let Some(store) = store {
-            let both = Both::new(Arc::new(assistant::Assistant::new(store)), tools);
+            let own = assistant::Assistant::new(store, config.utc_offset_minutes);
+            let both = Both::new(Arc::new(own), tools);
             for name in &both.hidden {
                 warnings.push(format!(
                     "tool server {name} is left out: the personal bot's own tools use that name"
@@ -431,6 +449,7 @@ impl Agent {
             tools,
             persona,
             limits: config.limits,
+            utc_offset_minutes: config.utc_offset_minutes,
             all_tools,
             warnings,
         })
@@ -444,6 +463,7 @@ impl Agent {
             tools: self.tools.clone(),
             persona: self.persona.clone(),
             limits: self.limits,
+            utc_offset_minutes: self.utc_offset_minutes,
             all_tools: self.all_tools.clone(),
             warnings: Vec::new(),
         })
@@ -562,6 +582,7 @@ mod tests {
             tools: Arc::new(NoTools),
             persona: None,
             limits: Limits::default(),
+            utc_offset_minutes: 0,
             all_tools: Vec::new(),
             warnings: Vec::new(),
         };

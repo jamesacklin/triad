@@ -167,7 +167,10 @@ fn turns_see_only_their_own_channel() {
                 "linear.create_issue",
                 "memory.forget",
                 "memory.save",
-                "memory.search"
+                "memory.search",
+                "schedule.add",
+                "schedule.list",
+                "schedule.remove"
             ]
             .map(String::from)
         )
@@ -186,8 +189,14 @@ fn turns_see_only_their_own_channel() {
             "memory named in a channel turn: {text}"
         );
         assert!(
-            names(t).iter().all(|n| !n.starts_with("memory.")),
-            "a channel turn was offered a memory tool"
+            names(t)
+                .iter()
+                .all(|n| !n.starts_with("memory.") && !n.starts_with("schedule.")),
+            "a channel turn was offered a DM-only tool"
+        );
+        assert!(
+            !text.contains("schedule"),
+            "schedules named in a channel turn"
         );
     }
     let _ = BIN;

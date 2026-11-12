@@ -1244,6 +1244,9 @@ impl Session {
         streams: &mut Streams,
         mut lines: mpsc::Receiver<String>,
     ) -> Result<()> {
+        // The personal bot's schedules are checked once a second.
+        let mut schedules = tokio::time::interval(std::time::Duration::from_secs(1));
+        schedules.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 line = lines.recv() => {
@@ -1278,6 +1281,7 @@ impl Session {
                 Some((value, text)) = streams.bot_events.recv() => {
                     self.printer.emit(value, || text);
                 }
+                _ = schedules.tick() => self.fire_schedules().await,
                 _ = tokio::signal::ctrl_c() => break,
             }
         }

@@ -1086,7 +1086,8 @@ on branch `james/rig-tools-assistant-3773ad`.
 | --- | --- | --- | --- |
 | A0 | Land stage 1 | `73dd271` | Committed after review; tests, fmt and clippy pass. By-hand check not run: no Brave key (`BRAVE_API_KEY` unset, none in `keys.json`) |
 | A1 | Context and scope | `89538e2` | `tools::tests::a_dm_only_tool_stays_in_the_dm` passes; no existing assertion changed |
-| A2 | Memory | `A2` | `bots_memory.rs` and the extended `bots_isolation.rs` pass; FTS5 checked in both SQLite builds |
+| A2 | Memory | `08d950a` | `bots_memory.rs` and the extended `bots_isolation.rs` pass; FTS5 checked in both SQLite builds |
+| A3 | Schedules | `A3` | `bots_schedules.rs` passes: one fire and one reply, none repeated after SIGKILL, overdue rules, interval advance |
 
 ### A0: stage 1
 
@@ -1167,6 +1168,46 @@ DM is absent from every channel turn's input (the word `memory` too), no
 channel turn is offered a `memory.*` tool, and the host's scripted
 `memory.search` from `#garden` is refused by the gate with "only available in
 the personal DM". No path from memory to a channel turn was found.
+
+### A3: schedules
+
+`schedule.add`, `schedule.list` and `schedule.remove` join the DM-only
+`Assistant`; the time arithmetic is `triad-agent/src/schedule.rs` (durations,
+`at` as `in 20m`, `HH:MM` or `YYYY-MM-DD HH:MM`, days-from-civil for dates,
+the missed-fire rules), with no time zone library. `utc_offset_minutes`
+(−840 to 840) in `agent.json` sets local time; the tool's description names
+the zone so the model writes times in it.
+
+The event loop checks the schedules once a second (an `interval` arm in
+`event_loop`) and fires only while the bots run and the DM's space is open,
+so a fire is never recorded and then refused because the space is not open
+yet after a restart. `State::schedule_fired` records a fire in one
+`IMMEDIATE` transaction that is conditional on `next_at_ms` still being the
+due time (a one-shot is deleted, a recurring one moved on), before the line
+is posted. A crash between the two loses that fire; nothing can repeat it.
+The fired line goes out through `send`, so it becomes a job by the normal
+path with the usual age limit, transcript and audit log.
+
+`bots_schedules.rs` measured: a schedule two seconds out fired 874–977 ms
+after its time (the one-second tick). Killed with SIGKILL right after
+`schedule_fired`, the restarted session fired nothing and listed no
+schedules; in that run the line itself had not been posted, so the fire was
+lost, as the plan allows. With rows written while the session was down, a
+one-shot one hour late fired once, one 25 hours late was dropped with a
+`schedule_missed` notice, and an hourly one 3.5 intervals late fired once
+and moved forward by four intervals.
+
+Where the plan was loose: "fired turns count against the DM's existing
+limits", but the DM has no rate limits (`policy::decide_dm` checks only the
+author and age), so the bounds on unattended turns are the step limit, the
+five-minute minimum interval and the 50-schedule cap. The plan's example
+"every weekday at 9" cannot be written without cron syntax; `every 1d` with
+`time 09:00` is the nearest.
+
+Changed assertions: the DM tool sets asserted in `bots_isolation.rs` and
+`bots_memory.rs` (both added or changed in A2) now include the three
+`schedule.*` tools. `bots_isolation.rs` also checks that no channel turn is
+offered a `schedule.*` tool or mentions schedules.
 
 ## Agent harness options (2026-11-11)
 
