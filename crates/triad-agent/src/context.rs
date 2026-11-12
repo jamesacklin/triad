@@ -175,7 +175,10 @@ fn system_prompt(turn: &Turn) -> String {
             turn.host
         ));
     }
-    s.push_str("Keep replies short: one chat message, under 2000 bytes.\n");
+    s.push_str(
+        "Keep replies short: one chat message of at most 350 characters, plain text. \
+         Longer replies are cut off.\n",
+    );
     if let Some(p) = turn.persona {
         s.push_str("\nThe host's instructions for you:\n");
         s.push_str(p);

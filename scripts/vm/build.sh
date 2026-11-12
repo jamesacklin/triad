@@ -13,6 +13,7 @@
 #                      (default: gcc for x86_64, aarch64-linux-gnu-gcc for arm64)
 #   CROSS_COMPILE      kernel cross prefix for arm64 (default: aarch64-linux-gnu-)
 #   KERNEL_MAKE_ARGS   extra arguments for the kernel `make`
+#   VM_KERNEL=skip     rebuild only triad and init; keep the existing kernel
 set -euo pipefail
 
 ARCH=${1:?usage: build.sh <x86_64|arm64>}
@@ -72,6 +73,13 @@ cp "$ROOT/target/$TRIPLE/release/triad" "$A/triad"
 # --- guest init ---
 log "building init"
 "$CC" -Os -static -s -o "$A/init" "$HERE/init.c"
+
+if [ "${VM_KERNEL:-}" = skip ]; then
+  [ -f "$A/kernel" ] || { echo "VM_KERNEL=skip, but $A/kernel does not exist" >&2; exit 1; }
+  log "keeping the existing kernel"
+  ls -l "$A/kernel" "$A/triad" "$A/init" >&2
+  exit 0
+fi
 
 # --- kernel ---
 TARBALL=$OUT/dl/linux-$KVER.tar.xz

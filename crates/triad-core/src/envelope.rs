@@ -6,8 +6,15 @@ use serde::{Deserialize, Serialize};
 
 /// Wire format version used everywhere.
 pub const VERSION: u8 = 1;
-/// Maximum UTF-8 text length of one chat message.
+/// Maximum UTF-8 text length of one chat message, in the wire format.
 pub const MAX_TEXT_BYTES: usize = 2_000;
+/// Longest text that can be sent today. p2panda-core 0.8.0 decodes operation
+/// headers with a 512-byte limit on any byte string, and spaces carry the
+/// encrypted message in the header. A message over about 460 bytes of text
+/// is published but can never be read back, which wedges the author's log
+/// in that space: no later message from them is published or synced. 400
+/// leaves a margin. See FINDINGS.md, "Bots", H7.
+pub const SEND_TEXT_BYTES: usize = 400;
 /// Invite prefix.
 pub const INVITE_PREFIX: &str = "triad1-";
 

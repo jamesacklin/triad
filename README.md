@@ -265,7 +265,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -p triad --test spaces_membership -- --ignored   # offline membership, about a minute each
 cargo test -p triad --features sqlcipher --test bots_at_rest  # SQLCipher state.sqlite (needs libcrypto)
-ANTHROPIC_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture  # the real model
+OPENROUTER_API_KEY=... scripts/live-check.sh   # the real model (or ANTHROPIC_API_KEY=...)
 ```
 
 Layout: `crates/triad` (the binary and its integration tests),

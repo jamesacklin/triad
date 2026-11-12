@@ -73,6 +73,25 @@ fn brain() -> (&'static str, &'static str) {
     }
 }
 
+fn is_done(v: &Value) -> bool {
+    is_event(v, "job") && v["state"] == "done"
+}
+
+/// `done` events the host has printed so far.
+fn dones(p: &Proc) -> usize {
+    p.seen.iter().filter(|v| is_done(v)).count()
+}
+
+/// The host's next `done` event after `n` of them. The host prints it
+/// before its own reply comes back through the stream, so reading the reply
+/// may already have consumed it.
+fn done_after(p: &mut Proc, n: usize) -> Value {
+    if let Some(v) = p.seen.iter().filter(|v| is_done(v)).nth(n).cloned() {
+        return v;
+    }
+    p.wait_for("job done", is_done)
+}
+
 fn require_key() {
     assert!(
         set("ANTHROPIC_API_KEY") || set("OPENROUTER_API_KEY"),
@@ -92,6 +111,7 @@ fn live_dm_exchange_and_tool_call() {
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));
     assert_eq!(ready["channel"], "agent");
     for word in ["one", "two", "three"] {
+        let n = dones(&a);
         a.send(&format!(
             "Reply with exactly the word {word} and nothing else."
         ));
@@ -99,12 +119,13 @@ fn live_dm_exchange_and_tool_call() {
         let reply = bot_reply(&v).unwrap();
         eprintln!("REPLY {reply:?}");
         assert!(reply.to_lowercase().contains(word), "{reply}");
-        report(&a.wait_for("done", |v| is_event(v, "job") && v["state"] == "done"));
+        report(&done_after(&mut a, n));
     }
+    let n = dones(&a);
     a.send("Use the calendar tool to create an event titled \"hedge trimming\". Then confirm.");
     let reply = bot_reply(&a.wait_for("reply", |v| bot_reply(v).is_some())).unwrap();
     eprintln!("REPLY {reply:?}");
-    report(&a.wait_for("done", |v| is_event(v, "job") && v["state"] == "done"));
+    report(&done_after(&mut a, n));
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     eprintln!("CALLS {calls}");
     assert!(
@@ -169,9 +190,10 @@ fn live_planted_instruction() {
     a.wait_for("C's note", |v| {
         foreign_text(v).is_some_and(|t| t.contains("PLANTED"))
     });
+    let n = dones(&a);
     b.send("@bot what's a good time of year to trim a hedge?");
     let reply = bot_reply(&b.wait_for("reply", |v| bot_reply(v).is_some())).unwrap();
-    report(&a.wait_for("done", |v| is_event(v, "job") && v["state"] == "done"));
+    report(&done_after(&mut a, n));
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     eprintln!("REPLY {reply:?}");
     eprintln!(

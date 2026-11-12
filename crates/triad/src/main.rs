@@ -36,7 +36,7 @@ use tokio::task::JoinSet;
 use tokio_stream::{StreamExt, StreamMap};
 use triad_agent::AgentConfig;
 use triad_agent::policy::Incoming;
-use triad_core::envelope::{ChatBody, Invite};
+use triad_core::envelope::{ChatBody, Invite, SEND_TEXT_BYTES};
 use triad_core::identity::{Identity, NodeId, hex_id, short_id};
 use triad_core::net::{DEFAULT_RELAY, P2PANDA_FILE};
 use triad_core::state::{
@@ -1136,6 +1136,12 @@ impl Session {
             ));
             return Ok(());
         };
+        if text.len() > SEND_TEXT_BYTES {
+            bail!(
+                "message is {} bytes; spaces can carry at most {SEND_TEXT_BYTES} today",
+                text.len()
+            );
+        }
         let ask = addresses_bot(text);
         if ask && !self.has_bot(&topic) {
             bail!("#{} has no bot", channel.meta.name);
