@@ -22,7 +22,7 @@ log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # Host side: the creator, with stdin held open through a FIFO.
 mkfifo "$RUN/host.in"
-"$TRIAD" --data-dir "$RUN/host-data" create --auto-accept --json \
+"$TRIAD" --data-dir "$RUN/host-data" create --no-bot --auto-accept --json \
   <"$RUN/host.in" >"$RUN/host.out" 2>"$RUN/host.err" &
 HOST_PID=$!
 exec 3>"$RUN/host.in"
@@ -39,7 +39,7 @@ INVITE=$(sed -n 's/.*"invite":"\([^"]*\)".*/\1/p' "$RUN/host.out" | head -1)
 ) &
 
 log "booting $ARCH guest with ${MEM} MB"
-"$HERE/run-vm.sh" "$ARCH" "$MEM" "$RUN/vm.log" join "$INVITE"
+"$HERE/run-vm.sh" "$ARCH" "$MEM" "$RUN/vm.log" join "$INVITE" --no-bot
 QEMU_EXIT=$?
 
 sleep 1

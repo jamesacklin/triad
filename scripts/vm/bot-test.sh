@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The bot in the VM (HARNESS-PLAN.md, H8): the guest creates a channel with
-# --agent on the mock brain, so it hosts the channel's bot; a triad on this
+# The bot in the VM (HARNESS-PLAN.md, H8): the guest creates a channel (with
+# its bot, the default) on the mock brain, so it hosts the channel's bot; a triad on this
 # machine joins and asks the bot. Exits 0 only if this side saw the bot's
 # reply and the guest triad exited cleanly.
 #
@@ -62,11 +62,11 @@ if [ "${LIVE:-0}" = 1 ]; then
     export VM_ENV="TRIAD_AGENT_BRAIN=mock
 TRIAD_AGENT_MOCK_SCRIPT=/data/script"
   elif [ "$LIVE_BRAIN" = openrouter ]; then
-    export VM_ENV="TRIAD_AGENT_BRAIN=openrouter
+    export VM_ENV="TRIAD_AGENT_MODEL=openrouter/anthropic/claude-opus-5.5
 OPENROUTER_API_KEY=$OPENROUTER_API_KEY
 RUST_LOG=warn"
   else
-    export VM_ENV="TRIAD_AGENT_BRAIN=anthropic
+    export VM_ENV="TRIAD_AGENT_MODEL=anthropic/claude-opus-5-5
 ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 RUST_LOG=warn"
   fi
@@ -79,7 +79,7 @@ else
   export VM_ENV=${VM_ENV:-TRIAD_AGENT_BRAIN=mock}
 fi
 log "booting $ARCH guest with ${MEM} MB, hosting #garden with its bot"
-"$HERE/run-vm.sh" "$ARCH" "$MEM" "$RUN/vm.log" create --name garden --agent --auto-accept &
+"$HERE/run-vm.sh" "$ARCH" "$MEM" "$RUN/vm.log" create --name garden --auto-accept &
 VM_PID=$!
 
 INVITE=""
@@ -94,7 +94,7 @@ log "guest ready; joining"
 
 mkfifo "$RUN/host.in"
 START=$(date +%s%N)
-"$TRIAD" --data-dir "$RUN/host-data" join "$INVITE" --json \
+"$TRIAD" --data-dir "$RUN/host-data" join "$INVITE" --no-bot --json \
   <"$RUN/host.in" >"$RUN/host.out" 2>"$RUN/host.err" &
 HOST_PID=$!
 exec 3>"$RUN/host.in"

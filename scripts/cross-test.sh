@@ -113,14 +113,14 @@ seq_names() { local tag=$1 from=$2 to=$3 i; for i in $(seq "$from" "$to"); do pr
 
 # --- 1. creator ---
 T0=$SECONDS
-start_a create --auto-accept --json -v
+start_a create --no-bot --auto-accept --json -v
 READY=$(wait_for 4 a '"event":"ready"')
 INVITE=$(field "$READY" invite)
 [ -n "$INVITE" ] || fail "no invite in: $READY"
 log "1. created group, invite ${INVITE:0:24}..."
 
 # --- 2. joiner ---
-start_b join "$INVITE" --json -v
+start_b join "$INVITE" --no-bot --json -v
 wait_for 6 b '"event":"ready"' >/dev/null
 JB=$(wait_for 6 b '"event":"joined"')
 JA=$(wait_for 4 a '"event":"joined"')
@@ -148,7 +148,7 @@ log "6. joiner offline, creator sent 5"
 
 # --- 7. joiner returns and catches up on exactly 5 ---
 T1=$SECONDS
-start_b chat --json -v
+start_b chat --no-bot --json -v
 expect_eq "$(collect_texts 6 b 5 "$LOCAL_TAG")" "$(seq_names "$LOCAL_TAG" 11 15)" "7. joiner caught up on exactly 5"
 log "7. catch-up took $((SECONDS - T1))s"
 grep -q '"event":"sync_started"' "$WORK/b.events" && log "7. sync observed" || log "7. WARNING: no sync_started event seen"

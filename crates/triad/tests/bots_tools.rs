@@ -224,14 +224,7 @@ fn run(backend: Backend) {
     let mut a = Proc::spawn_env(
         "A",
         da.path(),
-        &[
-            "create",
-            "--name",
-            "garden",
-            "--agent",
-            "--auto-accept",
-            "--json",
-        ],
+        &["create", "--name", "garden", "--auto-accept", "--json"],
         &env,
     );
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));

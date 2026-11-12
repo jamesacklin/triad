@@ -14,6 +14,7 @@
       --line: #dbdde3;
       --surface: #f2f3f5;
       --own: #e8f0ff;
+      --bot: #eaf6ee;
       --accent: #244ec1;
       --on-accent: #fff;
       --error: #a23030;
@@ -28,6 +29,7 @@
         --line: #3d3f49;
         --surface: #262830;
         --own: #263553;
+        --bot: #213a2b;
         --accent: #b5c8ff;
         --on-accent: #121f41;
         --error: #ffaeae;
@@ -89,6 +91,10 @@
       white-space: pre-wrap;
     }
     .mine { align-self: flex-end; background: var(--own); }
+    .message.bot { background: var(--bot); }
+    .room-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .check { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; }
+    .check input { flex: none; width: auto; min-height: 0; }
     .author { display: block; font-size: .75rem; color: var(--muted); margin-bottom: 2px; }
     #send { padding: 12px 0; }
     details { margin-top: 8px; }
@@ -114,6 +120,7 @@
   <section id="account" aria-label="Chat" hidden>
     <div id="setup" hidden>
       <button id="create" class="primary">Create room</button>
+      <label class="check muted"><input type="checkbox" id="with-bot" checked> With my bot</label>
       <form id="join">
         <label for="invite" class="muted">Room invite</label>
         <div class="form">
@@ -128,7 +135,10 @@
           <h2 id="room-title">Room</h2>
           <span id="status" class="muted" role="status"></span>
         </div>
-        <button id="copy" hidden>Copy invite link</button>
+        <div class="room-actions">
+          <button id="bot" hidden>Add bot</button>
+          <button id="copy" hidden>Copy invite link</button>
+        </div>
       </div>
       <button id="resume" hidden>Reconnect</button>
       <div id="messages" role="log" aria-label="Chat messages" tabindex="0"></div>
@@ -236,10 +246,16 @@
       disconnected: "Disconnected",
       removed: "Removed"
     })[state.Status] || "";
-    if (el("status").textContent !== status) el("status").textContent = status;
     el("sharing").hidden = el("copy").hidden = !state.Invite;
     el("share-code").value = state.Invite;
     el("resume").hidden = !hasRoom || state.Running;
+    const bot = state.Bot?.Enabled ? state.Bot : null;
+    el("bot").hidden = !state.Creator || !state.Running || state.Status !== "joined";
+    el("bot").textContent = bot?.Mine ? "Remove bot" : "Add bot";
+    el("bot").dataset.on = bot?.Mine ? "" : "1";
+    const botStatus = bot ? " · bot on (" + bot.Provider + ")" : "";
+    if (el("status").textContent !== status + botStatus) el("status").textContent = status + botStatus;
+    el("text").placeholder = bot ? "Write a message… (@bot to ask the bot)" : "Write a message…";
     el("send-button").disabled = state.Status !== "joined" || !state.Running;
     el("text").disabled = el("send-button").disabled;
     if (state.Error && state.Error !== lastError) {
@@ -281,12 +297,14 @@
     const fragment = document.createDocumentFragment();
     for (const message of added) {
       const item = document.createElement("div");
-      item.className = message.Mine ? "message mine" : "message";
+      item.className = "message" + (message.Mine ? " mine" : "") + (message.Bot ? " bot" : "");
       const author = document.createElement("span");
       author.className = "author";
       author.dir = "auto";
       author.title = message.Author;
-      if (message.Mine) {
+      if (message.Bot) {
+        author.textContent = message.Mine ? "Your bot" : "Bot";
+      } else if (message.Mine) {
         author.textContent = "You";
       } else {
         author.dataset.author = message.Author;
@@ -379,7 +397,8 @@
     if (document.activeElement !== el("nickname")) el("nickname").value = ownNickname();
   });
   el("users").onchange = () => action(async () => selectIdentity(el("users").value));
-  el("create").onclick = () => action(() => api("room", { Action: "create" }));
+  el("create").onclick = () => action(() => api("room", { Action: "create", Bot: el("with-bot").checked }));
+  el("bot").onclick = () => action(() => api("bot", { On: !!el("bot").dataset.on }));
   el("resume").onclick = () => action(() => api("room", { Action: "resume" }));
   el("join").onsubmit = event => {
     event.preventDefault();

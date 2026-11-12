@@ -64,12 +64,13 @@ fn set(var: &str) -> bool {
     std::env::var(var).is_ok_and(|k| !k.is_empty())
 }
 
-/// The brain to run: OpenRouter when its key is set, else Anthropic.
+/// The model to run: Claude Opus through OpenRouter when its key is set,
+/// else from Anthropic.
 fn brain() -> (&'static str, &'static str) {
     if set("OPENROUTER_API_KEY") {
-        ("TRIAD_AGENT_BRAIN", "openrouter")
+        ("TRIAD_AGENT_MODEL", "openrouter/anthropic/claude-opus-5.5")
     } else {
-        ("TRIAD_AGENT_BRAIN", "anthropic")
+        ("TRIAD_AGENT_MODEL", "anthropic/claude-opus-5-5")
     }
 }
 
@@ -107,7 +108,7 @@ fn live_dm_exchange_and_tool_call() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("calls.log");
     write_mcp(dir.path(), &log);
-    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--agent", "--json"], &[brain()]);
+    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--json"], &[brain()]);
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));
     assert_eq!(ready["channel"], "agent");
     for word in ["one", "two", "three"] {
@@ -149,14 +150,7 @@ fn live_planted_instruction() {
     let mut a = Proc::spawn_env(
         "A",
         da.path(),
-        &[
-            "create",
-            "--name",
-            "garden",
-            "--agent",
-            "--auto-accept",
-            "--json",
-        ],
+        &["create", "--name", "garden", "--auto-accept", "--json"],
         &[brain()],
     );
     let invite = a.wait_for("ready", |v| is_event(v, "ready"))["invite"]

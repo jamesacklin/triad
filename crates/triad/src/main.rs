@@ -37,7 +37,7 @@ use tokio_stream::{StreamExt, StreamMap};
 use triad_agent::AgentConfig;
 use triad_agent::policy::Incoming;
 use triad_core::envelope::{
-    ChatBody, Invite, ProfileUpdate, RoomEvent, SEND_TEXT_BYTES, normalize_nickname,
+    ChatBody, Invite, ProfileUpdate, RoomEvent, SEND_TEXT_BYTES, addresses_bot, normalize_nickname,
 };
 use triad_core::identity::{Identity, NodeId, hex_id, short_id};
 use triad_core::long::{self, LongBody};
@@ -70,7 +70,8 @@ struct Cli {
 enum Cmd {
     /// Print the node ID.
     Whoami,
-    /// Create a channel (a new space), print its invite, enter chat mode.
+    /// Create a channel (a new space) with my bot in it, print its invite,
+    /// enter chat mode.
     Create {
         /// Name of the new channel (default `general`).
         #[arg(long, value_name = "NAME")]
@@ -81,9 +82,10 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
-        /// Run my bots in this session (see HARNESS-PLAN.md).
-        #[arg(long)]
-        agent: bool,
+        /// Run without my bots: no personal bot, and no bot in channels I
+        /// create or host.
+        #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
+        no_bot: bool,
     },
     /// Join a channel from an invite, wait to be added, enter chat mode.
     Join {
@@ -95,9 +97,10 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
-        /// Run my bots in this session.
-        #[arg(long)]
-        agent: bool,
+        /// Run without my bots: no personal bot, and no bot in channels I
+        /// create or host.
+        #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
+        no_bot: bool,
     },
     /// Open every channel in chat mode.
     Chat {
@@ -108,9 +111,10 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
-        /// Run my bots in this session.
-        #[arg(long)]
-        agent: bool,
+        /// Run without my bots: no personal bot, and no bot in channels I
+        /// create or host.
+        #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
+        no_bot: bool,
     },
     /// List the channels in this data directory.
     Channels,
@@ -164,16 +168,25 @@ struct Opts {
     verbose: bool,
 }
 
-/// The bot configuration, read from the environment when `--agent` is
-/// given. A bad configuration is a usage error: exit code 2.
-fn agent_config(agent: bool) -> Result<Option<AgentConfig>, ExitCode> {
-    if !agent {
-        return Ok(None);
+/// Whether a session runs this user's bots. They run unless `--no-bot` is
+/// given; a configuration that cannot run them (no model key, say) is
+/// reported in the session, which then runs as a plain chat.
+enum BotStart {
+    Off,
+    On(AgentConfig),
+    Unavailable(String),
+}
+
+impl BotStart {
+    fn new(no_bot: bool, data_dir: &Path) -> Self {
+        if no_bot {
+            return BotStart::Off;
+        }
+        match AgentConfig::load(data_dir) {
+            Ok(config) => BotStart::On(config),
+            Err(e) => BotStart::Unavailable(e.to_string()),
+        }
     }
-    AgentConfig::from_env().map(Some).map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(2)
-    })
 }
 
 fn main() -> ExitCode {
@@ -252,7 +265,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             relay,
             auto_accept,
             json,
-            agent,
+            no_bot,
         } => {
             let opts = Opts {
                 nickname,
@@ -260,18 +273,15 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            let agent = match agent_config(agent) {
-                Ok(a) => a,
-                Err(code) => return Ok(code),
-            };
-            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts, agent))?;
+            let bots = BotStart::new(no_bot, &data_dir);
+            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts, bots))?;
         }
         Cmd::Join {
             invite,
             name,
             auto_accept,
             json,
-            agent,
+            no_bot,
         } => {
             let invite = Invite::parse(&invite)?;
             let opts = Opts {
@@ -280,17 +290,14 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            let agent = match agent_config(agent) {
-                Ok(a) => a,
-                Err(code) => return Ok(code),
-            };
-            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts, agent))?;
+            let bots = BotStart::new(no_bot, &data_dir);
+            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts, bots))?;
         }
         Cmd::Chat {
             channel,
             auto_accept,
             json,
-            agent,
+            no_bot,
         } => {
             let opts = Opts {
                 nickname,
@@ -298,11 +305,8 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            let agent = match agent_config(agent) {
-                Ok(a) => a,
-                Err(code) => return Ok(code),
-            };
-            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts, agent))?;
+            let bots = BotStart::new(no_bot, &data_dir);
+            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts, bots))?;
         }
         Cmd::Channels => {
             for g in State::open(&data_dir)?.groups()? {
@@ -506,15 +510,6 @@ fn parse_node(text: &str) -> Result<NodeId> {
         .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
 }
 
-/// Whether a typed line addresses the channel's bot: `@bot` as a word
-/// anywhere in it. Only the sender's client reads the text; bots read `ask`.
-fn addresses_bot(text: &str) -> bool {
-    text.split_whitespace().any(|w| {
-        w.trim_matches(|c: char| !c.is_alphanumeric() && c != '@')
-            .eq_ignore_ascii_case("@bot")
-    })
-}
-
 fn access_name(a: AccessLevel) -> &'static str {
     match a {
         AccessLevel::Pull => "pull",
@@ -566,7 +561,7 @@ struct Channel {
     seen_self: bool,
 }
 
-async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConfig>) -> Result<()> {
+async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Result<()> {
     let identity = Identity::load_or_create(data_dir)?;
     let me = identity.node_id();
     let state = State::open(data_dir)?;
@@ -575,10 +570,14 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
     // This node's relay for new channels and invites: the one its first
     // channel uses, so a restart with no arguments listens where peers expect.
     let home_relay = match (&start, groups.first()) {
-        (Start::Resume { .. }, None) if agent.is_none() => {
-            bail!("no channels in this data directory; run `create` or `join`")
-        }
-        (Start::Resume { .. }, None) => DEFAULT_RELAY.to_string(),
+        (Start::Resume { .. }, None) => match &bots {
+            BotStart::On(_) => DEFAULT_RELAY.to_string(),
+            BotStart::Off => bail!("no channels in this data directory; run `create` or `join`"),
+            BotStart::Unavailable(why) => bail!(
+                "no channels in this data directory, and no bot to talk to ({why}); \
+                 run `create` or `join`"
+            ),
+        },
         (_, Some(first)) => first.relay.clone(),
         (Start::Create { relay, .. }, None) => {
             relay.clone().unwrap_or_else(|| DEFAULT_RELAY.to_string())
@@ -614,6 +613,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
     let dm = state.dm_topic()?;
     let (bot_events_tx, bot_events_rx) = mpsc::unbounded_channel();
     let mut session = Session {
+        data_dir: data_dir.to_path_buf(),
         dm,
         bots: None,
         bot_events: bot_events_tx,
@@ -645,18 +645,24 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
         session.open(meta, &mut streams).await?;
     }
     let result = async {
-        if let Some(config) = &agent {
-            session.start_bots(config, data_dir, &mut streams).await?;
+        match &bots {
+            BotStart::On(config) => {
+                if let Err(e) = session.start_bots(config, &mut streams).await {
+                    session.bots_unavailable(&format!("{e:#}"));
+                }
+            }
+            BotStart::Unavailable(why) => session.bots_unavailable(why),
+            BotStart::Off => {}
         }
         session.focus = match start {
             Start::Create { name, relay } => {
                 let topic = session
                     .create_channel(name.as_deref(), relay, &mut streams)
                     .await?;
-                // Creating a channel while running with --agent offers my
-                // bot to it.
+                // A new channel gets my bot, unless the session runs
+                // without one.
                 if session.bots.is_some() {
-                    session.bot_on(topic).await?;
+                    session.bot_on(topic, &mut streams).await?;
                 }
                 topic
             }
@@ -668,7 +674,8 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
             Start::Resume {
                 channel: Some(name),
             } => session.resolve(&name)?,
-            // With --agent, chat opens on the personal bot's DM.
+            // With bots and no channel named, chat opens on the personal
+            // bot's DM.
             Start::Resume { channel: None } => match (session.bots.is_some(), session.dm) {
                 (true, Some(dm)) => dm,
                 _ => first.expect("checked above"),
@@ -690,6 +697,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConf
 }
 
 struct Session {
+    data_dir: PathBuf,
     me: NodeId,
     identity: Identity,
     node: Node,
@@ -702,9 +710,9 @@ struct Session {
     opts: Opts,
     /// Join requests waiting for an answer, oldest first.
     asks: VecDeque<(Topic, NodeId)>,
-    /// The personal bot's DM, once created (with or without `--agent`).
+    /// The personal bot's DM, once created (bots on or off this session).
     dm: Option<Topic>,
-    /// The bots, when running with `--agent`.
+    /// The bots, unless off this session (`--no-bot`, or no model).
     bots: Option<bots::Bots>,
     /// Where bot turns send display lines.
     bot_events: mpsc::UnboundedSender<bots::BotEvent>,
@@ -1082,13 +1090,15 @@ impl Session {
                     });
             }
             "/create" => {
-                if rest.is_empty() {
-                    bail!("usage: /create <name>");
-                }
-                let topic = self.create_channel(Some(rest), None, streams).await?;
+                let (name, no_bot) = match rest.split_whitespace().collect::<Vec<_>>()[..] {
+                    [name] => (name, false),
+                    [name, "--no-bot"] | ["--no-bot", name] => (name, true),
+                    _ => bail!("usage: /create <name> [--no-bot]"),
+                };
+                let topic = self.create_channel(Some(name), None, streams).await?;
                 self.added(topic)?;
-                if self.bots.is_some() {
-                    self.bot_on(topic).await?;
+                if self.bots.is_some() && !no_bot {
+                    self.bot_on(topic, streams).await?;
                 }
             }
             "/join" => {
@@ -1179,7 +1189,7 @@ impl Session {
                 ));
             }
             other => {
-                if !self.on_bot_command(other, rest).await? {
+                if !self.on_bot_command(other, rest, streams).await? {
                     self.printer.error(&format!("unknown command {other}"))
                 }
             }
@@ -1633,20 +1643,5 @@ impl Session {
             _ => {}
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn at_bot_is_a_word_anywhere() {
-        assert!(addresses_bot("@bot add this"));
-        assert!(addresses_bot("hey @bot, add this"));
-        assert!(addresses_bot("add this @Bot"));
-        assert!(!addresses_bot("email bot@example.com"));
-        assert!(!addresses_bot("@bottle"));
-        assert!(!addresses_bot("no address"));
     }
 }

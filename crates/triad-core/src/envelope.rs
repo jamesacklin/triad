@@ -67,6 +67,38 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Whether a typed line addresses the channel's bot: `@bot` as a word
+/// anywhere in it. Only the sender's client reads the text; bots read `ask`.
+pub fn addresses_bot(text: &str) -> bool {
+    text.split_whitespace().any(|w| {
+        w.trim_matches(|c: char| !c.is_alphanumeric() && c != '@')
+            .eq_ignore_ascii_case("@bot")
+    })
+}
+
+/// Splits `text` into pieces of at most `max` bytes, at whitespace where
+/// there is some and at a character boundary otherwise, for a peer that
+/// sends no long messages.
+pub fn split_text(text: &str, max: usize) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut rest = text.trim();
+    while rest.len() > max {
+        let mut cut = max;
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(space) = rest[..cut].rfind(char::is_whitespace).filter(|&i| i > 0) {
+            cut = space;
+        }
+        pieces.push(rest[..cut].trim_end().to_string());
+        rest = rest[cut..].trim_start();
+    }
+    if !rest.is_empty() || pieces.is_empty() {
+        pieces.push(rest.to_string());
+    }
+    pieces
+}
+
 /// Cuts `text` to at most `max` bytes at a character boundary. Text that
 /// had to be cut ends with `…`.
 pub fn truncate_text(text: &str, max: usize) -> String {
@@ -299,6 +331,30 @@ pub fn cbor_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_bot_is_a_word_anywhere() {
+        assert!(addresses_bot("@bot add this"));
+        assert!(addresses_bot("hey @bot, add this"));
+        assert!(addresses_bot("add this @Bot"));
+        assert!(!addresses_bot("email bot@example.com"));
+        assert!(!addresses_bot("@bottle"));
+        assert!(!addresses_bot("no address"));
+    }
+
+    #[test]
+    fn split_text_keeps_every_word_within_the_limit() {
+        assert_eq!(split_text("short", 10), vec!["short"]);
+        assert_eq!(split_text("", 10), vec![""]);
+        let words = "alpha beta gamma delta epsilon zeta eta theta";
+        let pieces = split_text(words, 12);
+        assert!(pieces.iter().all(|p| p.len() <= 12), "{pieces:?}");
+        assert_eq!(pieces.join(" "), words);
+        let long = "é".repeat(30);
+        let pieces = split_text(&long, 7);
+        assert!(pieces.iter().all(|p| p.len() <= 7), "{pieces:?}");
+        assert_eq!(pieces.concat(), long);
+    }
 
     #[test]
     fn room_events_keep_the_original_chat_format() {

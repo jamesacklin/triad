@@ -9,11 +9,22 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use triad_agent::brain::{AnthropicBrain, Brain};
+use triad_agent::brain::{Brain, ModelBrain};
 use triad_agent::context::{Kind, TurnInput};
 use triad_agent::policy::{Limits, ToolSet};
 use triad_agent::tools::{FakeTools, NoAudit, Tools};
 use triad_agent::{Agent, run_turn};
+
+/// Claude through Anthropic's Messages API, at the stand-in.
+fn anthropic(url: &str) -> ModelBrain {
+    ModelBrain::connect(
+        "anthropic/claude-opus-5-5",
+        Some(url),
+        Some("test-key"),
+        reqwest::Client::new(),
+    )
+    .unwrap()
+}
 
 /// Serves `replies` in order, one per request, recording request bodies.
 fn stand_in(replies: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -94,9 +105,8 @@ async fn rig_brain_runs_a_tool_turn() {
                "usage": {"input_tokens": 150, "output_tokens": 10}}),
     ]);
     triad_agent::http::install_crypto_provider();
-    let brain =
-        AnthropicBrain::with_key("test-key", &url, "claude-opus-5-5", reqwest::Client::new());
-    assert_eq!(brain.provider(), "anthropic (claude-opus-5-5)");
+    let brain = anthropic(&url);
+    assert_eq!(brain.provider(), "anthropic/claude-opus-5-5");
     let all_tools = tools.list();
     let agent = Agent {
         brain: Arc::new(brain),
@@ -148,8 +158,7 @@ async fn rig_brain_runs_a_tool_turn() {
         "stop_reason": "end_turn", "stop_sequence": null,
         "usage": {"input_tokens": 50, "output_tokens": 5}}),
     ]);
-    let brain =
-        AnthropicBrain::with_key("test-key", &url, "claude-opus-5-5", reqwest::Client::new());
+    let brain = anthropic(&url);
     let agent = Agent {
         brain: Arc::new(brain),
         ..agent
@@ -197,13 +206,14 @@ async fn openrouter_brain_runs_a_tool_turn() {
                "usage": {"prompt_tokens": 150, "completion_tokens": 10, "total_tokens": 160}}),
     ]);
     triad_agent::http::install_crypto_provider();
-    let brain = AnthropicBrain::openrouter_with_key(
-        "test-key",
-        &url,
-        "anthropic/claude-opus-5.5",
+    let brain = ModelBrain::connect(
+        "openrouter/anthropic/claude-opus-5.5",
+        Some(&url),
+        Some("test-key"),
         reqwest::Client::new(),
-    );
-    assert_eq!(brain.provider(), "openrouter (anthropic/claude-opus-5.5)");
+    )
+    .unwrap();
+    assert_eq!(brain.provider(), "openrouter/anthropic/claude-opus-5.5");
     let all_tools = tools.list();
     let agent = Agent {
         brain: Arc::new(brain),
@@ -246,4 +256,35 @@ async fn openrouter_brain_runs_a_tool_turn() {
         second.contains("event 42") && second.contains("call_1"),
         "{second}"
     );
+}
+
+/// Model references are checked before connecting: the shape, the vendor,
+/// and the vendor's key variable.
+#[test]
+fn model_references_are_checked() {
+    use triad_agent::brain::{check_model, vendors};
+    let v = vendors();
+    for vendor in ["anthropic", "openai", "openrouter", "gcp.gemini", "ollama"] {
+        assert!(v.contains(&vendor), "{vendor} missing from {v:?}");
+    }
+    assert!(
+        check_model("claude-opus-5-5")
+            .unwrap_err()
+            .contains("vendor/model")
+    );
+    assert!(
+        check_model("nosuchvendor/x")
+            .unwrap_err()
+            .contains("known:")
+    );
+    // A local server needs no key.
+    check_model("ollama/qwen3:4b").unwrap();
+    // A hosted vendor whose key is not set names the variable.
+    if std::env::var_os("VENICE_API_KEY").is_none() {
+        assert!(
+            check_model("venice/some-model")
+                .unwrap_err()
+                .contains("VENICE_API_KEY")
+        );
+    }
 }

@@ -20,24 +20,24 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use triad_core::envelope::{MAX_TEXT_BYTES, truncate_text};
 
-use crate::brain::{AnthropicBrain, Brain, MockBrain, TurnOutput};
+use crate::brain::{Brain, MockBrain, ModelBrain, TurnOutput};
 use crate::context::TurnInput;
 use crate::policy::{Limits, ToolSet};
 use crate::tools::{Audit, FakeTools, Gate, NoTools, ToolSpec, Tools};
 
-/// The default model.
-pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
-/// The default model's name on OpenRouter.
+/// The model when none is configured.
+pub const DEFAULT_MODEL: &str = "anthropic/claude-opus-5-5";
+/// Claude Opus's name on OpenRouter, after `openrouter/`.
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-5.5";
+/// The bots' settings file in the data directory.
+pub const CONFIG_FILE: &str = "agent.json";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrainKind {
-    Anthropic {
-        model: String,
-    },
-    /// The same model through OpenRouter (`OPENROUTER_API_KEY`).
-    OpenRouter {
-        model: String,
+    /// Any model rig-core's catalog reaches, as `vendor/model`.
+    Model {
+        reference: String,
+        base_url: Option<String>,
     },
     Mock {
         script: Option<PathBuf>,
@@ -54,7 +54,7 @@ pub enum ToolsKind {
     Fake(PathBuf),
 }
 
-/// How the bots run, from the environment.
+/// How the bots run, from `agent.json` and the environment.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub brain: BrainKind,
@@ -63,7 +63,7 @@ pub struct AgentConfig {
     pub limits: Limits,
 }
 
-/// A configuration the user must fix: `triad` exits with code 2.
+/// A configuration the user must fix before the bots can run.
 #[derive(Debug)]
 pub struct UsageError(pub String);
 
@@ -88,42 +88,67 @@ fn env_num(name: &str, default: u64) -> Result<u64, UsageError> {
     }
 }
 
+/// `agent.json`: settings worth keeping between sessions. Keys never go
+/// here; each vendor's key is read from its own variable.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    /// `vendor/model`.
+    model: Option<String>,
+    /// Replaces the vendor's endpoint.
+    base_url: Option<String>,
+    /// A file whose text is added to the system prompt.
+    persona: Option<PathBuf>,
+}
+
+impl FileConfig {
+    fn read(data_dir: &Path) -> Result<Self, UsageError> {
+        let path = data_dir.join(CONFIG_FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| UsageError(format!("{}: {e}", path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(UsageError(format!("{}: {e}", path.display()))),
+        }
+    }
+}
+
 impl AgentConfig {
-    /// Reads the `TRIAD_AGENT_*` variables. Keys are only checked for
-    /// presence here and never copied.
-    pub fn from_env() -> Result<Self, UsageError> {
-        let brain = match env("TRIAD_AGENT_BRAIN").as_deref().unwrap_or("anthropic") {
-            "anthropic" => {
-                if env("ANTHROPIC_API_KEY").is_none() {
-                    return Err(UsageError(
-                        "--agent with the anthropic brain needs ANTHROPIC_API_KEY \
-                         (or set TRIAD_AGENT_BRAIN=mock)"
-                            .into(),
-                    ));
-                }
-                BrainKind::Anthropic {
-                    model: env("TRIAD_AGENT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.into()),
-                }
-            }
-            "openrouter" => {
-                if env("OPENROUTER_API_KEY").is_none() {
-                    return Err(UsageError(
-                        "--agent with the openrouter brain needs OPENROUTER_API_KEY".into(),
-                    ));
-                }
-                BrainKind::OpenRouter {
-                    model: env("TRIAD_AGENT_MODEL")
-                        .unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.into()),
-                }
-            }
-            "mock" => BrainKind::Mock {
+    /// Reads `agent.json` in the data directory, then the `TRIAD_AGENT_*`
+    /// variables, which win. Checks that the model's vendor is one rig-core
+    /// reaches and that its key variable is set; keys are never copied.
+    pub fn load(data_dir: &Path) -> Result<Self, UsageError> {
+        let file = FileConfig::read(data_dir)?;
+        let brain = match env("TRIAD_AGENT_BRAIN").as_deref() {
+            Some("mock") => BrainKind::Mock {
                 script: env("TRIAD_AGENT_MOCK_SCRIPT").map(PathBuf::from),
                 log: env("TRIAD_AGENT_MOCK_LOG").map(PathBuf::from),
                 delay: Duration::from_millis(env_num("TRIAD_AGENT_MOCK_DELAY_MS", 0)?),
             },
-            other => {
+            // `anthropic` and `openrouter` were the only brains before any
+            // rig-core vendor could be named; they still pick the vendor for
+            // a model given without one.
+            brain @ (None | Some("model" | "anthropic" | "openrouter")) => {
+                let openrouter = brain == Some("openrouter");
+                let reference = match env("TRIAD_AGENT_MODEL").or(file.model) {
+                    Some(m) if openrouter && !m.starts_with("openrouter/") => {
+                        format!("openrouter/{m}")
+                    }
+                    Some(m) if m.contains('/') => m,
+                    Some(m) => format!("anthropic/{m}"),
+                    None if openrouter => format!("openrouter/{DEFAULT_OPENROUTER_MODEL}"),
+                    None => DEFAULT_MODEL.into(),
+                };
+                brain::check_model(&reference).map_err(UsageError)?;
+                BrainKind::Model {
+                    reference,
+                    base_url: env("TRIAD_AGENT_BASE_URL").or(file.base_url),
+                }
+            }
+            Some(other) => {
                 return Err(UsageError(format!(
-                    "TRIAD_AGENT_BRAIN must be anthropic, openrouter or mock, got {other:?}"
+                    "TRIAD_AGENT_BRAIN must be mock or unset, got {other:?}; \
+                     choose the model with TRIAD_AGENT_MODEL=vendor/model"
                 )));
             }
         };
@@ -150,10 +175,13 @@ impl AgentConfig {
             channel_per_minute: env_num("TRIAD_AGENT_BURST_PER_MINUTE", d.channel_per_minute)?,
             max_steps: env_num("TRIAD_AGENT_MAX_STEPS", d.max_steps as u64)? as usize,
         };
+        let persona = env("TRIAD_AGENT_PERSONA")
+            .map(PathBuf::from)
+            .or(file.persona.map(|p| data_dir.join(p)));
         Ok(AgentConfig {
             brain,
             tools,
-            persona: env("TRIAD_AGENT_PERSONA").map(PathBuf::from),
+            persona,
             limits,
         })
     }
@@ -179,13 +207,17 @@ impl Agent {
             BrainKind::Mock { script, log, delay } => {
                 Arc::new(MockBrain::new(script.as_deref(), log.clone(), *delay)?)
             }
-            BrainKind::Anthropic { model } => {
+            BrainKind::Model {
+                reference,
+                base_url,
+            } => {
                 let (client, _) = http::client().map_err(anyhow::Error::msg)?;
-                Arc::new(AnthropicBrain::from_env(model, client)?)
-            }
-            BrainKind::OpenRouter { model } => {
-                let (client, _) = http::client().map_err(anyhow::Error::msg)?;
-                Arc::new(AnthropicBrain::openrouter_from_env(model, client)?)
+                Arc::new(ModelBrain::connect(
+                    reference,
+                    base_url.as_deref(),
+                    None,
+                    client,
+                )?)
             }
         };
         let mut warnings = Vec::new();

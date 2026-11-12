@@ -2,6 +2,7 @@
 //! the gate. Two implementations: the mock every automated test uses, and
 //! Anthropic through `rig-core`. This is the only file that names `rig`.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -166,38 +167,25 @@ impl Brain for MockBrain {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic through rig-core, directly or through OpenRouter
+// Any model rig-core's catalog can reach
 
+use rig_core::DynModel;
+use rig_core::catalog::Catalog;
 use rig_core::completion::{
-    AssistantContent, CompletionRequest, CompletionResponse, Message, ToolDefinition,
+    AssistantContent, CompletionRequest, Message, ToolDefinition,
     message::{ToolName, ToolResultContent},
 };
-use rig_core::providers::anthropic::AnthropicConfig;
-use rig_core::providers::openai::OpenAIConfig;
-use rig_core::providers::openai::wire::{Chat, OPENROUTER};
+use rig_core::operation::Completion;
+use rig_core::providers::registry::{ConnectOptions, ProviderId};
 
-/// The two ways to reach the model: Anthropic's Messages API, or
-/// OpenRouter's OpenAI-format chat API (the same Claude model, routed).
-enum Backend {
-    Anthropic(Box<rig_core::Model<rig_core::providers::anthropic::Messages>>),
-    OpenRouter(Box<rig_core::Model<Chat>>),
-}
-
-impl Backend {
-    async fn call(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-        match self {
-            Backend::Anthropic(m) => m.call(request).await,
-            Backend::OpenRouter(m) => m.call(request).await,
-        }
-        .map_err(|e| anyhow!("model request failed: {e}"))
-    }
-}
-
-/// Claude through `rig-core`, by Anthropic's API or OpenRouter. Tool names
-/// are sent as `server__tool`, because the APIs allow only `[a-zA-Z0-9_-]`
-/// in a tool name and triad names tools `server.tool`.
-pub struct AnthropicBrain {
-    model: Backend,
+/// The model the bots use, named `vendor/model` as rig-core's catalog reads
+/// it: `anthropic/claude-opus-5-5`, `openrouter/anthropic/claude-opus-5.5`,
+/// `openai/gpt-5.5`, `ollama/qwen3:4b`. The vendor's key comes from its own
+/// variable (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+/// ...). Tool names are sent as `server__tool`, because the APIs allow only
+/// `[a-zA-Z0-9_-]` in a tool name and triad names tools `server.tool`.
+pub struct ModelBrain {
+    model: DynModel<Completion>,
     provider: String,
     max_tokens: u64,
 }
@@ -212,57 +200,76 @@ pub fn triad_tool_name(wire: &str) -> String {
     wire.replacen("__", ".", 1)
 }
 
-impl AnthropicBrain {
-    /// Reads `ANTHROPIC_API_KEY` (and `ANTHROPIC_BASE_URL`, if set). The key
-    /// is never written anywhere.
-    pub fn from_env(model: &str, http: reqwest::Client) -> Result<Self> {
-        let config = AnthropicConfig::from_env().map_err(|e| anyhow!("{e}"))?;
-        Ok(Self::with_config(config, model, http))
-    }
+/// Every vendor rig-core can connect to by itself, sorted.
+pub fn vendors() -> Vec<&'static str> {
+    let set: BTreeSet<&'static str> = ProviderId::all()
+        .filter(|p| p.is_registered())
+        .map(|p| p.vendor())
+        .collect();
+    set.into_iter().collect()
+}
 
-    /// An explicit key and base URL, for tests against a local stand-in for
-    /// the Messages API.
-    pub fn with_key(key: &str, base_url: &str, model: &str, http: reqwest::Client) -> Self {
-        let config = AnthropicConfig::new(key.to_string()).with_base_url(base_url);
-        Self::with_config(config, model, http)
+/// Checks a `vendor/model` reference without connecting: the vendor is one
+/// rig-core can reach, and its key variable is set if it needs one. The
+/// error says what to set.
+pub fn check_model(reference: &str) -> std::result::Result<(), String> {
+    let Some((vendor, model)) = reference.split_once('/') else {
+        return Err(format!(
+            "the bot's model is vendor/model, such as {}, got {reference:?}",
+            crate::DEFAULT_MODEL
+        ));
+    };
+    if vendor.is_empty() || model.is_empty() {
+        return Err(format!(
+            "the bot's model is vendor/model, got {reference:?}"
+        ));
     }
-
-    fn with_config(config: AnthropicConfig, model: &str, http: reqwest::Client) -> Self {
-        let client = config.connect(rig_reqwest::ReqwestClient::from(http));
-        AnthropicBrain {
-            model: Backend::Anthropic(Box::new(client.completion(model))),
-            provider: format!("anthropic ({model})"),
-            max_tokens: 1024,
-        }
+    let provider = ProviderId::catalog(vendor)
+        .filter(|p| p.is_registered())
+        .ok_or_else(|| {
+            format!(
+                "the bot's model names vendor {vendor:?}, which this build cannot reach; \
+                 known: {}",
+                vendors().join(", ")
+            )
+        })?;
+    let keys = provider.api_key_envs();
+    let set = |k: &&str| std::env::var(k).is_ok_and(|v| !v.is_empty());
+    if provider.requires_credential() && !keys.is_empty() && !keys.iter().any(set) {
+        return Err(format!(
+            "the bot's model {reference} needs {}",
+            keys.join(" or ")
+        ));
     }
+    Ok(())
+}
 
-    /// Through OpenRouter: reads `OPENROUTER_API_KEY`. The key is never
-    /// written anywhere. `model` is OpenRouter's name, such as
-    /// `anthropic/claude-opus-5.5`.
-    pub fn openrouter_from_env(model: &str, http: reqwest::Client) -> Result<Self> {
-        let config = OpenAIConfig::from_env_with(&OPENROUTER).map_err(|e| anyhow!("{e}"))?;
-        Ok(Self::openrouter_with_config(config, model, http))
-    }
-
-    /// OpenRouter with an explicit key and base URL, for tests against a
-    /// local stand-in.
-    pub fn openrouter_with_key(
-        key: &str,
-        base_url: &str,
-        model: &str,
+impl ModelBrain {
+    /// Connects to `reference` through the shared HTTP client. Without
+    /// `api_key`, the key comes from the vendor's variable and is never
+    /// written anywhere. `base_url` replaces the vendor's endpoint (a proxy,
+    /// a local server, or a test stand-in).
+    pub fn connect(
+        reference: &str,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
         http: reqwest::Client,
-    ) -> Self {
-        let config = OpenAIConfig::with_key(&OPENROUTER, key.to_string()).with_base_url(base_url);
-        Self::openrouter_with_config(config, model, http)
-    }
-
-    fn openrouter_with_config(config: OpenAIConfig, model: &str, http: reqwest::Client) -> Self {
-        let client = config.connect(rig_reqwest::ReqwestClient::from(http));
-        AnthropicBrain {
-            model: Backend::OpenRouter(Box::new(client.chat(model))),
-            provider: format!("openrouter ({model})"),
-            max_tokens: 1024,
+    ) -> Result<Self> {
+        let mut options = ConnectOptions::new().http(rig_reqwest::ReqwestClient::from(http));
+        if let Some(url) = base_url {
+            options = options.base_url(url);
         }
+        if let Some(key) = api_key {
+            options = options.api_key(key);
+        }
+        let model = Catalog::builtin()
+            .connect_with(reference, options)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(ModelBrain {
+            model,
+            provider: reference.to_string(),
+            max_tokens: 1024,
+        })
     }
 
     fn transcript(input: &TurnInput) -> String {
@@ -298,7 +305,7 @@ impl AnthropicBrain {
     }
 }
 
-impl Brain for AnthropicBrain {
+impl Brain for ModelBrain {
     fn provider(&self) -> String {
         self.provider.clone()
     }
@@ -331,7 +338,11 @@ impl Brain for AnthropicBrain {
                     .tools(defs.clone())
                     .max_tokens(self.max_tokens);
                 let started = Instant::now();
-                let response = self.model.call(request).await?;
+                let response = self
+                    .model
+                    .call(request)
+                    .await
+                    .map_err(|e| anyhow!("model request failed: {e}"))?;
                 out.model_time += started.elapsed();
                 out.requests += 1;
                 if let Some(n) = response.usage.input_tokens {

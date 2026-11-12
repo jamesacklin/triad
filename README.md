@@ -104,7 +104,7 @@ always-on node.
 | Command | Behavior |
 | --- | --- |
 | `whoami` | Print the node ID. Create credentials if the data directory is new. |
-| `create [--name <name>]` | Create a channel (default `general`), print its invite, enter chat mode. |
+| `create [--name <name>]` | Create a channel (default `general`) with your bot in it, print its invite, enter chat mode. |
 | `join <invite> [--name <name>]` | Add a channel from an invite, enter chat mode, wait to be added. |
 | `chat [--channel <name>]` | Open every channel in chat mode, focused on the named or first one. |
 | `channels` | List the channels in this data directory. |
@@ -120,6 +120,7 @@ always-on node.
 | `--data-dir <path>` | All | Use this data directory (default `~/Library/Application Support/triad` on macOS, `~/.local/share/triad` on Linux). |
 | `--relay <url>` | `create`, `probe` | Override the default relay (`https://use1-1.relay.n0.iroh.link./`). Joiners take the relay from the invite. |
 | `--auto-accept` | `create`, `join`, `chat` | Accept every join request, in every channel this node manages, without asking. |
+| `--no-bot` | `create`, `join`, `chat` | Run without your bots ([Bots](#bots)). Also `TRIAD_NO_BOT=1`. |
 | `--json` | chat mode | Print one JSON object per event (`ready`, `channel`, `switched`, `join_request`, `joined`, `removed`, `promoted`, `message`, `sync_started`, `sync_ended`, `error`). |
 | `-v` | All | Also print sync and connection events. |
 
@@ -137,7 +138,7 @@ channel.
 | In chat mode | Behavior |
 | --- | --- |
 | plain text | Send to the focused channel, up to 2,000 bytes. Over 400 bytes it goes as a long message: encrypted beside the space, because p2panda 0.8 cannot read back a longer space message ([FINDINGS.md](FINDINGS.md#long-messages-2026-11-12)). |
-| `/create <name>` | Create a channel, focus it, print its invite. |
+| `/create <name> [--no-bot]` | Create a channel, focus it, print its invite. It gets your bot unless `--no-bot`. |
 | `/join <invite> [name]` | Join a channel and focus it. Messages there stay disabled until a manager adds you. |
 | `/switch <name>` (`/s`) | Focus another channel. |
 | `/msg <name> <text>` | Send to a channel without switching. |
@@ -156,27 +157,73 @@ passes its own. Every JSON event about a channel has a `channel` field.
 There is no `/leave` yet. A `state.sqlite` from before channels is migrated
 on first open, and its group becomes `#main`.
 
-### Bots (`--agent`)
+### Bots
 
-`create`, `join` and `chat` take `--agent` to run this user's bots in the
-session ([HARNESS-PLAN.md](HARNESS-PLAN.md), results in
+Every session runs your bots unless you pass `--no-bot`
+([HARNESS-PLAN.md](HARNESS-PLAN.md), results in
 [FINDINGS.md](FINDINGS.md#bots-2026-11-11)):
 
 - **A personal bot** in `#agent`, a space with you as its only member,
   created on first use. It answers every line you type there.
-- **A channel bot** in every channel you create while running with
-  `--agent`, announced to members. Members address it with `@bot`. Admins
-  (`Manage`) may use all its tools; other members get answers and no tools
-  unless you grant some.
+- **A channel bot** in every channel you create, announced to members.
+  Members address it with `@bot`. Admins (`Manage`) may use all its tools;
+  other members get answers and no tools unless you grant some. It keeps
+  answering after a restart, as long as the session runs bots.
 
-The model is Anthropic's (`ANTHROPIC_API_KEY`, `TRIAD_AGENT_MODEL`, default
-`claude-opus-5-5`); `TRIAD_AGENT_BRAIN=mock` runs without one. MCP servers go
-in `mcp.json` in the data directory, tokens named by environment variable.
+To add your bot to a channel you created without one (`--no-bot`, `/create
+<name> --no-bot`, or before a model was configured), focus the channel and
+type `/bot on`. In a session that started without bots, that starts them
+first. `/bot off` removes it.
+
+If the model can't be reached at start (no key, say), the session prints why
+(`bot_unavailable`) and runs as a plain chat; `/bot on` tries again.
+
 Every message in a bot turn goes to the model provider in plaintext.
+
+#### Choosing the model
+
+The model is any one [rig-core](https://docs.rs/rig-core/0.46.0) 0.46 can
+reach, named `vendor/model`. The vendor's key comes from its own environment
+variable and is never written to disk. Without a configured model the bots
+use `anthropic/claude-opus-5-5`.
+
+| Model | Key |
+| --- | --- |
+| `anthropic/claude-opus-5-5` (default) | `ANTHROPIC_API_KEY` |
+| `openrouter/anthropic/claude-opus-5.5` | `OPENROUTER_API_KEY` |
+| `openai/gpt-5.5` | `OPENAI_API_KEY` |
+| `gcp.gemini/<model>` | `GEMINI_API_KEY` |
+| `ollama/qwen3:4b` | none (a local server) |
+
+Other vendors: `azure.openai`, `cohere`, `deepseek`, `groq`, `huggingface`,
+`mistral`, `moonshot`, `perplexity`, `together`, `xai` and the rest of rig's
+registry. A misspelt vendor gets an error that lists them all, and a missing
+key gets one that names the variable. Tools need a model that supports tool
+calls.
+
+Set the model in `agent.json` in the data directory, kept between sessions:
+
+```json
+{ "model": "openrouter/anthropic/claude-opus-5.5" }
+```
+
+| `agent.json` field | Variable (wins over the file) | Meaning |
+| --- | --- | --- |
+| `model` | `TRIAD_AGENT_MODEL` | `vendor/model`. |
+| `base_url` | `TRIAD_AGENT_BASE_URL` | Replaces the vendor's endpoint: a proxy, or a local server on another port. |
+| `persona` | `TRIAD_AGENT_PERSONA` | A file whose text is added to the system prompt (relative to the data directory). |
+
+`TRIAD_AGENT_BRAIN=mock` runs a scripted stand-in with no model (the tests
+use it). The older `TRIAD_AGENT_BRAIN=anthropic` and `=openrouter` still
+work: they pick the vendor for a model named without one. Limits:
+`TRIAD_AGENT_MAX_AGE_SECS`, `TRIAD_AGENT_ASKER_PER_HOUR`,
+`TRIAD_AGENT_CHANNEL_PER_DAY`, `TRIAD_AGENT_BURST_PER_MINUTE`,
+`TRIAD_AGENT_MAX_STEPS`. MCP servers go in `mcp.json` in the data
+directory, tokens named by environment variable.
 
 | In chat mode | Behavior |
 | --- | --- |
-| `/bot`, `/bot on`, `/bot off` | Show, or turn on or off, the focused channel's bot. On and off: creator only. |
+| `/bot`, `/bot on`, `/bot off` | Show the focused channel's bot, add yours to it, or remove it. On and off: creator only. |
 | `/grant <node> <server.tool \| server.*>`, `/revoke <node> [pattern]`, `/grants` | Edit grants in the focused channel. Host only. |
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
@@ -211,19 +258,30 @@ Peers with older clients can still exchange chat and show node IDs. The demo
 does not read long messages yet: it shows their fallback text, and refuses
 lines over 400 bytes.
 
+**Bots in the demo.** **Create room** adds the identity's bot unless **With
+my bot** is unticked, and the room's creator gets **Add bot** / **Remove
+bot** in the room header to change that later. Members ask it with `@bot`;
+its replies show as **Bot**. The bot runs in the `triad-web` process as that
+identity, with the CLI's policy and limits and the model from the server's
+environment or the identity's `agent.json` ([Choosing the
+model](#choosing-the-model)); `TRIAD_AGENT_BRAIN=mock cargo run -p
+triad-web` tries it with no key. A reply over 400 bytes goes as several
+messages, since the demo sends no long messages. The demo keeps no tool-call
+audit log.
+
 ## Acceptance run (two machines)
 
 Put the machines on different networks, for example the Mac on home Wi-Fi and
 the Linux machine on a cloud VM or a phone hotspot. Both machines need
 `triad` installed as above.
 
-1. Mac: `triad create --auto-accept -v`. Copy the invite.
-2. Linux: `triad join <invite> -v`.
+1. Mac: `triad create --no-bot --auto-accept -v`. Copy the invite.
+2. Linux: `triad join <invite> --no-bot -v`.
 3. Both: confirm the output shows 2 members.
 4. Mac: send `mac-01` through `mac-10`. Linux: send `linux-01` through `linux-10`.
 5. Both: `triad history` lists 20 messages, with each sender's messages in order.
 6. Linux: `/quit`. Mac: send `mac-11` through `mac-15`.
-7. Linux: `triad chat -v`. Expect one sync and exactly five new messages.
+7. Linux: `triad chat --no-bot -v`. Expect one sync and exactly five new messages.
 8. Both: `/quit`, then `triad inspect --grep mac-01` and `triad inspect --grep linux-01`. Both must exit 0.
 9. Both: `triad status` shows `failed=0`.
 10. Repeat steps 1 to 5 with fresh data directories (`--data-dir`) and the roles swapped, so Linux creates and the Mac joins.

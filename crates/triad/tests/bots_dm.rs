@@ -24,7 +24,7 @@ fn bot_text(v: &Value) -> Option<String> {
 }
 
 fn start(name: &'static str, dir: &Path, env: &[(&str, &str)]) -> (Proc, Value) {
-    let mut p = Proc::spawn_env(name, dir, &["chat", "--agent", "--json"], env);
+    let mut p = Proc::spawn_env(name, dir, &["chat", "--json"], env);
     let ready = p.wait_for("ready", |v| is_event(v, "ready"));
     (p, ready)
 }
@@ -45,7 +45,8 @@ fn personal_bot_in_a_one_member_dm() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
-    // A fresh data directory: chat --agent creates the DM and focuses it.
+    // A fresh data directory: chat (bots on by default) creates the DM and
+    // focuses it.
     let (mut a, ready) = start("A", dir_a.path(), &[MOCK]);
     assert_eq!(ready["channel"], "agent");
     assert!(ready["invite"].is_null(), "the DM has no invite");
@@ -164,17 +165,56 @@ fn personal_bot_in_a_one_member_dm() {
     assert_ne!(code, 0, "CLI invite to the DM: {out}");
 }
 
+/// Bots are on by default. With no key for the model, a session says why
+/// and runs as a plain chat; with no channel either, there is nothing to
+/// open.
 #[test]
-fn agent_without_a_key_is_a_usage_error() {
+fn no_model_key_runs_without_bots() {
     let dir = tempfile::tempdir().unwrap();
+    let no_key = [
+        ("TRIAD_NO_BOT", "0"),
+        ("ANTHROPIC_API_KEY", ""),
+        ("TRIAD_AGENT_BRAIN", ""),
+        ("TRIAD_AGENT_MODEL", ""),
+    ];
     let out = std::process::Command::new(BIN)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env("TRIAD_AGENT_BRAIN", "anthropic")
+        .envs(no_key)
         .arg("--data-dir")
         .arg(dir.path())
-        .args(["chat", "--agent", "--json"])
+        .args(["chat", "--json"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("ANTHROPIC_API_KEY"));
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+
+    let mut a = Proc::spawn_env(
+        "A",
+        dir.path(),
+        &["create", "--name", "garden", "--json"],
+        &no_key,
+    );
+    let why = a.wait_for("bot_unavailable", |v| is_event(v, "bot_unavailable"));
+    assert!(
+        why["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ANTHROPIC_API_KEY"),
+        "{why}"
+    );
+    let ready = a.wait_for("ready", |v| is_event(v, "ready"));
+    assert_eq!(ready["channel"], "garden");
+    assert_eq!(
+        ready["channels"].as_array().unwrap().len(),
+        1,
+        "no DM: {ready}"
+    );
+    // /bot on retries, and says the same.
+    a.send("/bot on");
+    let e = a.wait_for("error", |v| is_event(v, "error"));
+    assert!(
+        e["text"].as_str().unwrap().contains("ANTHROPIC_API_KEY"),
+        "{e}"
+    );
+    a.quit();
 }

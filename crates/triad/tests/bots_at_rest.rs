@@ -33,7 +33,7 @@ fn state_sqlite_holds_no_plaintext() {
     let dir = tempfile::tempdir().unwrap();
     let key = ("TRIAD_STATE_KEY", "correct horse battery staple");
     let env = [("TRIAD_AGENT_BRAIN", "mock"), key];
-    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--agent", "--json"], &env);
+    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--json"], &env);
     a.wait_for("ready", |v| is_event(v, "ready"));
     a.send("at-rest-secret-line");
     a.wait_for("reply", |v| {

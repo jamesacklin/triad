@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
 use triad_core::{
-    envelope::{ChatBody, Invite, SEND_TEXT_BYTES, normalize_nickname},
+    envelope::{ChatBody, Invite, SEND_TEXT_BYTES, addresses_bot, normalize_nickname},
     state::now_ms,
 };
 
@@ -129,7 +129,7 @@ impl App {
                 let account = self.account(&request).await?;
                 let input: RoomInput = body(request).await?;
                 let start = match input.action.as_str() {
-                    "create" => Start::Create,
+                    "create" => Start::Create { bot: input.bot },
                     "join" => Start::Join(Invite::parse(&input.invite).map_err(bad_request)?),
                     "resume" => Start::Resume,
                     _ => return Err(bad_request("unknown room action")),
@@ -153,8 +153,32 @@ impl App {
                         text.len()
                     )));
                 }
-                let message = ChatBody::new(text, now_ms()).map_err(bad_request)?;
+                let ask = addresses_bot(text);
+                if ask && !account.has_bot().await {
+                    return Err(bad_request("this room has no bot"));
+                }
+                let message = ChatBody::new(text, now_ms())
+                    .map_err(bad_request)?
+                    .asking(ask);
                 publish(&account, Outgoing::Chat(message)).await
+            }
+            (&Method::POST, "/api/bot") => {
+                let account = self.account(&request).await?;
+                let input: BotInput = body(request).await?;
+                // Starting the bot can connect its MCP servers first.
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    account.send(Outgoing::Bot(input.on)),
+                )
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "the bot took too long to start".into(),
+                    )
+                })?
+                .map_err(|err| (StatusCode::CONFLICT, format!("{err:#}")))?;
+                ok(&json!({"Accepted": true}))
             }
             (&Method::POST, "/api/profile") => {
                 let account = self.account(&request).await?;
@@ -232,6 +256,19 @@ struct RoomInput {
     action: String,
     #[serde(default)]
     invite: String,
+    /// Create the room with this identity's bot (the default).
+    #[serde(default = "yes")]
+    bot: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct BotInput {
+    on: bool,
 }
 
 #[derive(Deserialize)]
