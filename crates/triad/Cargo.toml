@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [features]
 sqlcipher = ["triad-core/sqlcipher"]
+# The full-screen terminal interface (crates/triad/src/tui). Filled in by
+# the next step; until then chat runs as plain text either way.
+tui = []
 
 [dependencies]
 triad-core = { workspace = true }

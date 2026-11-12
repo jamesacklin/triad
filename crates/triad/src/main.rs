@@ -82,6 +82,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -97,6 +100,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -111,6 +117,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -164,8 +173,38 @@ enum ProbeCmd {
 struct Opts {
     nickname: Option<String>,
     auto_accept: bool,
-    json: bool,
+    mode: Mode,
     verbose: bool,
+}
+
+/// How a chat session talks to its user.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// One JSON object per line (`--json`), the tested protocol.
+    Json,
+    /// Plain text lines.
+    Plain,
+    /// The full-screen terminal interface.
+    Tui,
+}
+
+impl Mode {
+    /// `--json` wins; then `--plain`, a pipe on stdin or stdout, or a build
+    /// without the `tui` feature mean plain text; otherwise the interface.
+    fn select(json: bool, plain: bool) -> Mode {
+        use std::io::IsTerminal;
+        if json {
+            Mode::Json
+        } else if plain
+            || !cfg!(feature = "tui")
+            || !std::io::stdin().is_terminal()
+            || !std::io::stdout().is_terminal()
+        {
+            Mode::Plain
+        } else {
+            Mode::Tui
+        }
+    }
 }
 
 /// Whether a session runs this user's bots. They run unless `--no-bot` is
@@ -265,12 +304,13 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             relay,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
@@ -281,13 +321,14 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             name,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let invite = Invite::parse(&invite)?;
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
@@ -297,12 +338,13 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             channel,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
@@ -478,18 +520,34 @@ enum Start {
 /// Name given to `create` when none is passed.
 const DEFAULT_CHANNEL: &str = "general";
 
+/// Where a session's output goes. Every event is a JSON value with a text
+/// form; the sink decides which is used.
+enum Sink {
+    Text,
+    Json,
+    /// The terminal interface's thread, which gets both.
+    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
+    Tui(mpsc::UnboundedSender<(serde_json::Value, String)>),
+}
+
 struct Printer {
-    json: bool,
+    sink: Sink,
     verbose: bool,
 }
 
 impl Printer {
     fn emit(&self, value: serde_json::Value, text: impl FnOnce() -> String) {
-        if self.json {
-            println!("{value}");
-        } else {
-            println!("{}", text());
+        match &self.sink {
+            Sink::Json => println!("{value}"),
+            Sink::Text => println!("{}", text()),
+            Sink::Tui(tx) => {
+                let _ = tx.send((value, text()));
+            }
         }
+    }
+
+    fn json(&self) -> bool {
+        matches!(self.sink, Sink::Json)
     }
 
     fn info(&self, text: &str) {
@@ -625,7 +683,11 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         channels: BTreeMap::new(),
         focus: [0; 32],
         printer: Printer {
-            json: opts.json,
+            sink: match opts.mode {
+                Mode::Json => Sink::Json,
+                // The interface comes in a later step; plain until then.
+                Mode::Plain | Mode::Tui => Sink::Text,
+            },
             verbose: opts.verbose,
         },
         opts,
@@ -683,7 +745,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         };
         session.ready()?;
         session.resume_jobs(&mut streams).await;
-        session.event_loop(&mut streams).await
+        session.event_loop(&mut streams, spawn_stdin()).await
     }
     .await;
     for (_, channel) in std::mem::take(&mut session.channels) {
@@ -982,8 +1044,11 @@ impl Session {
         Ok(())
     }
 
-    async fn event_loop(&mut self, streams: &mut Streams) -> Result<()> {
-        let mut lines = spawn_stdin();
+    async fn event_loop(
+        &mut self,
+        streams: &mut Streams,
+        mut lines: mpsc::Receiver<String>,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 line = lines.recv() => {
@@ -1594,7 +1659,7 @@ impl Session {
                 ..
             } => {
                 let peer = *remote_node_id.as_bytes();
-                if self.printer.json || self.printer.verbose {
+                if self.printer.json() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_started", "channel": name, "peer": hex_id(&peer),
                                "incoming_ops": incoming_operations, "incoming_bytes": incoming_bytes}),
@@ -1611,7 +1676,7 @@ impl Session {
             } => {
                 let peer = *remote_node_id.as_bytes();
                 let error = error.map(|e| e.to_string());
-                if self.printer.json || self.printer.verbose {
+                if self.printer.json() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_ended", "channel": name, "peer": hex_id(&peer),
                                "received_ops": received_operations, "sent_ops": sent_operations,
