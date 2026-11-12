@@ -179,16 +179,17 @@ To add your bot to a channel you created without one (`--no-bot`, `/create
 type `/bot on`. In a session that started without bots, that starts them
 first. `/bot off` removes it.
 
-If the model can't be reached at start (no key, say), the session prints why
-(`bot_unavailable`) and runs as a plain chat; `/bot on` tries again.
+If no model is chosen yet, or the model has no key, the session prints why
+and what to type (`bot_unavailable`) and runs as a plain chat; `/bot on`
+tries again.
 
 Every message in a bot turn goes to the model provider in plaintext.
 
 #### Choosing the model
 
 The model is any one [rig-core](https://docs.rs/rig-core/0.46.0) 0.46 can
-reach, named `vendor/model`. Without a configured model the bots use
-`anthropic/claude-opus-5-5`.
+reach, named `vendor/model`. There is no default: you pick the vendor, and
+with it who reads your bots' messages. Until you do, the bots stay off.
 
 The quickest setup is from chat mode, without restarting:
 
@@ -208,7 +209,7 @@ wins over a saved key.
 
 | Model | Key |
 | --- | --- |
-| `anthropic/claude-opus-5-5` (default) | `ANTHROPIC_API_KEY` |
+| `anthropic/claude-opus-5-5` | `ANTHROPIC_API_KEY` |
 | `openrouter/anthropic/claude-opus-5.5` | `OPENROUTER_API_KEY` |
 | `openai/gpt-5.5` | `OPENAI_API_KEY` |
 | `gcp.gemini/<model>` | `GEMINI_API_KEY` |
@@ -234,7 +235,8 @@ Set the model in `agent.json` in the data directory, kept between sessions:
 
 `TRIAD_AGENT_BRAIN=mock` runs a scripted stand-in with no model (the tests
 use it). The older `TRIAD_AGENT_BRAIN=anthropic` and `=openrouter` still
-work: they pick the vendor for a model named without one. Limits:
+work: they pick the vendor for a model named without one. Any other model
+must name its vendor. Limits:
 `TRIAD_AGENT_MAX_AGE_SECS`, `TRIAD_AGENT_ASKER_PER_HOUR`,
 `TRIAD_AGENT_CHANNEL_PER_DAY`, `TRIAD_AGENT_BURST_PER_MINUTE`,
 `TRIAD_AGENT_MAX_STEPS`. MCP servers go in `mcp.json` in the data

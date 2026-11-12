@@ -712,11 +712,12 @@ impl Session {
             let running = self.bots.as_ref().map(|b| b.agent.provider());
             self.printer.emit(
                 json!({"event": "bot_model", "model": current, "running": running}),
-                || match &running {
-                    Some(r) if *r != current => {
-                        format!("bot model: {current} (running: {r})")
+                || match (&current, &running) {
+                    (None, _) => triad_agent::no_model_help(),
+                    (Some(c), Some(r)) if c != r => {
+                        format!("bot model: {c} (running: {r})")
                     }
-                    _ => format!("bot model: {current}"),
+                    (Some(c), _) => format!("bot model: {c}"),
                 },
             );
             return Ok(());
@@ -740,7 +741,12 @@ impl Session {
         let usage = "usage: /bot provider-key [vendor] <key>";
         let (vendor, key) = match arg.split_whitespace().collect::<Vec<_>>()[..] {
             [key] => {
-                let model = configured_model(&self.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let model = configured_model(&self.data_dir)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .with_context(|| {
+                        "choose a model first with /bot model <vendor/model>, \
+                         or name the vendor: /bot provider-key <vendor> <key>"
+                    })?;
                 let vendor = triad_agent::brain::vendor_of(&model)
                     .map_err(anyhow::Error::msg)?
                     .to_string();

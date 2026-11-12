@@ -186,8 +186,14 @@ fn no_model_key_runs_without_bots() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    // No model is assumed: the error says how to choose one and save its
+    // key.
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+    assert!(
+        err.contains("/bot model <vendor/model>") && err.contains("/bot provider-key"),
+        "{err}"
+    );
+    assert!(!err.contains("ANTHROPIC"), "{err}");
 
     let mut a = Proc::spawn_env(
         "A",
@@ -197,10 +203,7 @@ fn no_model_key_runs_without_bots() {
     );
     let why = a.wait_for("bot_unavailable", |v| is_event(v, "bot_unavailable"));
     assert!(
-        why["reason"]
-            .as_str()
-            .unwrap()
-            .contains("ANTHROPIC_API_KEY"),
+        why["reason"].as_str().unwrap().contains("no model chosen"),
         "{why}"
     );
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));
@@ -213,10 +216,18 @@ fn no_model_key_runs_without_bots() {
     // /bot on retries, and says the same.
     a.send("/bot on");
     let e = a.wait_for("error", |v| is_event(v, "error"));
+    assert!(e["text"].as_str().unwrap().contains("/bot model"), "{e}");
+    a.send("/bot model");
+    let m = a.wait_for("no model", |v| is_event(v, "bot_model"));
+    assert!(m["model"].is_null(), "{m}");
+    // A key alone has no vendor to go with yet.
+    a.send("/bot provider-key sk-early");
+    let e = a.wait_for("model first", |v| is_event(v, "error"));
     assert!(
-        e["text"].as_str().unwrap().contains("ANTHROPIC_API_KEY"),
+        e["text"].as_str().unwrap().contains("choose a model first"),
         "{e}"
     );
+    assert!(!e["text"].as_str().unwrap().contains("sk-early"), "{e}");
 
     // /bot model saves the model; without its key the bots stay off and
     // the session says which key.
