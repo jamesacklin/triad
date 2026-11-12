@@ -215,7 +215,7 @@ pub fn vendor_of(reference: &str) -> std::result::Result<&str, String> {
     let Some((vendor, model)) = reference.split_once('/') else {
         return Err(format!(
             "the bot's model is vendor/model, such as {}, got {reference:?}",
-            crate::DEFAULT_MODEL
+            crate::EXAMPLE_MODELS
         ));
     };
     if vendor.is_empty() || model.is_empty() {
@@ -268,7 +268,8 @@ pub fn check_model_keyed(reference: &str, stored_key: bool) -> std::result::Resu
     let keys = key_vars(vendor);
     if !keys.is_empty() && !stored_key && key_var_set(vendor).is_none() {
         return Err(format!(
-            "the bot's model {reference} needs {}; set it, or type /bot provider-key <key>",
+            "the bot's model {reference} needs a key for {vendor}; type /bot provider-key <key> \
+             (or set {}), or choose another model with /bot model <vendor/model>",
             keys.join(" or ")
         ));
     }

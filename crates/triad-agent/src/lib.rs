@@ -25,10 +25,10 @@ use crate::context::TurnInput;
 use crate::policy::{Limits, ToolSet};
 use crate::tools::{Audit, FakeTools, Gate, NoTools, ToolSpec, Tools};
 
-/// The model when none is configured.
-pub const DEFAULT_MODEL: &str = "anthropic/claude-opus-5-5";
-/// Claude Opus's name on OpenRouter, after `openrouter/`.
-pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-5.5";
+/// Model references shown when asking for one. There is no default model:
+/// the user picks the vendor, and with it who sees the bots' messages.
+pub const EXAMPLE_MODELS: &str =
+    "openrouter/anthropic/claude-opus-5.5, openai/gpt-5.5 or ollama/qwen3:4b";
 /// The bots' settings file in the data directory.
 pub const CONFIG_FILE: &str = "agent.json";
 /// Keys saved with `/bot provider-key`, by vendor, readable only by the
@@ -163,25 +163,31 @@ fn write_file(path: &Path, text: &str, private: bool) -> Result<()> {
     Ok(())
 }
 
-/// The model the bots would use: `TRIAD_AGENT_MODEL`, else `agent.json`,
-/// else the default. Not checked.
-pub fn configured_model(data_dir: &Path) -> Result<String, UsageError> {
+/// What to do when no model is chosen.
+pub fn no_model_help() -> String {
+    format!(
+        "no model chosen for your bots; type /bot model <vendor/model> (such as {EXAMPLE_MODELS}), \
+         then /bot provider-key <key> if the vendor needs one"
+    )
+}
+
+/// The model the bots would use: `TRIAD_AGENT_MODEL`, else `agent.json`;
+/// `None` if neither names one. Not checked.
+pub fn configured_model(data_dir: &Path) -> Result<Option<String>, UsageError> {
     let file = FileConfig::read(data_dir)?;
     Ok(reference(env("TRIAD_AGENT_BRAIN").as_deref(), file.model))
 }
 
-fn reference(brain: Option<&str>, file_model: Option<String>) -> String {
+fn reference(brain: Option<&str>, file_model: Option<String>) -> Option<String> {
     // `anthropic` and `openrouter` were the only brains before any rig-core
-    // vendor could be named; they still pick the vendor for a model given
-    // without one.
-    let openrouter = brain == Some("openrouter");
-    match env("TRIAD_AGENT_MODEL").or(file_model) {
-        Some(m) if openrouter && !m.starts_with("openrouter/") => format!("openrouter/{m}"),
-        Some(m) if m.contains('/') => m,
-        Some(m) => format!("anthropic/{m}"),
-        None if openrouter => format!("openrouter/{DEFAULT_OPENROUTER_MODEL}"),
-        None => DEFAULT_MODEL.into(),
-    }
+    // vendor could be named; set explicitly, they still pick the vendor for
+    // a model given without one. Otherwise a model names its vendor.
+    let m = env("TRIAD_AGENT_MODEL").or(file_model)?;
+    Some(match brain {
+        Some("openrouter") if !m.starts_with("openrouter/") => format!("openrouter/{m}"),
+        Some("anthropic") if !m.contains('/') => format!("anthropic/{m}"),
+        _ => m,
+    })
 }
 
 /// Saves `vendor/model` as the bots' model in `agent.json`, keeping its
@@ -240,7 +246,8 @@ impl AgentConfig {
                 delay: Duration::from_millis(env_num("TRIAD_AGENT_MOCK_DELAY_MS", 0)?),
             },
             brain @ (None | Some("model" | "anthropic" | "openrouter")) => {
-                let reference = reference(brain, file.model);
+                let reference =
+                    reference(brain, file.model).ok_or_else(|| UsageError(no_model_help()))?;
                 let vendor = brain::vendor_of(&reference).map_err(UsageError)?;
                 let api_key = match brain::key_var_set(vendor) {
                     Some(_) => None,

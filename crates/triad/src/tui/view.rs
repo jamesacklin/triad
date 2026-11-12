@@ -311,7 +311,11 @@ fn bot_segment(app: &App, c: &Chan) -> Span<'static> {
             ))
         } else {
             match &app.bots_off {
-                Some(why) => off(&format!("bot off: {why}")),
+                // The pane has the whole reason and what to type.
+                Some(why) => off(&format!(
+                    "bot off: {}",
+                    why.split(';').next().unwrap_or(why)
+                )),
                 None => off("bot off"),
             }
         };
