@@ -31,6 +31,19 @@ pub const DEFAULT_MODEL: &str = "anthropic/claude-opus-5-5";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-5.5";
 /// The bots' settings file in the data directory.
 pub const CONFIG_FILE: &str = "agent.json";
+/// Keys saved with `/bot provider-key`, by vendor, readable only by the
+/// user. A vendor's environment variable wins over it.
+pub const KEYS_FILE: &str = "keys.json";
+
+/// A model provider's key. Its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(pub String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(..)")
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrainKind {
@@ -38,6 +51,8 @@ pub enum BrainKind {
     Model {
         reference: String,
         base_url: Option<String>,
+        /// From `keys.json`, when the vendor's variable is not set.
+        api_key: Option<ApiKey>,
     },
     Mock {
         script: Option<PathBuf>,
@@ -89,7 +104,7 @@ fn env_num(name: &str, default: u64) -> Result<u64, UsageError> {
 }
 
 /// `agent.json`: settings worth keeping between sessions. Keys never go
-/// here; each vendor's key is read from its own variable.
+/// here; they live in `keys.json` or the vendor's own variable.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -113,10 +128,109 @@ impl FileConfig {
     }
 }
 
+fn read_keys(data_dir: &Path) -> Result<std::collections::BTreeMap<String, String>, UsageError> {
+    let path = data_dir.join(KEYS_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            serde_json::from_str(&text).map_err(|e| UsageError(format!("{}: {e}", path.display())))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(e) => Err(UsageError(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Writes `text` to `path` through a temporary file, readable only by the
+/// user when `private`.
+fn write_file(path: &Path, text: &str, private: bool) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut f = options
+        .open(&tmp)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// The model the bots would use: `TRIAD_AGENT_MODEL`, else `agent.json`,
+/// else the default. Not checked.
+pub fn configured_model(data_dir: &Path) -> Result<String, UsageError> {
+    let file = FileConfig::read(data_dir)?;
+    Ok(reference(env("TRIAD_AGENT_BRAIN").as_deref(), file.model))
+}
+
+fn reference(brain: Option<&str>, file_model: Option<String>) -> String {
+    // `anthropic` and `openrouter` were the only brains before any rig-core
+    // vendor could be named; they still pick the vendor for a model given
+    // without one.
+    let openrouter = brain == Some("openrouter");
+    match env("TRIAD_AGENT_MODEL").or(file_model) {
+        Some(m) if openrouter && !m.starts_with("openrouter/") => format!("openrouter/{m}"),
+        Some(m) if m.contains('/') => m,
+        Some(m) => format!("anthropic/{m}"),
+        None if openrouter => format!("openrouter/{DEFAULT_OPENROUTER_MODEL}"),
+        None => DEFAULT_MODEL.into(),
+    }
+}
+
+/// Saves `vendor/model` as the bots' model in `agent.json`, keeping its
+/// other fields. Checks the vendor, not the key.
+pub fn save_model(data_dir: &Path, model: &str) -> Result<()> {
+    brain::vendor_of(model).map_err(anyhow::Error::msg)?;
+    let path = data_dir.join(CONFIG_FILE);
+    let mut value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .with_context(|| format!("{}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("{}", path.display())),
+    };
+    let Some(obj) = value.as_object_mut() else {
+        bail!("{} is not a JSON object", path.display());
+    };
+    obj.insert("model".into(), model.into());
+    write_file(&path, &format!("{value:#}\n"), false)
+}
+
+/// Saves a key for `vendor` in `keys.json`, which only the user can read.
+pub fn save_key(data_dir: &Path, vendor: &str, key: &str) -> Result<()> {
+    if brain::key_vars(vendor).is_empty() {
+        brain::vendor_of(&format!("{vendor}/x")).map_err(anyhow::Error::msg)?;
+        bail!("{vendor} needs no key");
+    }
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        bail!("usage: /bot provider-key [vendor] <key>");
+    }
+    let mut keys = read_keys(data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    keys.insert(vendor.to_string(), key.to_string());
+    let text = serde_json::to_string_pretty(&keys)?;
+    let path = data_dir.join(KEYS_FILE);
+    write_file(&path, &format!("{text}\n"), true)?;
+    #[cfg(unix)]
+    {
+        // An older file made by hand keeps its mode through the rename of
+        // a new one, but not if it was a different inode; be sure.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 impl AgentConfig {
     /// Reads `agent.json` in the data directory, then the `TRIAD_AGENT_*`
     /// variables, which win. Checks that the model's vendor is one rig-core
-    /// reaches and that its key variable is set; keys are never copied.
+    /// reaches and that it has a key: the vendor's variable, else one saved
+    /// in `keys.json`.
     pub fn load(data_dir: &Path) -> Result<Self, UsageError> {
         let file = FileConfig::read(data_dir)?;
         let brain = match env("TRIAD_AGENT_BRAIN").as_deref() {
@@ -125,24 +239,18 @@ impl AgentConfig {
                 log: env("TRIAD_AGENT_MOCK_LOG").map(PathBuf::from),
                 delay: Duration::from_millis(env_num("TRIAD_AGENT_MOCK_DELAY_MS", 0)?),
             },
-            // `anthropic` and `openrouter` were the only brains before any
-            // rig-core vendor could be named; they still pick the vendor for
-            // a model given without one.
             brain @ (None | Some("model" | "anthropic" | "openrouter")) => {
-                let openrouter = brain == Some("openrouter");
-                let reference = match env("TRIAD_AGENT_MODEL").or(file.model) {
-                    Some(m) if openrouter && !m.starts_with("openrouter/") => {
-                        format!("openrouter/{m}")
-                    }
-                    Some(m) if m.contains('/') => m,
-                    Some(m) => format!("anthropic/{m}"),
-                    None if openrouter => format!("openrouter/{DEFAULT_OPENROUTER_MODEL}"),
-                    None => DEFAULT_MODEL.into(),
+                let reference = reference(brain, file.model);
+                let vendor = brain::vendor_of(&reference).map_err(UsageError)?;
+                let api_key = match brain::key_var_set(vendor) {
+                    Some(_) => None,
+                    None => read_keys(data_dir)?.remove(vendor).map(ApiKey),
                 };
-                brain::check_model(&reference).map_err(UsageError)?;
+                brain::check_model_keyed(&reference, api_key.is_some()).map_err(UsageError)?;
                 BrainKind::Model {
                     reference,
                     base_url: env("TRIAD_AGENT_BASE_URL").or(file.base_url),
+                    api_key,
                 }
             }
             Some(other) => {
@@ -200,26 +308,32 @@ pub struct Agent {
     pub warnings: Vec<String>,
 }
 
+/// The brain a configuration names.
+fn brain(config: &AgentConfig) -> Result<Arc<dyn Brain>> {
+    http::install_crypto_provider();
+    Ok(match &config.brain {
+        BrainKind::Mock { script, log, delay } => {
+            Arc::new(MockBrain::new(script.as_deref(), log.clone(), *delay)?)
+        }
+        BrainKind::Model {
+            reference,
+            base_url,
+            api_key,
+        } => {
+            let (client, _) = http::client().map_err(anyhow::Error::msg)?;
+            Arc::new(ModelBrain::connect(
+                reference,
+                base_url.as_deref(),
+                api_key.as_ref().map(|k| k.0.as_str()),
+                client,
+            )?)
+        }
+    })
+}
+
 impl Agent {
     pub async fn start(config: &AgentConfig, data_dir: &Path) -> Result<Agent> {
-        http::install_crypto_provider();
-        let brain: Arc<dyn Brain> = match &config.brain {
-            BrainKind::Mock { script, log, delay } => {
-                Arc::new(MockBrain::new(script.as_deref(), log.clone(), *delay)?)
-            }
-            BrainKind::Model {
-                reference,
-                base_url,
-            } => {
-                let (client, _) = http::client().map_err(anyhow::Error::msg)?;
-                Arc::new(ModelBrain::connect(
-                    reference,
-                    base_url.as_deref(),
-                    None,
-                    client,
-                )?)
-            }
-        };
+        let brain = brain(config)?;
         let mut warnings = Vec::new();
         let tools: Arc<dyn Tools> = match &config.tools {
             ToolsKind::Fake(path) => Arc::new(FakeTools::load(path)?),
@@ -252,6 +366,19 @@ impl Agent {
             limits: config.limits,
             all_tools,
             warnings,
+        })
+    }
+
+    /// These bots with the brain `config` names, keeping their tools and
+    /// persona. Turns already running finish with the old brain.
+    pub fn with_brain(&self, config: &AgentConfig) -> Result<Agent> {
+        Ok(Agent {
+            brain: brain(config)?,
+            tools: self.tools.clone(),
+            persona: self.persona.clone(),
+            limits: self.limits,
+            all_tools: self.all_tools.clone(),
+            warnings: Vec::new(),
         })
     }
 

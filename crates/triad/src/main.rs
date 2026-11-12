@@ -151,6 +151,16 @@ enum Cmd {
         #[arg(long, value_name = "TEXT")]
         grep: String,
     },
+    /// Delete everything in the data directory (channels, history, keys,
+    /// bot settings) and start over with a new identity. Asks first.
+    Reset {
+        /// Don't ask.
+        #[arg(long)]
+        yes: bool,
+        /// Keep the bots' settings: agent.json, mcp.json and keys.json.
+        #[arg(long)]
+        keep_bot_config: bool,
+    },
     /// Raw iroh connectivity check, below p2panda.
     Probe {
         #[command(subcommand)]
@@ -299,6 +309,13 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         Some(d) => d,
         None => default_data_dir()?,
     };
+    if let Cmd::Reset {
+        yes,
+        keep_bot_config,
+    } = cli.cmd
+    {
+        return reset(&data_dir, yes, keep_bot_config);
+    }
     // The removed OpenMLS version of `triad` used the same default directory.
     // Its group is not a p2panda space, so it cannot be opened as a channel.
     if !matches!(cli.cmd, Cmd::Inspect { .. } | Cmd::Probe { .. })
@@ -334,6 +351,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         .transpose()?;
     match cli.cmd {
         Cmd::Whoami => println!("{}", Identity::load_or_create(&data_dir)?.node_hex()),
+        Cmd::Reset { .. } => unreachable!("handled above"),
         Cmd::Create {
             name,
             relay,
@@ -510,6 +528,97 @@ fn invite_to(meta: &Meta, me: &NodeId) -> Result<String> {
     Invite::new(meta.topic, *me, &meta.relay)
         .with_name(&meta.name)
         .render()
+}
+
+/// Files that mark a directory as triad's, so `reset` never empties some
+/// other directory passed by mistake.
+const TRIAD_FILES: &[&str] = &[
+    triad_core::identity::CREDENTIALS_FILE,
+    triad_core::state::STATE_FILE,
+    P2PANDA_FILE,
+    "mls.sqlite",
+    "triad.log",
+];
+
+/// `triad reset`: empties the data directory and creates a new identity.
+fn reset(data_dir: &Path, yes: bool, keep_bot_config: bool) -> Result<ExitCode> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let keep: &[&str] = if keep_bot_config {
+        &[
+            triad_agent::CONFIG_FILE,
+            triad_agent::mcp::CONFIG_FILE,
+            triad_agent::KEYS_FILE,
+        ]
+    } else {
+        &[]
+    };
+    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(data_dir) {
+        Ok(dir) => dir.collect::<std::io::Result<_>>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", data_dir.display())),
+    };
+    let doomed: Vec<&std::fs::DirEntry> = entries
+        .iter()
+        .filter(|e| !keep.iter().any(|k| e.file_name() == *k))
+        .collect();
+    if !doomed.is_empty() {
+        if !TRIAD_FILES.iter().any(|f| data_dir.join(f).exists()) {
+            bail!(
+                "{} does not look like a triad data directory; not touching it",
+                data_dir.display()
+            );
+        }
+        if !yes {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "reset deletes {}; pass --yes to confirm",
+                    data_dir.display()
+                );
+            }
+            let me = data_dir
+                .join(triad_core::identity::CREDENTIALS_FILE)
+                .exists()
+                .then(|| {
+                    Identity::load_or_create(data_dir)
+                        .map(|i| i.node_hex())
+                        .ok()
+                })
+                .flatten();
+            eprintln!(
+                "This deletes everything in {}{}: every channel, its history, and this node's \
+                 identity{}. Other members will see a new node.",
+                data_dir.display(),
+                if keep.is_empty() {
+                    ""
+                } else {
+                    " except the bot settings"
+                },
+                me.map(|m| format!(" ({m})")).unwrap_or_default()
+            );
+            eprint!("Type reset to continue: ");
+            std::io::stderr().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().lock().read_line(&mut answer)?;
+            if answer.trim() != "reset" {
+                eprintln!("not reset");
+                return Ok(ExitCode::from(1));
+            }
+        }
+        for e in doomed {
+            let path = e.path();
+            if e.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .with_context(|| format!("deleting {}", path.display()))?;
+        }
+    }
+    std::fs::create_dir_all(data_dir)?;
+    let id = Identity::load_or_create(data_dir)?;
+    eprintln!("reset {}; new node ID:", data_dir.display());
+    println!("{}", id.node_hex());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn inspect(data_dir: &Path, needle: &str) -> Result<ExitCode> {

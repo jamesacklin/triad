@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use super::commands::{Suggestion, suggest};
 use super::input::Input;
 
 /// One line of a channel's pane.
@@ -131,6 +132,8 @@ pub struct App {
     pub asks: VecDeque<Ask>,
     /// The last error, until the next line is submitted.
     pub last_error: Option<String>,
+    /// The selected command suggestion.
+    pub completion: usize,
 }
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -173,6 +176,7 @@ impl App {
             focus: None,
             selected: None,
             input: Input::default(),
+            completion: 0,
             early: Vec::new(),
             store,
             pane: Cell::new((0, 0)),
@@ -405,6 +409,40 @@ impl App {
         if !line.trim().starts_with('/') {
             self.asks.pop_front();
         }
+    }
+
+    /// Command suggestions for what is typed, while the cursor is at its
+    /// end.
+    pub fn suggestions(&self) -> Vec<Suggestion> {
+        if !self.input.at_end() {
+            return Vec::new();
+        }
+        let names: Vec<&str> = self.channels.iter().map(|c| c.name.as_str()).collect();
+        suggest(self.input.text(), &names)
+    }
+
+    /// The selected suggestion's index, kept in range.
+    pub fn selected_completion(&self, count: usize) -> usize {
+        self.completion.min(count.saturating_sub(1))
+    }
+
+    pub fn move_completion(&mut self, step: isize) {
+        let n = self.suggestions().len();
+        if n == 0 {
+            return;
+        }
+        let i = self.selected_completion(n) as isize + step;
+        self.completion = i.rem_euclid(n as isize) as usize;
+    }
+
+    /// Tab: replaces the input with the selected suggestion.
+    pub fn complete(&mut self) {
+        let s = self.suggestions();
+        if let Some(s) = s.get(self.selected_completion(s.len())) {
+            let text = s.complete.clone();
+            self.input.set(&text);
+        }
+        self.completion = 0;
     }
 
     /// Whether the screen shows a clock that needs redrawing.

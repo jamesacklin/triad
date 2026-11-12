@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Paragraph};
 use std::time::Instant;
 
 use super::app::{App, Chan, Line};
-use super::input::width;
+use super::commands::{Suggestion, redact};
+use super::input::{Input, width};
 
 /// Below this many columns the sidebar is hidden.
 pub const SIDEBAR_MIN_COLS: u16 = 60;
@@ -121,8 +122,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if area.width < 4 || area.height < 5 {
         return;
     }
-    let [main, status, input] = Layout::vertical([
+    let suggestions = app.suggestions();
+    let shown = suggestions
+        .len()
+        .min(MAX_SUGGESTIONS)
+        .min((area.height as usize).saturating_sub(6)) as u16;
+    let [main, popup, status, input] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(shown),
         Constraint::Length(1),
         Constraint::Length(3),
     ])
@@ -137,7 +144,47 @@ pub fn draw(frame: &mut Frame, app: &App) {
     };
     draw_pane(frame, app, pane);
     draw_status(frame, app, status);
+    draw_suggestions(frame, app, &suggestions, popup);
     draw_input(frame, app, input);
+}
+
+/// The most command suggestions shown at once.
+const MAX_SUGGESTIONS: usize = 8;
+
+/// Matching commands above the input box; the selected one is reversed and
+/// Tab takes it. The list scrolls to keep the selection in view.
+fn draw_suggestions(frame: &mut Frame, app: &App, suggestions: &[Suggestion], area: Rect) {
+    let rows = area.height as usize;
+    if rows == 0 || suggestions.is_empty() {
+        return;
+    }
+    let selected = app.selected_completion(suggestions.len());
+    let first = (selected + 1).saturating_sub(rows);
+    let label_cols = suggestions
+        .iter()
+        .map(|s| width(&s.label))
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<TextLine> = suggestions
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+        .map(|(i, s)| {
+            let pad = " ".repeat(label_cols - width(&s.label));
+            let mut spans = vec![Span::raw(format!(" {}{pad}  ", s.label))];
+            if !s.help.is_empty() {
+                spans.push(Span::styled(s.help, dim()));
+            }
+            let line = TextLine::from(spans);
+            if i == selected {
+                line.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -374,7 +421,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         frame.set_cursor_position(Position::new(inner.x + prompt.len() as u16, inner.y));
         return;
     }
-    let (shown, cursor) = app.input.visible(cols);
+    let mut hidden = Input::default();
+    let input = match redact(app.input.text()) {
+        r if r != app.input.text() => {
+            // Same length in chars, so the cursor stays where it was.
+            hidden.set(&r);
+            for _ in 0..app.input.text().chars().count() - app.input.cursor() {
+                hidden.left();
+            }
+            &hidden
+        }
+        _ => &app.input,
+    };
+    let (shown, cursor) = input.visible(cols);
     frame.render_widget(Paragraph::new(format!("{prompt}{}", clean(&shown))), inner);
     frame.set_cursor_position(Position::new(
         inner.x + (prompt.len() + cursor) as u16,
@@ -511,6 +570,27 @@ mod tests {
         assert_eq!(wrap("", 10), vec![""]);
         assert!(wrap("x", 0).is_empty());
         assert_eq!(wrap("ab cdefghij", 4), vec!["ab", "cdef", "ghij"]);
+    }
+
+    #[test]
+    fn command_suggestions_and_hidden_keys() {
+        let mut app = started();
+        for c in "/bot ".chars() {
+            app.input.insert(c);
+        }
+        let rows = screen(&app, 80, 20);
+        assert!(rows.iter().any(|r| r.contains("/bot model [vendor/model]")), "{rows:#?}");
+        // Down then Tab takes the second suggestion.
+        app.move_completion(1);
+        app.complete();
+        assert_eq!(app.input.text(), "/bot off");
+        app.input.take();
+        for c in "/bot provider-key sk-secret".chars() {
+            app.input.insert(c);
+        }
+        let rows = screen(&app, 80, 20);
+        assert!(!rows.iter().any(|r| r.contains("sk-secret")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("/bot provider-key •••")), "{rows:#?}");
     }
 
     #[test]

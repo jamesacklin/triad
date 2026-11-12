@@ -209,10 +209,9 @@ pub fn vendors() -> Vec<&'static str> {
     set.into_iter().collect()
 }
 
-/// Checks a `vendor/model` reference without connecting: the vendor is one
-/// rig-core can reach, and its key variable is set if it needs one. The
-/// error says what to set.
-pub fn check_model(reference: &str) -> std::result::Result<(), String> {
+/// The vendor of a `vendor/model` reference, checked to be one rig-core
+/// can reach.
+pub fn vendor_of(reference: &str) -> std::result::Result<&str, String> {
     let Some((vendor, model)) = reference.split_once('/') else {
         return Err(format!(
             "the bot's model is vendor/model, such as {}, got {reference:?}",
@@ -224,7 +223,12 @@ pub fn check_model(reference: &str) -> std::result::Result<(), String> {
             "the bot's model is vendor/model, got {reference:?}"
         ));
     }
-    let provider = ProviderId::catalog(vendor)
+    provider(vendor)?;
+    Ok(vendor)
+}
+
+fn provider(vendor: &str) -> std::result::Result<ProviderId, String> {
+    ProviderId::catalog(vendor)
         .filter(|p| p.is_registered())
         .ok_or_else(|| {
             format!(
@@ -232,12 +236,39 @@ pub fn check_model(reference: &str) -> std::result::Result<(), String> {
                  known: {}",
                 vendors().join(", ")
             )
-        })?;
-    let keys = provider.api_key_envs();
-    let set = |k: &&str| std::env::var(k).is_ok_and(|v| !v.is_empty());
-    if provider.requires_credential() && !keys.is_empty() && !keys.iter().any(set) {
+        })
+}
+
+/// The variables a vendor's key is read from; empty if it needs no key.
+pub fn key_vars(vendor: &str) -> Vec<&'static str> {
+    match provider(vendor) {
+        Ok(p) if p.requires_credential() => p.api_key_envs().to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// The first of a vendor's key variables that is set.
+pub fn key_var_set(vendor: &str) -> Option<&'static str> {
+    key_vars(vendor)
+        .into_iter()
+        .find(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+}
+
+/// Checks a `vendor/model` reference without connecting: the vendor is one
+/// rig-core can reach, and its key variable is set if it needs one. The
+/// error says what to set.
+pub fn check_model(reference: &str) -> std::result::Result<(), String> {
+    check_model_keyed(reference, false)
+}
+
+/// [`check_model`], where `stored_key` says a key for the vendor was saved
+/// with `/bot provider-key`.
+pub fn check_model_keyed(reference: &str, stored_key: bool) -> std::result::Result<(), String> {
+    let vendor = vendor_of(reference)?;
+    let keys = key_vars(vendor);
+    if !keys.is_empty() && !stored_key && key_var_set(vendor).is_none() {
         return Err(format!(
-            "the bot's model {reference} needs {}",
+            "the bot's model {reference} needs {}; set it, or type /bot provider-key <key>",
             keys.join(" or ")
         ));
     }

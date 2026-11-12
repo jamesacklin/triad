@@ -21,9 +21,22 @@ pub struct Input {
 }
 
 impl Input {
-    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Replaces the text and puts the cursor at its end.
+    pub fn set(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.cursor = self.len();
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn at_end(&self) -> bool {
+        self.cursor == self.len()
     }
 
     pub fn is_empty(&self) -> bool {

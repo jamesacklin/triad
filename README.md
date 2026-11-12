@@ -111,6 +111,7 @@ always-on node.
 | `invite [--channel <name>]` | Print an invite to a channel this node has joined. |
 | `history [--channel <name>] [--limit N]` | Print stored messages, oldest first: one channel, or all in one timeline. |
 | `status` | Print role, join status and operation counts for every channel. |
+| `reset [--yes] [--keep-bot-config]` | Delete everything in the data directory (channels, history, identity, bot settings and keys) and print a new node ID. Asks you to type `reset` unless `--yes`. `--keep-bot-config` keeps `agent.json`, `mcp.json` and `keys.json`. Refuses a directory with no triad files in it. Quit any session using the directory first. |
 | `inspect --grep <text>` | Scan the raw bytes of `p2panda.sqlite` for the text. Exit 0 if absent, 1 if found. |
 | `probe listen` | Start a raw iroh echo endpoint and print its address. |
 | `probe connect <addr>` | Connect, echo one line, report whether the path was direct or relayed. |
@@ -185,9 +186,24 @@ Every message in a bot turn goes to the model provider in plaintext.
 #### Choosing the model
 
 The model is any one [rig-core](https://docs.rs/rig-core/0.46.0) 0.46 can
-reach, named `vendor/model`. The vendor's key comes from its own environment
-variable and is never written to disk. Without a configured model the bots
-use `anthropic/claude-opus-5-5`.
+reach, named `vendor/model`. Without a configured model the bots use
+`anthropic/claude-opus-5-5`.
+
+The quickest setup is from chat mode, without restarting:
+
+```
+/bot model openai/gpt-5.5
+/bot provider-key sk-...
+```
+
+`/bot model` saves the model in `agent.json`. `/bot provider-key` saves the
+key for the model's vendor (or `/bot provider-key <vendor> <key>` for another
+vendor) in `keys.json` in the data directory, readable only by you (mode
+0600). The terminal interface shows the key as dots while you type it, and
+it is never logged. Once the model has a key, the bots start, or switch to
+the new model if they are already running. Each channel whose bot you run is
+told where its messages now go. A vendor's environment variable, when set,
+wins over a saved key.
 
 | Model | Key |
 | --- | --- |
@@ -226,6 +242,8 @@ directory, tokens named by environment variable.
 | In chat mode | Behavior |
 | --- | --- |
 | `/bot`, `/bot on`, `/bot off` | Show the focused channel's bot, add yours to it, or remove it. On and off: creator only. |
+| `/bot model [vendor/model]` | Show your bots' model, or set it ([Choosing the model](#choosing-the-model)). |
+| `/bot provider-key [vendor] <key>` | Save the key for the model's vendor, or the named one, and start the bots. |
 | `/grant <node> <server.tool \| server.*>`, `/revoke <node> [pattern]`, `/grants` | Edit grants in the focused channel. Host only. |
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
@@ -264,6 +282,7 @@ On a terminal, `create`, `join` and `chat` open a full-screen interface:
 | Enter | Send the line. |
 | Ctrl-N / Ctrl-P, Alt-Down / Alt-Up | Focus the next or previous channel. |
 | PgUp / PgDn | Scroll the chat pane. It stays put while new messages arrive, until you scroll back down. |
+| Tab, Up / Down | When a line starts with `/`, the matching commands (and channel names after `/switch`, `/s`, `/msg`, `/invite`) are listed above the input box. Up and Down pick one; Tab puts it in the line. |
 | Left, Right, Home, End, Ctrl-A, Ctrl-E | Move in the line. |
 | Backspace, Delete, Ctrl-U, Ctrl-W | Delete a character, everything before the cursor, or a word. |
 | Ctrl-C, or Ctrl-D on an empty line | Quit (`/quit`). |

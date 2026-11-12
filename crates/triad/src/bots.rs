@@ -17,7 +17,9 @@ use serde_json::Value;
 use triad_agent::context::{self, ContextLimits, HistoryLine, Kind, Turn};
 use triad_agent::policy::{self, ChannelView, Decision, Incoming, Tier, ToolSet};
 use triad_agent::tools::{Audit, offered, servers};
-use triad_agent::{Agent, AgentConfig, TurnResult};
+use triad_agent::{
+    Agent, AgentConfig, KEYS_FILE, TurnResult, configured_model, save_key, save_model,
+};
 use triad_core::envelope::Control;
 use triad_core::state::{BotRow, Job, JobState, NewJob};
 
@@ -698,6 +700,98 @@ impl Session {
         Ok(())
     }
 
+    /// `/bot model`: shows the model, or saves a new one and applies it.
+    async fn bot_model(&mut self, model: &str, streams: &mut Streams) -> Result<()> {
+        if model.is_empty() {
+            let current = configured_model(&self.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let running = self.bots.as_ref().map(|b| b.agent.provider());
+            self.printer.emit(
+                json!({"event": "bot_model", "model": current, "running": running}),
+                || match &running {
+                    Some(r) if *r != current => {
+                        format!("bot model: {current} (running: {r})")
+                    }
+                    _ => format!("bot model: {current}"),
+                },
+            );
+            return Ok(());
+        }
+        if model.split_whitespace().count() != 1 {
+            bail!("usage: /bot model <vendor/model>");
+        }
+        save_model(&self.data_dir, model)?;
+        self.printer.info(&format!("bot model set to {model}"));
+        if std::env::var("TRIAD_AGENT_MODEL").is_ok_and(|v| !v.is_empty()) {
+            self.printer
+                .info("TRIAD_AGENT_MODEL is set and wins over /bot model");
+        }
+        self.apply_bot_config(streams).await
+    }
+
+    /// `/bot provider-key [vendor] <key>`: saves a key for the configured
+    /// model's vendor (or the one named) and applies it. The key is not
+    /// echoed or logged.
+    async fn bot_provider_key(&mut self, arg: &str, streams: &mut Streams) -> Result<()> {
+        let usage = "usage: /bot provider-key [vendor] <key>";
+        let (vendor, key) = match arg.split_whitespace().collect::<Vec<_>>()[..] {
+            [key] => {
+                let model = configured_model(&self.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let vendor = triad_agent::brain::vendor_of(&model)
+                    .map_err(anyhow::Error::msg)?
+                    .to_string();
+                (vendor, key)
+            }
+            [vendor, key] => (vendor.to_string(), key),
+            _ => bail!(usage),
+        };
+        save_key(&self.data_dir, &vendor, key)?;
+        self.printer.info(&format!(
+            "saved the {vendor} key in {} (readable only by you)",
+            self.data_dir.join(KEYS_FILE).display()
+        ));
+        if let Some(var) = triad_agent::brain::key_var_set(&vendor) {
+            self.printer
+                .info(&format!("{var} is set and wins over the saved key"));
+        }
+        self.apply_bot_config(streams).await
+    }
+
+    /// After the model or a key changed: starts the bots if they are not
+    /// running, or gives the running ones the new brain and tells each
+    /// channel whose bot I run where its messages now go.
+    async fn apply_bot_config(&mut self, streams: &mut Streams) -> Result<()> {
+        let config = match AgentConfig::load(&self.data_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                self.printer.info(&format!("bots not started: {e}"));
+                return Ok(());
+            }
+        };
+        let Some(bots) = self.bots.as_mut() else {
+            return self.ensure_bots(streams).await;
+        };
+        let before = bots.agent.provider();
+        bots.agent = Arc::new(bots.agent.with_brain(&config)?);
+        let provider = bots.agent.provider();
+        self.printer.emit(
+            json!({"event": "bots_started", "provider": provider, "servers": bots.agent.servers()}),
+            || format!("bots now use {provider}"),
+        );
+        if provider != before {
+            let hosted: Vec<Topic> = self
+                .channels
+                .keys()
+                .copied()
+                .filter(|t| !self.is_dm(t) && self.hosting(t))
+                .collect();
+            for topic in hosted {
+                let body = self.bot_on_body()?;
+                self.publish_chat(topic, body).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the bots in a session running without them.
     async fn ensure_bots(&mut self, streams: &mut Streams) -> Result<()> {
         if self.bots.is_some() {
@@ -780,10 +874,12 @@ impl Session {
         let focus = self.focus;
         let name = self.name(&focus).to_string();
         match cmd {
-            "/bot" => match rest {
-                "on" => self.bot_on(focus, streams).await?,
-                "off" => self.bot_off(focus).await?,
-                "" => {
+            "/bot" => match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
+                ("on", "") => self.bot_on(focus, streams).await?,
+                ("off", "") => self.bot_off(focus).await?,
+                ("model", arg) => self.bot_model(arg.trim(), streams).await?,
+                ("provider-key", arg) => self.bot_provider_key(arg.trim(), streams).await?,
+                ("", _) => {
                     let bot = self.state.bot(&focus)?;
                     let mine = match &bot {
                         _ if self.is_dm(&focus) => "all".to_string(),
@@ -833,7 +929,7 @@ impl Session {
                         },
                     );
                 }
-                _ => bail!("usage: /bot [on|off]"),
+                _ => bail!("usage: /bot [on|off|model [vendor/model]|provider-key [vendor] <key>]"),
             },
             "/grant" => {
                 self.require_host(&focus)?;
