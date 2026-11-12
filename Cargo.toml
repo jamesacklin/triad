@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad", "crates/triad-web"]
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad"]
 
 [workspace.package]
 version = "0.1.0"
@@ -44,6 +44,10 @@ rmcp = { version = "=3.9.0", default-features = false, features = ["client", "tr
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-root-certs = "1"
+
+# The terminal interface (crates/triad/src/tui). Pinned exactly; crossterm
+# is used through ratatui's re-export and named nowhere else.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 
 triad-core = { path = "crates/triad-core" }
 triad-probe = { path = "crates/triad-probe" }

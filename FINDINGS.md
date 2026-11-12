@@ -935,6 +935,146 @@ run through rig-core's catalog path.
   kernel configuration) so `build.sh` rebuilds the kernel again;
   `VM_KERNEL=skip` rebuilds only `triad` and init meanwhile.
 
+## Terminal interface (2026-11-12)
+
+`create`, `join` and `chat` now open a ratatui interface on a terminal
+(sidebar of channels, chat pane, status line, input line; see
+[README.md](README.md#terminal-interface)), and `crates/triad-web` is gone.
+The plan is `TUI-PLAN.md`.
+
+The interface is a view on the CLI's `Session`, not a second client. Two
+seams carry everything:
+
+- **Output.** `Printer` had a `json` flag; it now has a `Sink` (`Text`,
+  `Json`, `Tui`). The `Tui` sink sends each event's `(json, text)` pair over
+  an unbounded channel to the interface thread, which decodes the JSON
+  (`crates/triad/src/tui/app.rs`). None of the ~50 emit sites changed.
+- **Input.** `event_loop` takes its line receiver as a parameter. Plain and
+  JSON modes still get `spawn_stdin()`, created at the same point as
+  before; the interface thread holds the other end in TUI mode and submits
+  lines exactly as typed.
+
+The interface runs on one OS thread: `event::poll(50 ms)`, then drain the
+event channel with `try_recv`, then redraw if anything changed (or every
+half second while a turn's clock is showing). No tokio, no `EventStream`.
+When the session ends for any reason its sender drops, the thread sees the
+disconnect, restores the terminal and returns; `run_chat` joins it before
+returning the session's result, so an error prints on the normal screen.
+
+Each channel's pane starts from a second, read-only use of `state.sqlite`
+(the last 500 messages, the accepted bot, queued jobs), opened in the
+interface thread when `ready` arrives. Live messages are deduplicated
+against that backlog by operation hash, because a message can be recorded
+between the read and its event. Author labels for both come from shared
+functions in `main.rs` (`sender_name`, `author_label`,
+`bot_author_accepted`) that `Session` now uses too.
+
+**Mode.** `--json` gives JSON lines; `--plain`, stdin or stdout not a
+terminal, or a build without the `tui` feature give the plain prompt;
+otherwise the interface. The VM image and every script pass `--json`. All
+integration tests pass unedited, which is the evidence that the seam
+changed nothing in either line protocol.
+
+**Protocol additions** (additive only): `ready` gains `bots` (whether this
+session runs my bots) and, when they run, `bot_provider` and `bot_servers`,
+so the status line knows the DM's bot without guessing; `join_request`
+gains `auto`, because under `--auto-accept` the request is not waiting for
+an answer and the status line must not prompt for one; `/nick <name>`
+(replacing the web demo's nickname field) emits a new `nick` event. `--plain`
+is new on `create`, `join` and `chat`.
+
+**ratatui features.** `ratatui = "=0.30.2"` with `default-features = false,
+features = ["crossterm"]` compiled and was enough on Rust 1.98.1; no
+`layout-cache` or other feature was added. It brings ratatui-core,
+ratatui-widgets, ratatui-crossterm, crossterm 0.29, kasuari, compact_str,
+lru, strum, itertools and unicode-width/-segmentation/-truncate. `cargo tree
+-d` shows no new duplicate versions; nothing the workspace pins is pulled in
+twice. crossterm is reached only as `ratatui::crossterm`, and display widths
+through `ratatui::text::Span::width`, so neither is named in a manifest.
+
+**Release binary size** (`cargo build --release --locked -p triad`, Linux
+x86_64, same target directory):
+
+| Build | Size | Stripped |
+| --- | --- | --- |
+| Before (`0110a8d`, no interface) | 60,625,496 | 43,488,792 |
+| `tui` on (default) | 61,204,176 (+579 KB, +1.0%) | 43,960,312 (+472 KB) |
+| `tui` off (`--no-default-features`) | 60,690,528 (+65 KB) | 43,516,952 (+28 KB) |
+
+The VM image can build with `--no-default-features` and lose nothing it
+uses.
+
+**Terminal restoration**, checked by hand in tmux (`tmux capture-pane`,
+then `stty -a` in the same shell): after `/quit`, Ctrl-C and Ctrl-D; after
+an error from `chat()` (`chat --channel nosuch`: the message prints after
+the screen is restored, exit 1); after a panic in the interface thread and
+after a panic in the session (both with a throwaway patch that was not
+committed: exit 1 and 101, the panic message on the normal screen, the
+shell in cooked mode with echo). A panic hook installed after
+`ratatui::try_init`'s own sets a flag that stops the interface thread
+drawing over the restored screen while the panic is reported.
+
+Smaller decisions:
+
+- **Ctrl-C before `ready`.** Raw mode turns Ctrl-C into a key, and until
+  the session's event loop runs nobody reads `/quit`. Pressed then (for
+  example while the node is still dialling a relay), Ctrl-C restores the
+  terminal and exits 130, as SIGINT would in plain mode.
+- **Wrapping is the interface's own** (`view::wrap`, by display width, at
+  spaces, inside words longer than a row), because the pane must know its
+  row count to stick to the bottom and to hold its place when scrolled up,
+  and `Paragraph::line_count` needs ratatui's unstable features.
+- **Control characters** in anything shown (messages, nicknames, channel
+  names) are replaced before drawing, so a peer cannot write escape
+  sequences to the terminal.
+- **Routine bot traffic stays out of the pane.** `job` (queued, started,
+  done, abandoned) and `tool_call` only move the status line; a refused or
+  failed job also leaves a line in its channel. Every other event,
+  including unknown ones, becomes a pane line from its text form, in its
+  channel or the focused one.
+- **Join requests and errors lead the status line**, ahead of the bot and
+  turn segments, so a narrow terminal still shows them.
+- **No timestamps.** There is no time crate in the tree and none was added.
+
+What the web demo did that is now gone:
+
+- Several identities in one process, one browser tab each. Two identities
+  now need two terminals and two `--data-dir`s.
+- Clickable invite links. An invite is printed in the pane on `/create`
+  and by `/invite`, and copied with the terminal's own selection (mouse
+  capture is off for that), but a long invite wraps across rows.
+- The incoming message chime.
+- Its own copy of the bot loop and its 400-byte message split; it never
+  learned long messages. The earlier follow-up "Long messages in the web
+  demo" is moot.
+
+Where the plan was wrong or silent:
+
+- The plan lists a `bot` event for bot state. The announcements are
+  `bot_on` and `bot_off`; `bot` is only `/bot`'s output. All three update
+  the status line.
+- `join_request` under `--auto-accept` needed the `auto` field above.
+- `ratatui::init()` panics if the terminal cannot be set up; `try_init()`
+  is used instead, so that becomes an ordinary error.
+- The mock brain's delay (`TRIAD_AGENT_MOCK_DELAY_MS`) comes before a
+  scripted tool call, which then finishes at once, so the smoke test never
+  showed a tool call in flight. The unit and rendering tests cover it.
+
+Tests (`crates/triad/src/tui/`): `input.rs` (editing, multibyte and wide
+characters, Ctrl-U/Ctrl-W, horizontal scroll); `app.rs` (`App::apply` on
+event values copied from the emit sites: focus and selection, unread
+counts, backlog dedup, bot labels against the plain prompt's, job and
+tool-call state, join requests, errors, unknown events, scrolling);
+`view.rs` with `TestBackend` (a populated screen at 100×30, the status line
+at 140×30, the sidebar hidden at 50×12, tiny sizes, wrapping).
+
+Follow-ups:
+
+- **Copying invites**: an OSC 52 clipboard copy on a key, or an unwrapped
+  invite line.
+- **Input history** (Up/Down) and multi-line input.
+- **Timestamps** if a time crate is ever in the tree.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

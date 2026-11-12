@@ -11,13 +11,16 @@
 //! spaces, each a named channel with its own members and history. Chat mode
 //! opens all of them at once. Plain lines go to the focused channel, and
 //! `/create`, `/join`, `/switch`, `/channels`, `/msg` and `/invite` manage
-//! the rest, as in an IRC client.
+//! the rest, as in an IRC client. `/nick <name>` changes the nickname in
+//! every channel.
 //!
 //! Membership commands in chat mode, for the offline-membership tests:
 //! `/add <node>`, `/remove <node>`, `/promote <node>` (to `Manage`). They act
 //! on the focused channel.
 
 mod bots;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -82,6 +85,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -97,6 +103,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -111,6 +120,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Plain line-based output instead of the full-screen interface.
+        #[arg(long, conflicts_with = "json")]
+        plain: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -164,8 +176,38 @@ enum ProbeCmd {
 struct Opts {
     nickname: Option<String>,
     auto_accept: bool,
-    json: bool,
+    mode: Mode,
     verbose: bool,
+}
+
+/// How a chat session talks to its user.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// One JSON object per line (`--json`), the tested protocol.
+    Json,
+    /// Plain text lines.
+    Plain,
+    /// The full-screen terminal interface.
+    Tui,
+}
+
+impl Mode {
+    /// `--json` wins; then `--plain`, a pipe on stdin or stdout, or a build
+    /// without the `tui` feature mean plain text; otherwise the interface.
+    fn select(json: bool, plain: bool) -> Mode {
+        use std::io::IsTerminal;
+        if json {
+            Mode::Json
+        } else if plain
+            || !cfg!(feature = "tui")
+            || !std::io::stdin().is_terminal()
+            || !std::io::stdout().is_terminal()
+        {
+            Mode::Plain
+        } else {
+            Mode::Tui
+        }
+    }
 }
 
 /// Whether a session runs this user's bots. They run unless `--no-bot` is
@@ -201,13 +243,45 @@ fn main() -> ExitCode {
 }
 
 fn message_sender(message: &StoredMessage, me: &NodeId, profile: Option<String>) -> String {
-    if &message.author == me {
+    sender_name(
+        &message.author == me,
+        &message.author,
+        profile.or_else(|| message.nickname.clone()),
+    )
+}
+
+/// A message author's name: `me`, their nickname (from their profile or
+/// the message), or a short node ID.
+fn sender_name(mine: bool, author: &NodeId, nickname: Option<String>) -> String {
+    if mine {
         "me".into()
     } else {
-        profile
-            .or_else(|| message.nickname.clone())
+        nickname
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| short_id(&message.author))
+            .unwrap_or_else(|| short_id(author))
+    }
+}
+
+/// How a message's author is shown: `my bot` in the DM, `bot` in a
+/// channel, a note that a bot claim was not accepted, or `who`, their name
+/// as [`sender_name`] gives it. Shared by the live display and the
+/// interface's backlog.
+fn author_label(who: String, dm: bool, claimed: bool, accepted: bool) -> String {
+    match (claimed, accepted) {
+        (true, true) if dm => "my bot".to_string(),
+        (true, true) => "bot".to_string(),
+        (true, false) => format!("{who} (bot claim not accepted)"),
+        _ => who,
+    }
+}
+
+/// Whether a bot message from `author` is shown as the channel's bot: in
+/// the DM only this node's, elsewhere only the accepted host's (`host`).
+fn bot_author_accepted(dm: bool, me: &NodeId, host: Option<&NodeId>, author: &NodeId) -> bool {
+    if dm {
+        author == me
+    } else {
+        host == Some(author)
     }
 }
 
@@ -265,48 +339,51 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             relay,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Create { name, relay }, opts, bots)?;
         }
         Cmd::Join {
             invite,
             name,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let invite = Invite::parse(&invite)?;
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Join { invite, name }, opts, bots)?;
         }
         Cmd::Chat {
             channel,
             auto_accept,
             json,
+            plain,
             no_bot,
         } => {
             let opts = Opts {
                 nickname,
                 auto_accept,
-                json,
+                mode: Mode::select(json, plain),
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Resume { channel }, opts, bots)?;
         }
         Cmd::Channels => {
             for g in State::open(&data_dir)?.groups()? {
@@ -478,18 +555,35 @@ enum Start {
 /// Name given to `create` when none is passed.
 const DEFAULT_CHANNEL: &str = "general";
 
+/// Where a session's output goes. Every event is a JSON value with a text
+/// form; the sink decides which is used.
+enum Sink {
+    Text,
+    Json,
+    /// The terminal interface's thread, which gets both.
+    #[cfg(feature = "tui")]
+    Tui(tui::Events),
+}
+
 struct Printer {
-    json: bool,
+    sink: Sink,
     verbose: bool,
 }
 
 impl Printer {
     fn emit(&self, value: serde_json::Value, text: impl FnOnce() -> String) {
-        if self.json {
-            println!("{value}");
-        } else {
-            println!("{}", text());
+        match &self.sink {
+            Sink::Json => println!("{value}"),
+            Sink::Text => println!("{}", text()),
+            #[cfg(feature = "tui")]
+            Sink::Tui(tx) => {
+                let _ = tx.send((value, text()));
+            }
         }
+    }
+
+    fn json(&self) -> bool {
+        matches!(self.sink, Sink::Json)
     }
 
     fn info(&self, text: &str) {
@@ -561,7 +655,46 @@ struct Channel {
     seen_self: bool,
 }
 
-async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Result<()> {
+/// Runs a chat session in the mode `opts` picked. With the terminal
+/// interface, the session's result is returned once the interface has
+/// restored the terminal, so an error prints on the normal screen.
+fn run_chat(
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    start: Start,
+    opts: Opts,
+    bots: BotStart,
+) -> Result<()> {
+    match opts.mode {
+        #[cfg(feature = "tui")]
+        Mode::Tui => {
+            let (events, lines, ui) = tui::spawn(data_dir)?;
+            let result = rt.block_on(chat(
+                data_dir,
+                start,
+                opts,
+                bots,
+                Sink::Tui(events),
+                Some(lines),
+            ));
+            let shown = ui.join();
+            result.and(shown)
+        }
+        Mode::Json => rt.block_on(chat(data_dir, start, opts, bots, Sink::Json, None)),
+        _ => rt.block_on(chat(data_dir, start, opts, bots, Sink::Text, None)),
+    }
+}
+
+/// A chat session. `lines` is where typed lines come from: stdin unless
+/// the terminal interface supplies them.
+async fn chat(
+    data_dir: &Path,
+    start: Start,
+    opts: Opts,
+    bots: BotStart,
+    sink: Sink,
+    lines: Option<mpsc::Receiver<String>>,
+) -> Result<()> {
     let identity = Identity::load_or_create(data_dir)?;
     let me = identity.node_id();
     let state = State::open(data_dir)?;
@@ -625,7 +758,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         channels: BTreeMap::new(),
         focus: [0; 32],
         printer: Printer {
-            json: opts.json,
+            sink,
             verbose: opts.verbose,
         },
         opts,
@@ -683,7 +816,8 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         };
         session.ready()?;
         session.resume_jobs(&mut streams).await;
-        session.event_loop(&mut streams).await
+        let lines = lines.unwrap_or_else(spawn_stdin);
+        session.event_loop(&mut streams, lines).await
     }
     .await;
     for (_, channel) in std::mem::take(&mut session.channels) {
@@ -953,6 +1087,12 @@ impl Session {
         fields.insert("node".into(), json!(hex_id(&self.me)));
         fields.insert("channels".into(), json!(all));
         fields.remove("focused");
+        // Whether this session runs my bots, for the terminal interface.
+        fields.insert("bots".into(), json!(self.bots.is_some()));
+        if let Some(b) = &self.bots {
+            fields.insert("bot_provider".into(), json!(b.agent.provider()));
+            fields.insert("bot_servers".into(), json!(b.agent.servers()));
+        }
         let invite = value["invite"].as_str().map(str::to_string);
         self.printer.emit(value, || {
             let mut s = format!("node    {}\n{}", short_id(&self.me), self.channel_lines());
@@ -982,8 +1122,11 @@ impl Session {
         Ok(())
     }
 
-    async fn event_loop(&mut self, streams: &mut Streams) -> Result<()> {
-        let mut lines = spawn_stdin();
+    async fn event_loop(
+        &mut self,
+        streams: &mut Streams,
+        mut lines: mpsc::Receiver<String>,
+    ) -> Result<()> {
         loop {
             tokio::select! {
                 line = lines.recv() => {
@@ -1174,6 +1317,27 @@ impl Session {
                     .await?;
                 tracing::info!(member = %short_id(&member), "promoted member");
             }
+            "/nick" => {
+                let name = normalize_nickname(rest)?
+                    .context("usage: /nick <name>")?
+                    .to_owned();
+                self.opts.nickname = Some(name.clone());
+                // Every channel this node is in now; one still waiting to be
+                // let in publishes it on joining, as with --nickname.
+                let joined: Vec<Topic> = self
+                    .channels
+                    .values()
+                    .filter(|c| c.space.is_some())
+                    .map(|c| c.meta.topic)
+                    .collect();
+                for topic in joined {
+                    self.publish_nickname(topic).await?;
+                }
+                self.printer
+                    .emit(json!({"event": "nick", "nickname": name}), || {
+                        format!("you are now {name}")
+                    });
+            }
             "/status" => {
                 let c = self.channel(&focus)?;
                 let counts = self.state.counts(&focus)?;
@@ -1323,12 +1487,7 @@ impl Session {
     /// How a message's author is shown. `who` is their name as
     /// [`message_sender`] gives it.
     fn label(&self, topic: &Topic, who: String, claimed: bool, accepted: bool) -> String {
-        match (claimed, accepted) {
-            (true, true) if self.is_dm(topic) => "my bot".to_string(),
-            (true, true) => "bot".to_string(),
-            (true, false) => format!("{who} (bot claim not accepted)"),
-            _ => who,
-        }
+        author_label(who, self.is_dm(topic), claimed, accepted)
     }
 
     /// Whether this node may add members to the channel (`Manage` access).
@@ -1566,7 +1725,8 @@ impl Session {
                     return Ok(());
                 }
                 self.printer.emit(
-                    json!({"event": "join_request", "channel": name, "member": hex_id(&member)}),
+                    json!({"event": "join_request", "channel": name, "member": hex_id(&member),
+                           "auto": self.opts.auto_accept}),
                     || {
                         format!(
                             "join request for #{name} from {}. Accept? [y/N]{}",
@@ -1594,7 +1754,7 @@ impl Session {
                 ..
             } => {
                 let peer = *remote_node_id.as_bytes();
-                if self.printer.json || self.printer.verbose {
+                if self.printer.json() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_started", "channel": name, "peer": hex_id(&peer),
                                "incoming_ops": incoming_operations, "incoming_bytes": incoming_bytes}),
@@ -1611,7 +1771,7 @@ impl Session {
             } => {
                 let peer = *remote_node_id.as_bytes();
                 let error = error.map(|e| e.to_string());
-                if self.printer.json || self.printer.verbose {
+                if self.printer.json() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_ended", "channel": name, "peer": hex_id(&peer),
                                "received_ops": received_operations, "sent_ops": sent_operations,

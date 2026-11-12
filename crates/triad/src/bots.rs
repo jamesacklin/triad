@@ -234,10 +234,11 @@ impl Session {
     /// channel's bot: only when its author is the channel's accepted host
     /// (in the DM, this node).
     pub fn bot_accepted(&self, topic: &Topic, author: &NodeId) -> bool {
-        if self.is_dm(topic) {
-            return *author == self.me;
-        }
-        matches!(self.state.bot(topic), Ok(Some(b)) if b.host == *author)
+        let host = match self.is_dm(topic) {
+            true => None,
+            false => self.state.bot(topic).ok().flatten().map(|b| b.host),
+        };
+        bot_author_accepted(self.is_dm(topic), &self.me, host.as_ref(), author)
     }
 
     /// The host's view of a channel's members, for the policy.
