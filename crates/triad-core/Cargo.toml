@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# SQLCipher for state.sqlite (HARNESS-PLAN.md H9). Switches the one
+# libsqlite3-sys in the build, p2panda's included, to SQLCipher, linked
+# against the system libcrypto.
+sqlcipher = ["rusqlite/bundled-sqlcipher"]
+
 [dependencies]
 p2panda = { workspace = true }
 p2panda-core = { workspace = true }

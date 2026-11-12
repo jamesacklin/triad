@@ -17,6 +17,8 @@
 //! `/add <node>`, `/remove <node>`, `/promote <node>` (to `Manage`). They act
 //! on the focused channel.
 
+mod bots;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,7 +34,11 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::{StreamExt, StreamMap};
-use triad_core::envelope::{ChatBody, Invite, ProfileUpdate, RoomEvent, normalize_nickname};
+use triad_agent::AgentConfig;
+use triad_agent::policy::Incoming;
+use triad_core::envelope::{
+    ChatBody, Invite, ProfileUpdate, RoomEvent, SEND_TEXT_BYTES, normalize_nickname,
+};
 use triad_core::identity::{Identity, NodeId, hex_id, short_id};
 use triad_core::net::{DEFAULT_RELAY, P2PANDA_FILE};
 use triad_core::state::{
@@ -74,6 +80,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Run my bots in this session (see HARNESS-PLAN.md).
+        #[arg(long)]
+        agent: bool,
     },
     /// Join a channel from an invite, wait to be added, enter chat mode.
     Join {
@@ -85,6 +94,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Run my bots in this session.
+        #[arg(long)]
+        agent: bool,
     },
     /// Open every channel in chat mode.
     Chat {
@@ -95,6 +107,9 @@ enum Cmd {
         auto_accept: bool,
         #[arg(long)]
         json: bool,
+        /// Run my bots in this session.
+        #[arg(long)]
+        agent: bool,
     },
     /// List the channels in this data directory.
     Channels,
@@ -146,6 +161,18 @@ struct Opts {
     auto_accept: bool,
     json: bool,
     verbose: bool,
+}
+
+/// The bot configuration, read from the environment when `--agent` is
+/// given. A bad configuration is a usage error: exit code 2.
+fn agent_config(agent: bool) -> Result<Option<AgentConfig>, ExitCode> {
+    if !agent {
+        return Ok(None);
+    }
+    AgentConfig::from_env().map(Some).map_err(|e| {
+        eprintln!("error: {e}");
+        ExitCode::from(2)
+    })
 }
 
 fn main() -> ExitCode {
@@ -224,6 +251,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             relay,
             auto_accept,
             json,
+            agent,
         } => {
             let opts = Opts {
                 nickname,
@@ -231,13 +259,18 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts))?;
+            let agent = match agent_config(agent) {
+                Ok(a) => a,
+                Err(code) => return Ok(code),
+            };
+            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts, agent))?;
         }
         Cmd::Join {
             invite,
             name,
             auto_accept,
             json,
+            agent,
         } => {
             let invite = Invite::parse(&invite)?;
             let opts = Opts {
@@ -246,12 +279,17 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts))?;
+            let agent = match agent_config(agent) {
+                Ok(a) => a,
+                Err(code) => return Ok(code),
+            };
+            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts, agent))?;
         }
         Cmd::Chat {
             channel,
             auto_accept,
             json,
+            agent,
         } => {
             let opts = Opts {
                 nickname,
@@ -259,7 +297,11 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 json,
                 verbose,
             };
-            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts))?;
+            let agent = match agent_config(agent) {
+                Ok(a) => a,
+                Err(code) => return Ok(code),
+            };
+            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts, agent))?;
         }
         Cmd::Channels => {
             for g in State::open(&data_dir)?.groups()? {
@@ -278,6 +320,9 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             let meta = pick(&state, channel.as_deref())?;
             if meta.status != JoinStatus::Joined {
                 bail!("not a member of #{} yet", meta.name);
+            }
+            if state.dm_topic()? == Some(meta.topic) {
+                bail!("#{} is your bot DM; it never gains a member", meta.name);
             }
             println!("{}", invite_to(&meta, &me)?);
         }
@@ -304,7 +349,12 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 lines.drain(..lines.len() - limit);
             }
             for (_, name, m, profile) in lines {
-                let who = message_sender(&m, &me, profile);
+                let base = message_sender(&m, &me, profile);
+                let who = match (m.author == me, m.bot) {
+                    (true, true) => "my bot".into(),
+                    (false, true) => format!("{base} (bot)"),
+                    _ => base,
+                };
                 if channel.is_some() {
                     println!("{}: {}", who, m.text);
                 } else {
@@ -455,6 +505,15 @@ fn parse_node(text: &str) -> Result<NodeId> {
         .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
 }
 
+/// Whether a typed line addresses the channel's bot: `@bot` as a word
+/// anywhere in it. Only the sender's client reads the text; bots read `ask`.
+fn addresses_bot(text: &str) -> bool {
+    text.split_whitespace().any(|w| {
+        w.trim_matches(|c: char| !c.is_alphanumeric() && c != '@')
+            .eq_ignore_ascii_case("@bot")
+    })
+}
+
 fn access_name(a: AccessLevel) -> &'static str {
     match a {
         AccessLevel::Pull => "pull",
@@ -481,6 +540,10 @@ type Topic = [u8; 32];
 struct Streams {
     subs: StreamMap<Topic, SpaceSubscription<RoomEvent>>,
     joining: JoinSet<(Topic, Result<Space<RoomEvent>, String>)>,
+    /// Bot turns running off the event loop.
+    jobs: JoinSet<bots::JobDone>,
+    /// Display lines from bot turns (tool calls).
+    bot_events: mpsc::UnboundedReceiver<bots::BotEvent>,
 }
 
 impl Streams {
@@ -499,7 +562,7 @@ struct Channel {
     seen_self: bool,
 }
 
-async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
+async fn chat(data_dir: &Path, start: Start, opts: Opts, agent: Option<AgentConfig>) -> Result<()> {
     let identity = Identity::load_or_create(data_dir)?;
     let me = identity.node_id();
     let state = State::open(data_dir)?;
@@ -508,9 +571,10 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
     // This node's relay for new channels and invites: the one its first
     // channel uses, so a restart with no arguments listens where peers expect.
     let home_relay = match (&start, groups.first()) {
-        (Start::Resume { .. }, None) => {
+        (Start::Resume { .. }, None) if agent.is_none() => {
             bail!("no channels in this data directory; run `create` or `join`")
         }
+        (Start::Resume { .. }, None) => DEFAULT_RELAY.to_string(),
         (_, Some(first)) => first.relay.clone(),
         (Start::Create { relay, .. }, None) => {
             relay.clone().unwrap_or_else(|| DEFAULT_RELAY.to_string())
@@ -543,7 +607,12 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
     }
     let node = builder.spawn().await.context("spawning p2panda node")?;
 
+    let dm = state.dm_topic()?;
+    let (bot_events_tx, bot_events_rx) = mpsc::unbounded_channel();
     let mut session = Session {
+        dm,
+        bots: None,
+        bot_events: bot_events_tx,
         me,
         identity,
         node,
@@ -561,17 +630,28 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
     let mut streams = Streams {
         subs: StreamMap::new(),
         joining: JoinSet::new(),
+        jobs: JoinSet::new(),
+        bot_events: bot_events_rx,
     };
     let first = groups.first().map(|g| g.topic);
     for meta in groups {
         session.open(meta, &mut streams).await?;
     }
     let result = async {
+        if let Some(config) = &agent {
+            session.start_bots(config, data_dir, &mut streams).await?;
+        }
         session.focus = match start {
             Start::Create { name, relay } => {
-                session
+                let topic = session
                     .create_channel(name.as_deref(), relay, &mut streams)
-                    .await?
+                    .await?;
+                // Creating a channel while running with --agent offers my
+                // bot to it.
+                if session.bots.is_some() {
+                    session.bot_on(topic).await?;
+                }
+                topic
             }
             Start::Join { invite, name } => {
                 session
@@ -581,9 +661,14 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts) -> Result<()> {
             Start::Resume {
                 channel: Some(name),
             } => session.resolve(&name)?,
-            Start::Resume { channel: None } => first.expect("checked above"),
+            // With --agent, chat opens on the personal bot's DM.
+            Start::Resume { channel: None } => match (session.bots.is_some(), session.dm) {
+                (true, Some(dm)) => dm,
+                _ => first.expect("checked above"),
+            },
         };
         session.ready()?;
+        session.resume_jobs(&mut streams).await;
         session.event_loop(&mut streams).await
     }
     .await;
@@ -610,6 +695,12 @@ struct Session {
     opts: Opts,
     /// Join requests waiting for an answer, oldest first.
     asks: VecDeque<(Topic, NodeId)>,
+    /// The personal bot's DM, once created (with or without `--agent`).
+    dm: Option<Topic>,
+    /// The bots, when running with `--agent`.
+    bots: Option<bots::Bots>,
+    /// Where bot turns send display lines.
+    bot_events: mpsc::UnboundedSender<bots::BotEvent>,
 }
 
 fn spawn_stdin() -> mpsc::Receiver<String> {
@@ -780,7 +871,7 @@ impl Session {
     }
 
     fn channel_json(&self, c: &Channel) -> Result<serde_json::Value> {
-        let invite = (c.meta.status == JoinStatus::Joined)
+        let invite = (c.meta.status == JoinStatus::Joined && !self.is_dm(&c.meta.topic))
             .then(|| invite_to(&c.meta, &self.me))
             .transpose()?;
         Ok(json!({
@@ -877,9 +968,16 @@ impl Session {
                     Err(e) => self.printer.error(&format!("joining a channel failed: {e}")),
                 },
                 Some((topic, ev)) = streams.subs.next() => {
-                    if let Err(e) = self.on_event(topic, ev).await {
+                    if let Err(e) = self.on_event(topic, ev, streams).await {
                         self.printer.error(&format!("{e:#}"));
                     }
+                }
+                Some(done) = streams.jobs.join_next() => match done {
+                    Ok(done) => self.on_job_done(done, streams).await,
+                    Err(e) => self.printer.error(&format!("a bot turn failed: {e}")),
+                },
+                Some((value, text)) = streams.bot_events.recv() => {
+                    self.printer.emit(value, || text);
                 }
                 _ = tokio::signal::ctrl_c() => break,
             }
@@ -958,6 +1056,9 @@ impl Session {
                 }
                 let topic = self.create_channel(Some(rest), None, streams).await?;
                 self.added(topic)?;
+                if self.bots.is_some() {
+                    self.bot_on(topic).await?;
+                }
             }
             "/join" => {
                 let mut words = rest.split_whitespace();
@@ -975,6 +1076,9 @@ impl Session {
                 let c = self.channel(&topic)?;
                 if c.meta.status != JoinStatus::Joined {
                     bail!("not a member of #{} yet", c.meta.name);
+                }
+                if self.is_dm(&topic) {
+                    bail!("#{} is your bot DM; it never gains a member", c.meta.name);
                 }
                 let invite = invite_to(&c.meta, &self.me)?;
                 self.printer.emit(
@@ -1010,6 +1114,12 @@ impl Session {
                     },
                 );
             }
+            "/add" | "/promote" if self.is_dm(&focus) => {
+                bail!(
+                    "#{} is your bot DM; it never gains a member",
+                    self.name(&focus)
+                )
+            }
             "/add" => self.add(focus, parse_node(rest)?).await?,
             "/remove" => {
                 let member = parse_node(rest)?;
@@ -1037,7 +1147,11 @@ impl Session {
                     counts.failed
                 ));
             }
-            other => self.printer.error(&format!("unknown command {other}")),
+            other => {
+                if !self.on_bot_command(other, rest).await? {
+                    self.printer.error(&format!("unknown command {other}"))
+                }
+            }
         }
         Ok(true)
     }
@@ -1051,7 +1165,17 @@ impl Session {
             ));
             return Ok(());
         };
-        let body = RoomEvent::Chat(ChatBody::new(text, now_ms())?);
+        if text.len() > SEND_TEXT_BYTES {
+            bail!(
+                "message is {} bytes; spaces can carry at most {SEND_TEXT_BYTES} today",
+                text.len()
+            );
+        }
+        let ask = addresses_bot(text);
+        if ask && !self.has_bot(&topic) {
+            bail!("#{} has no bot", channel.meta.name);
+        }
+        let body = RoomEvent::Chat(ChatBody::new(text, now_ms())?.asking(ask));
         // The plaintext is stored when our own operation comes back through
         // the stream; spaces do not return its hash here.
         space.publish(body).await?;
@@ -1140,6 +1264,19 @@ impl Session {
         }
     }
 
+    /// Who a message is shown as: `me`, a short node ID, `my bot:` in the
+    /// DM, `bot` in a channel, or a note that a bot claim was not accepted.
+    /// How a message's author is shown. `who` is their name as
+    /// [`message_sender`] gives it.
+    fn label(&self, topic: &Topic, who: String, claimed: bool, accepted: bool) -> String {
+        match (claimed, accepted) {
+            (true, true) if self.is_dm(topic) => "my bot".to_string(),
+            (true, true) => "bot".to_string(),
+            (true, false) => format!("{who} (bot claim not accepted)"),
+            _ => who,
+        }
+    }
+
     /// Whether this node may add members to the channel (`Manage` access).
     async fn can_manage(&self, topic: &Topic) -> bool {
         let Some(space) = self.channels.get(topic).and_then(|c| c.space.as_ref()) else {
@@ -1153,7 +1290,12 @@ impl Session {
         }
     }
 
-    async fn on_event(&mut self, topic: Topic, ev: StreamEvent<RoomEvent>) -> Result<()> {
+    async fn on_event(
+        &mut self,
+        topic: Topic,
+        ev: StreamEvent<RoomEvent>,
+        streams: &mut Streams,
+    ) -> Result<()> {
         let name = self.name(&topic).to_string();
         match ev {
             StreamEvent::Processed { operation, .. } => {
@@ -1180,21 +1322,76 @@ impl Session {
                     sent_at_ms: body.sent_at_ms,
                     op_ts: Some(operation.timestamp()),
                     text: body.text.clone(),
+                    bot: body.bot,
                     nickname: body.nickname().map(str::to_owned),
                 };
-                self.state
-                    .record(&topic, &hash, Outcome::Ok, None, Some(&msg))?;
+                let incoming = Incoming {
+                    author,
+                    bot: body.bot,
+                    ask: body.ask,
+                    ctl: body.ctl.is_some(),
+                    at_ms: operation.timestamp() / 1000,
+                };
+                let job = self.bot_job(topic, hash, &incoming).await?;
+                self.state.record_with_job(
+                    &topic,
+                    &hash,
+                    Outcome::Ok,
+                    None,
+                    Some(&msg),
+                    job.as_ref(),
+                )?;
+                if let Some(ctl) = &body.ctl {
+                    self.on_control(topic, author, ctl).await?;
+                }
                 let mine = author == self.me;
                 let profile = self.state.profile(&topic, &author)?;
-                let who = message_sender(&msg, &self.me, profile.clone());
-                let nickname = profile.or(msg.nickname).filter(|name| !name.is_empty());
-                self.printer.emit(
-                    json!({"event": "message", "channel": name, "author": hex_id(&author),
-                           "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
-                           "ts": operation.timestamp() / 1000}),
-                    || format!("[#{name}] {who}: {}", body.text),
-                );
+                let base = message_sender(&msg, &self.me, profile.clone());
+                let nickname = profile
+                    .or_else(|| msg.nickname.clone())
+                    .filter(|name| !name.is_empty());
+                let shown_as_bot = body.bot && self.bot_accepted(&topic, &author);
+                let who = self.label(&topic, base, body.bot, shown_as_bot);
+                let mut value = json!({"event": "message", "channel": name, "author": hex_id(&author),
+                       "text": body.text, "nickname": nickname, "op": hex::encode(hash), "mine": mine,
+                       "ts": operation.timestamp() / 1000,
+                       "bot": shown_as_bot, "ask": body.ask});
+                if body.bot && !shown_as_bot {
+                    value["bot_claim"] = json!("not accepted");
+                }
+                self.printer
+                    .emit(value, || format!("[#{name}] {who}: {}", body.text));
                 operation.ack().await?;
+                if let Some(job) = job {
+                    self.emit_job(
+                        &topic,
+                        &hash,
+                        &job.asker,
+                        job.state,
+                        job.reason.as_deref(),
+                        None,
+                    );
+                    if job.state == triad_core::state::JobState::Queued {
+                        self.pump(topic, streams).await;
+                    }
+                }
+            }
+            StreamEvent::Member(vk) if self.is_dm(&topic) => {
+                // The bot DM never gains a member: decline without asking,
+                // even under --auto-accept.
+                let member = *vk.as_bytes();
+                if member != self.me {
+                    self.printer.emit(
+                        json!({"event": "join_declined", "channel": name, "member": hex_id(&member),
+                               "reason": "bot DM"}),
+                        || {
+                            format!(
+                                "declined {} for #{name}: your bot DM never gains a member",
+                                short_id(&member)
+                            )
+                        },
+                    );
+                }
             }
             StreamEvent::Member(vk) => {
                 let member = *vk.as_bytes();
@@ -1283,5 +1480,20 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_bot_is_a_word_anywhere() {
+        assert!(addresses_bot("@bot add this"));
+        assert!(addresses_bot("hey @bot, add this"));
+        assert!(addresses_bot("add this @Bot"));
+        assert!(!addresses_bot("email bot@example.com"));
+        assert!(!addresses_bot("@bottle"));
+        assert!(!addresses_bot("no address"));
     }
 }

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::Mutex};
 use triad_core::{
-    envelope::{ChatBody, Invite, normalize_nickname},
+    envelope::{ChatBody, Invite, SEND_TEXT_BYTES, normalize_nickname},
     state::now_ms,
 };
 
@@ -146,6 +146,12 @@ impl App {
                 let text = input.text.trim();
                 if text.is_empty() || text.contains(['\n', '\r']) {
                     return Err(bad_request("enter one line of text"));
+                }
+                if text.len() > SEND_TEXT_BYTES {
+                    return Err(bad_request(format!(
+                        "message is {} bytes; spaces can carry at most {SEND_TEXT_BYTES} today",
+                        text.len()
+                    )));
                 }
                 let message = ChatBody::new(text, now_ms()).map_err(bad_request)?;
                 publish(&account, Outgoing::Chat(message)).await

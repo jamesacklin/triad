@@ -253,6 +253,7 @@ impl Account {
                                         sent_at_ms: body.sent_at_ms,
                                         op_ts: Some(operation.timestamp()),
                                         text: body.text.clone(),
+                                        bot: body.bot,
                                         nickname: body.nickname().map(str::to_owned),
                                     };
                                     store.record(&meta.topic, &hash, Outcome::Ok, None, Some(&message))?;
