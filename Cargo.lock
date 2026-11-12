@@ -5472,6 +5472,7 @@ dependencies = [
  "ciborium",
  "hex",
  "p2panda",
+ "p2panda-core",
  "rusqlite",
  "serde",
  "tempfile",
@@ -5488,6 +5489,25 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "triad-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "p2panda",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "triad-core",
 ]
 
 [[package]]

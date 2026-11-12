@@ -191,7 +191,7 @@ impl Session {
                 c.meta.name
             );
         }
-        let (space, rx) = self.node.create_space::<ChatBody>().await?;
+        let (space, rx) = self.node.create_space::<RoomEvent>().await?;
         let topic = *space.id().as_bytes();
         let meta = Meta {
             name: DM_NAME.into(),
@@ -526,7 +526,9 @@ impl Session {
             Ok(turn) => {
                 let published = async {
                     let body = ChatBody::new(&turn.text, now_ms())?.from_bot();
-                    self.joined_space(&topic)?.publish(body).await?;
+                    self.joined_space(&topic)?
+                        .publish(RoomEvent::Chat(body))
+                        .await?;
                     anyhow::Ok(())
                 }
                 .await;
@@ -683,7 +685,9 @@ impl Session {
             bail!("only the channel's creator can run its bot");
         }
         let body = self.bot_on_body()?;
-        self.joined_space(&topic)?.publish(body).await?;
+        self.joined_space(&topic)?
+            .publish(RoomEvent::Chat(body))
+            .await?;
         Ok(())
     }
 
@@ -696,7 +700,9 @@ impl Session {
             bail!("only the channel's creator can run its bot");
         }
         let body = ChatBody::new("This channel's bot is off.", now_ms())?.with_ctl(Control::BotOff);
-        self.joined_space(&topic)?.publish(body).await?;
+        self.joined_space(&topic)?
+            .publish(RoomEvent::Chat(body))
+            .await?;
         Ok(())
     }
 
@@ -910,12 +916,16 @@ impl Session {
                         provider: "forged".into(),
                         servers: vec![],
                     });
-                self.joined_space(&focus)?.publish(body).await?;
+                self.joined_space(&focus)?
+                    .publish(RoomEvent::Chat(body))
+                    .await?;
             }
             "/debug-bot-says" if std::env::var_os("TRIAD_AGENT_TEST_HOOKS").is_some() => {
                 // Test hook: a message with the bot flag from a non-host.
                 let body = ChatBody::new(rest, now_ms())?.from_bot();
-                self.joined_space(&focus)?.publish(body).await?;
+                self.joined_space(&focus)?
+                    .publish(RoomEvent::Chat(body))
+                    .await?;
             }
             _ => return Ok(false),
         }

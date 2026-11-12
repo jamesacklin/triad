@@ -5,10 +5,10 @@
 //! locally unique name, and every operation and message is filed under its
 //! group's topic.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::identity::NodeId;
 
@@ -139,6 +139,7 @@ pub struct StoredMessage {
     pub text: String,
     /// The author's bot wrote it (as the author claimed; see `bots`).
     pub bot: bool,
+    pub nickname: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -247,7 +248,7 @@ impl State {
     }
 
     pub fn open_path(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         if let Some(key) = std::env::var(STATE_KEY_ENV).ok().filter(|k| !k.is_empty()) {
             // Must come before any other statement on the connection.
@@ -294,13 +295,22 @@ impl State {
                  sent_at_ms INTEGER NOT NULL,
                  op_ts INTEGER,
                  text TEXT NOT NULL,
-                 topic BLOB
+                 topic BLOB,
+                 nickname TEXT
+             );
+             CREATE TABLE IF NOT EXISTS room_profiles (
+                 topic BLOB NOT NULL,
+                 author BLOB NOT NULL,
+                 revision INTEGER NOT NULL,
+                 nickname TEXT NOT NULL,
+                 PRIMARY KEY (topic, author)
+             );
+             CREATE TABLE IF NOT EXISTS room_profile_revisions (
+                 topic BLOB PRIMARY KEY,
+                 revision INTEGER NOT NULL
              );",
         )?;
-        migrate_single_group(&conn)?;
-        if !has_column(&conn, "messages", "bot")? {
-            conn.execute_batch("ALTER TABLE messages ADD COLUMN bot INTEGER NOT NULL DEFAULT 0;")?;
-        }
+        migrate_layout(&mut conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS settings (
                  key TEXT PRIMARY KEY,
@@ -426,6 +436,65 @@ impl State {
         Ok(())
     }
 
+    pub fn profiles(&self, topic: &[u8; 32]) -> Result<BTreeMap<NodeId, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT author, nickname FROM room_profiles WHERE topic = ?1")?;
+        let rows = stmt.query_map([topic.as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut profiles = BTreeMap::new();
+        for row in rows {
+            let (author, nickname) = row?;
+            profiles.insert(to_32(&author)?, nickname);
+        }
+        Ok(profiles)
+    }
+
+    pub fn profile(&self, topic: &[u8; 32], author: &NodeId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT nickname FROM room_profiles WHERE topic = ?1 AND author = ?2",
+                params![topic.as_slice(), author.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn next_profile_revision(&self, topic: &[u8; 32]) -> Result<u64> {
+        let revision: i64 = self.conn.query_row(
+            "INSERT INTO room_profile_revisions (topic, revision) VALUES (?1, 1)
+             ON CONFLICT (topic) DO UPDATE SET revision = revision + 1
+             RETURNING revision",
+            [topic.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(revision)?)
+    }
+
+    pub fn record_profile(
+        &self,
+        topic: &[u8; 32],
+        author: &NodeId,
+        revision: u64,
+        nickname: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT INTO room_profiles (topic, author, revision, nickname)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (topic, author) DO UPDATE
+             SET revision = excluded.revision, nickname = excluded.nickname
+             WHERE excluded.revision > room_profiles.revision",
+            params![
+                topic.as_slice(),
+                author.as_slice(),
+                i64::try_from(revision)?,
+                nickname
+            ],
+        )? != 0)
+    }
+
     pub fn outcome(&self, op_hash: &[u8; 32]) -> Result<Option<Outcome>> {
         let s: Option<String> = self
             .conn
@@ -481,8 +550,8 @@ impl State {
         }
         if let Some(m) = message {
             tx.execute(
-                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, bot)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO messages (op_hash, author, sent_at_ms, op_ts, text, topic, bot, nickname)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     m.op_hash.as_slice(),
                     m.author.as_slice(),
@@ -491,6 +560,7 @@ impl State {
                     m.text,
                     topic.as_slice(),
                     m.bot,
+                    m.nickname,
                 ],
             )?;
         }
@@ -523,7 +593,7 @@ impl State {
     /// `limit` messages.
     pub fn history(&self, topic: &[u8; 32], limit: Option<usize>) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT op_hash, author, sent_at_ms, op_ts, text, bot FROM messages
+            "SELECT op_hash, author, sent_at_ms, op_ts, text, bot, nickname FROM messages
              WHERE topic = ?1
              ORDER BY COALESCE(op_ts, sent_at_ms * 1000) ASC, op_hash ASC",
         )?;
@@ -535,11 +605,12 @@ impl State {
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, bool>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (h, a, sent, ts, text, bot) = row?;
+            let (h, a, sent, ts, text, bot, nickname) = row?;
             out.push(StoredMessage {
                 op_hash: to_32(&h)?,
                 author: to_32(&a)?,
@@ -547,6 +618,7 @@ impl State {
                 op_ts: ts.map(|t| t as u64),
                 text,
                 bot,
+                nickname,
             });
         }
         if let Some(limit) = limit
@@ -562,7 +634,7 @@ impl State {
         let row = self
             .conn
             .query_row(
-                "SELECT author, sent_at_ms, op_ts, text, bot, topic FROM messages WHERE op_hash = ?1",
+                "SELECT author, sent_at_ms, op_ts, text, bot, topic, nickname FROM messages WHERE op_hash = ?1",
                 params![op_hash.as_slice()],
                 |r| {
                     Ok((
@@ -572,11 +644,12 @@ impl State {
                         r.get::<_, String>(3)?,
                         r.get::<_, bool>(4)?,
                         r.get::<_, Vec<u8>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(a, sent, ts, text, bot, topic)| {
+        row.map(|(a, sent, ts, text, bot, topic, nickname)| {
             Ok((
                 StoredMessage {
                     op_hash: *op_hash,
@@ -585,6 +658,7 @@ impl State {
                     op_ts: ts.map(|t| t as u64),
                     text,
                     bot,
+                    nickname,
                 },
                 to_32(&topic)?,
             ))
@@ -943,36 +1017,38 @@ impl State {
     }
 }
 
-/// Moves a database written when a data directory held exactly one group
-/// (a single `meta` row, no `topic` columns) to the multi-group layout. The
-/// old group becomes the channel `main`.
-fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-        params![table, column],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-fn migrate_single_group(conn: &Connection) -> Result<()> {
+fn migrate_layout(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let n: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
     for table in ["processed_ops", "messages"] {
-        if !has_column(conn, table, "topic")? {
-            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN topic BLOB;"))?;
+        if !has_column(table, "topic")? {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN topic BLOB;"))?;
         }
     }
-    if !has_column(conn, "meta", "topic")? {
-        return Ok(());
+    if !has_column("messages", "bot")? {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN bot INTEGER NOT NULL DEFAULT 0;")?;
     }
-    conn.execute_batch(
-        "BEGIN;
-         INSERT OR IGNORE INTO groups (topic, name, creator, relay, role, status)
-             SELECT topic, 'main', creator, relay, role, status FROM meta;
-         UPDATE processed_ops SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
-         UPDATE messages SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
-         DROP TABLE meta;
-         COMMIT;",
-    )?;
+    if !has_column("messages", "nickname")? {
+        tx.execute_batch("ALTER TABLE messages ADD COLUMN nickname TEXT;")?;
+    }
+    if has_column("meta", "topic")? {
+        // The old single room becomes the channel called main.
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO groups (topic, name, creator, relay, role, status)
+                 SELECT topic, 'main', creator, relay, role, status FROM meta;
+             UPDATE processed_ops SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
+             UPDATE messages SET topic = (SELECT topic FROM meta) WHERE topic IS NULL;
+             DROP TABLE meta;",
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1012,6 +1088,7 @@ mod tests {
             op_ts: Some(ts),
             text: text.into(),
             bot: hash.is_multiple_of(2),
+            nickname: None,
         }
     }
 
@@ -1053,11 +1130,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut state = State::open(dir.path()).unwrap();
         let (a, b) = ([1; 32], [3; 32]);
-        let (m1, m2, other) = (
+        let (mut m1, m2, other) = (
             msg(1, 1_000, "first"),
             msg(2, 2_000, "second"),
             msg(5, 1_500, "elsewhere"),
         );
+        m1.nickname = Some("Alice".into());
         state
             .record(&a, &[2; 32], Outcome::Ok, None, Some(&m2))
             .unwrap();
@@ -1085,6 +1163,10 @@ mod tests {
             .map(|m| m.bot)
             .collect();
         assert_eq!(bots, [false, true]);
+        assert_eq!(
+            state.history(&a, None).unwrap()[0].nickname.as_deref(),
+            Some("Alice")
+        );
         assert_eq!(texts(&b), ["elsewhere"]);
         assert_eq!(state.history(&a, Some(1)).unwrap()[0].text, "second");
         assert_eq!(state.outcome(&[3; 32]).unwrap(), Some(Outcome::Skipped));
@@ -1212,6 +1294,32 @@ mod tests {
     }
 
     #[test]
+    fn profiles_keep_the_latest_update_per_author_and_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let (room, other, author) = ([1; 32], [2; 32], [3; 32]);
+        {
+            let state = State::open(dir.path()).unwrap();
+            assert_eq!(state.next_profile_revision(&room).unwrap(), 1);
+            assert!(state.record_profile(&room, &author, 2, "Renée").unwrap());
+            assert!(!state.record_profile(&room, &author, 1, "Old").unwrap());
+            assert!(state.record_profile(&other, &author, 1, "Other").unwrap());
+            assert!(state.record_profile(&room, &author, 3, "").unwrap());
+            assert!(!state.record_profile(&room, &author, 2, "Renée").unwrap());
+        }
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.profile(&room, &author).unwrap().as_deref(), Some(""));
+        assert_eq!(state.next_profile_revision(&room).unwrap(), 2);
+        assert_eq!(
+            state
+                .profiles(&other)
+                .unwrap()
+                .get(&author)
+                .map(String::as_str),
+            Some("Other")
+        );
+    }
+
+    #[test]
     fn migrates_a_single_group_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(STATE_FILE);
@@ -1251,7 +1359,9 @@ mod tests {
             assert_eq!(groups.len(), 1);
             assert_eq!(groups[0].name, "main");
             assert_eq!(groups[0].role, Role::Creator);
-            assert_eq!(state.history(&[7; 32], None).unwrap()[0].text, "old");
+            let history = state.history(&[7; 32], None).unwrap();
+            assert_eq!(history[0].text, "old");
+            assert_eq!(history[0].nickname, None);
             assert_eq!(state.counts(&[7; 32]).unwrap().ok, 1);
         }
     }

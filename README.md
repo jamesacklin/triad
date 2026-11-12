@@ -181,6 +181,34 @@ Every message in a bot turn goes to the model provider in plaintext.
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
 
+## Local web demo
+
+`triad-web` serves a small chat page for trying multiple Triad identities
+inside one Rust process. Each identity has its own keys and SQLite files
+and can create or join one p2panda space.
+
+```sh
+cargo run --locked -p triad-web
+```
+
+Open the local address printed at startup (by default
+`http://127.0.0.1:8765`). Create an identity and a room, then copy the
+invite link into a second tab and create a second identity there. The
+raw invite code under **Details** also works with the current CLI via
+`triad join <invite-code>`. To join a CLI-created room in the browser,
+paste its invite code into the **Room invite** field.
+
+The demo binds its web interface to loopback and automatically accepts
+invite holders in rooms it creates. It stores credentials and decrypted
+history under `demo-data/` by default. Use `--data <dir>` to choose another
+directory. After a restart, opening a saved identity reconnects its room.
+The browser enables the incoming message chime after you interact with the
+page. Set a nickname under **Details**. Triad shares the change as an
+encrypted room event. The current name appears on all messages from that
+identity in the room, including earlier ones. Pass `--nickname "Sam"` to set
+your nickname in the channels the CLI opens, or `--nickname ""` to clear it.
+Peers with older clients can still exchange chat and show node IDs.
+
 ## Acceptance run (two machines)
 
 Put the machines on different networks, for example the Mac on home Wi-Fi and

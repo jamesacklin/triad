@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad"]
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad", "crates/triad-web"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Pinned by the spec (exact versions).
 p2panda = "=0.8.0"
+p2panda-core = "=0.8.0"
 iroh = "=1.4.1"
 
 # Supporting crates.

@@ -1,8 +1,10 @@
-//! Wire formats: [`ChatBody`] (one chat message, the payload of a space
-//! operation) and [`Invite`].
+//! Wire formats for room events and invites.
 
 use anyhow::{Context, Result, anyhow, bail};
+use p2panda_core::{Signature, VerifyingKey, identity::Signer};
 use serde::{Deserialize, Serialize};
+
+use crate::identity::{Identity, NodeId};
 
 /// Wire format version used everywhere.
 pub const VERSION: u8 = 1;
@@ -15,6 +17,7 @@ pub const MAX_TEXT_BYTES: usize = 2_000;
 /// in that space: no later message from them is published or synced. 400
 /// leaves a margin. See FINDINGS.md, "Bots", H7.
 pub const SEND_TEXT_BYTES: usize = 400;
+const MAX_NICKNAME_CHARS: usize = 24;
 /// Invite prefix.
 pub const INVITE_PREFIX: &str = "triad1-";
 
@@ -28,6 +31,8 @@ pub struct ChatBody {
     pub v: u8,
     pub sent_at_ms: u64,
     pub text: String,
+    #[serde(default, skip_serializing)]
+    nickname: Option<String>,
     /// True when the author's bot wrote this, not the author.
     #[serde(default, skip_serializing_if = "is_false")]
     pub bot: bool,
@@ -84,6 +89,7 @@ impl ChatBody {
             bot: false,
             ask: false,
             ctl: None,
+            nickname: None,
         })
     }
 
@@ -105,6 +111,10 @@ impl ChatBody {
         self
     }
 
+    pub fn nickname(&self) -> Option<&str> {
+        normalize_nickname(self.nickname.as_deref()?).ok().flatten()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         cbor_encode(self)
     }
@@ -122,6 +132,82 @@ impl ChatBody {
         }
         Ok(body)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RoomEvent {
+    Profile(ProfileUpdate),
+    Chat(ChatBody),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileUpdate {
+    v: u8,
+    profile: String,
+    author: NodeId,
+    revision: u64,
+    signature: Vec<u8>,
+}
+
+impl ProfileUpdate {
+    pub fn sign(
+        identity: &Identity,
+        topic: &[u8; 32],
+        revision: u64,
+        nickname: &str,
+    ) -> Result<Self> {
+        let profile = normalize_nickname(nickname)?.unwrap_or_default().to_owned();
+        let author = identity.node_id();
+        let bytes = profile_bytes(VERSION, topic, &author, revision, &profile)?;
+        Ok(Self {
+            v: VERSION,
+            profile,
+            author,
+            revision,
+            signature: identity
+                .p2panda_credentials()
+                .sign(&bytes)
+                .to_bytes()
+                .to_vec(),
+        })
+    }
+
+    pub fn verify(&self, topic: &[u8; 32]) -> Result<(NodeId, u64, &str)> {
+        if self.v != VERSION {
+            bail!("unsupported profile version {}", self.v);
+        }
+        let name = normalize_nickname(&self.profile)?.unwrap_or_default();
+        let bytes = profile_bytes(self.v, topic, &self.author, self.revision, name)?;
+        let signature = Signature::try_from(self.signature.as_slice())?;
+        if !VerifyingKey::from_bytes(&self.author)?.verify(&bytes, &signature) {
+            bail!("invalid profile signature");
+        }
+        Ok((self.author, self.revision, name))
+    }
+}
+
+fn profile_bytes(
+    v: u8,
+    topic: &[u8; 32],
+    author: &NodeId,
+    revision: u64,
+    nickname: &str,
+) -> Result<Vec<u8>> {
+    // Spaces can deliver several buffered payloads with one outer operation's metadata.
+    cbor_encode(&("triad-room-profile", v, topic, author, revision, nickname))
+}
+
+pub fn normalize_nickname(raw: &str) -> Result<Option<&str>> {
+    let name = raw.trim();
+    if name.chars().count() > MAX_NICKNAME_CHARS
+        || name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        bail!("nickname must be one line and at most {MAX_NICKNAME_CHARS} characters");
+    }
+    Ok((!name.is_empty()).then_some(name))
 }
 
 /// Invite. Rendered as "triad1-" + lowercase hex of the CBOR bytes.
@@ -192,6 +278,36 @@ pub fn cbor_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_events_keep_the_original_chat_format() {
+        let chat = ChatBody::new("hi", 42).unwrap();
+        let chat_wire = cbor_encode(&RoomEvent::Chat(chat.clone())).unwrap();
+        assert_eq!(ChatBody::decode(&chat_wire).unwrap(), chat);
+        assert_eq!(
+            cbor_decode::<RoomEvent>(&chat_wire).unwrap(),
+            RoomEvent::Chat(chat)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity::load_or_create(dir.path()).unwrap();
+        let topic = [4; 32];
+        let profile = ProfileUpdate::sign(&identity, &topic, 2, "  Renée  ").unwrap();
+        assert_eq!(
+            profile.verify(&topic).unwrap(),
+            (identity.node_id(), 2, "Renée")
+        );
+        assert!(profile.verify(&[5; 32]).is_err());
+        let mut tampered = profile.clone();
+        tampered.profile = "Someone else".into();
+        assert!(tampered.verify(&topic).is_err());
+        let profile_wire = cbor_encode(&RoomEvent::Profile(profile.clone())).unwrap();
+        assert_eq!(
+            cbor_decode::<RoomEvent>(&profile_wire).unwrap(),
+            RoomEvent::Profile(profile)
+        );
+        assert!(ChatBody::decode(&profile_wire).is_err());
+        assert!(ProfileUpdate::sign(&identity, &topic, 3, "two\nlines").is_err());
+    }
 
     #[test]
     fn invite_round_trip() {
