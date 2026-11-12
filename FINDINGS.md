@@ -347,6 +347,7 @@ and fake or fixture tools; none calls a model or a third-party service.
 | H5 | Isolation | pass | `h5` | nothing crossed between DM and channels |
 | H6 | Real MCP | pass | `h6` | rmcp client over stdio and HTTP against a fixture server |
 | H7 | A real model | built; live run handed over | `h7` | rig wiring checked offline; no API key on this host |
+| H8 | The bot in the VM | pass (mock); real-model run handed over | `h8` | 48 MB smallest passing guest; +4 MB peak RSS |
 
 ### H0: dependencies
 
@@ -592,6 +593,39 @@ A test fix on the way: `bots_tools.rs` matched "any bot reply" after an ask,
 so under load another member's late reply could be taken for the asker's
 (it failed once in a full parallel run). Mock replies can now include
 `{ask}`, and the test matches on it.
+
+### H8: the bot in the VM
+
+`scripts/vm/bot-test.sh`: the guest creates `#garden` with `--agent` on the
+mock brain and hosts its bot; `triad` on the host machine joins and asks.
+The guest init now reads `KEY=VALUE` lines from `/etc/triad.env`
+(`VM_ENV` in `run-vm.sh`), and `build.sh` builds `-p triad` (it still named
+the removed `triad-cli` package). x86_64, KVM, one vCPU:
+
+| Guest RAM | Result | Join | Ask to reply | Peak RSS | RssAnon | Free |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 MB | pass | 3.0 s | 0.27 s | 31.6 MB | 14.7 MB | 4.9 MB |
+| 48 MB | pass, slow | 11.2 s | 6.7 s | 22.6 MB | 13.9 MB | 2.6 MB |
+| 40 MB | join did not complete in time | | | | | |
+
+**Smallest guest that passes: 48 MB**, the same as plain `triad`, but at
+48 MB it is slow: binary pages are evicted and read back (peak RSS drops to
+22.6 MB while anonymous memory stays at 13.9 MB). 64 MB is comfortable. The
+same binary without `--agent`, as the joining guest of `chat-test.sh` at
+64 MB, peaks at 27.7 MB with 10.9 MB anonymous (README's earlier 26 to 28
+MB). **The bots cost about 4 MB of peak RSS** (3 to 4 MB of it anonymous:
+brain, tools, a second SQLite connection, the job machinery) **and 4.6 MB of
+binary**: the static, stripped x86_64 `triad` is 23.0 MB against 18.4 MB at
+`75ba1fc`. (The two runs differ in role, creator against joiner, which
+also moves the figure a little.)
+
+Not done here: the manual run on the real model with an HTTP MCP server
+(no API key on this host), so an HTTPS request from the guest, which has no
+certificate store, has not been made; the bundled-roots fallback that would
+serve it is tested only on the host (H0). The guest's kernel was not
+rebuilt: `build.sh` now stops at the kernel step on this host because
+objtool needs libelf headers (`gelf.h`), which are not installed; the
+kernel built earlier the same day, from the same configuration, was used.
 
 ## Agent harness options (2026-11-11)
 

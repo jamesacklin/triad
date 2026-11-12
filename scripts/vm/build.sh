@@ -61,7 +61,7 @@ T_LOWER=${TRIPLE//-/_}
     "CARGO_TARGET_${T_UPPER}_LINKER=$CC" \
     "CC_${T_LOWER}=$CC" \
     "AR_${T_LOWER}=$AR" \
-    cargo build --release --locked -p triad-cli --target "$TRIPLE" \
+    cargo build --release --locked -p triad --target "$TRIPLE" \
       --config 'profile.release.strip=true' \
       --config 'profile.release.lto="fat"' \
       --config 'profile.release.codegen-units=1' \

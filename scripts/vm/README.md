@@ -17,7 +17,8 @@ for every run.
 | [build.sh](build.sh) | Builds static `triad`, the kernel and the init for one architecture into `target/vm/<arch>/`. |
 | [run-vm.sh](run-vm.sh) | Boots the guest once with a given memory size and `triad` arguments. |
 | [chat-test.sh](chat-test.sh) | Host creates a group, the guest joins, each sends one message. Exits 0 on success. |
-| [init.c](init.c) | Guest PID 1: mounts, DNS, runs `triad --json`, prints memory figures, reboots. |
+| [bot-test.sh](bot-test.sh) | The guest creates a channel with `--agent` (mock brain) and hosts its bot; the host joins and asks it. Exits 0 on the bot's reply. |
+| [init.c](init.c) | Guest PID 1: mounts, DNS, sets `/etc/triad.env`, runs `triad --json`, prints memory figures, reboots. |
 | `kernel-*.config` | Kernel options added on top of `tinyconfig`, shared and per architecture. |
 
 ## Prerequisites
@@ -73,6 +74,22 @@ rest is binary pages read from disk. The kernel takes about 9 MB.
 | --- | --- | --- |
 | `triad`, static and stripped | 20.7 MB | 17.8 MB |
 | Kernel image | 2.3 MB (compressed) | 5.4 MB (uncompressed) |
+
+### The bot in the guest (2026-11-11)
+
+`scripts/vm/bot-test.sh x86_64 <MB>`: the guest runs `create --name garden
+--agent --auto-accept` with `TRIAD_AGENT_BRAIN=mock` (set through `VM_ENV`)
+and hosts the channel's bot; a `triad` on the host joins and sends `@bot
+hello from the host`. Same kernel, `triad` 23.0 MB static and stripped.
+
+| Guest RAM | Result | Join | Ask to reply | Peak RSS (VmHWM) | RssAnon | Free |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64 MB | pass | 3.0 s | 0.27 s | 31.6 MB | 14.7 MB | 4.9 MB |
+| 48 MB | pass, slow | 11.2 s | 6.7 s | 22.6 MB | 13.9 MB | 2.6 MB |
+| 40 MB | join did not complete in time | | | | | |
+
+For comparison, the same binary without `--agent` (`chat-test.sh`, guest
+joining) at 64 MB: peak 27.7 MB, RssAnon 10.9 MB, 9.9 MB free.
 
 ## Limits
 

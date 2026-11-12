@@ -1,5 +1,6 @@
 // Minimal PID 1 for the triad test guest. It mounts /proc, /sys and /tmp,
-// copies the DHCP nameserver into /etc/resolv.conf, runs
+// copies the DHCP nameserver into /etc/resolv.conf, sets the KEY=VALUE
+// lines of /etc/triad.env in its environment, runs
 // `triad --data-dir /data <args from /etc/triad.args> --json` with a pipe on
 // stdin, sends one chat line, prints memory figures, sends /quit and reboots.
 #include <stdio.h>
@@ -31,6 +32,15 @@ int main(void) {
     if (in && out) while (fgets(line, sizeof line, in)) if (!strncmp(line, "nameserver", 10)) fputs(line, out);
     if (in) fclose(in);
     if (out) fclose(out);
+
+    FILE *e = fopen("/etc/triad.env", "r");
+    static char env_lines[64][512]; int ne = 0;
+    while (e && ne < 64 && fgets(env_lines[ne], sizeof env_lines[ne], e)) {
+        char *l = env_lines[ne], *eq = strchr(l, '=');
+        l[strcspn(l, "\n")] = 0;
+        if (eq) { *eq = 0; setenv(l, eq + 1, 1); ne++; }
+    }
+    if (e) fclose(e);
 
     char *argv[32]; int n = 0;
     argv[n++] = "/bin/triad"; argv[n++] = "--data-dir"; argv[n++] = "/data";

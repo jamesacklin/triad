@@ -12,6 +12,7 @@
 #   VM_WAIT      seconds the guest waits before sending its line
 #   VM_SETTLE    seconds the guest waits after sending, before measuring
 #   VM_TIMEOUT   seconds before QEMU is killed
+#   VM_ENV       KEY=VALUE lines for triad's environment in the guest
 #   VM_ACCEL     QEMU accelerator (default: kvm for x86_64, tcg for arm64)
 #   VM_CPU       QEMU CPU model
 #   QEMU         QEMU binary
@@ -58,6 +59,7 @@ cp "$A/triad" "$WORK/root/bin/triad"
 cp "$A/init" "$WORK/root/sbin/init"
 echo "$*" >"$WORK/root/etc/triad.args"
 echo "$WAIT $SETTLE" >"$WORK/root/etc/triad.wait"
+printf '%s\n' "${VM_ENV:-}" >"$WORK/root/etc/triad.env"
 mkfs.ext4 -q -d "$WORK/root" -L root "$WORK/rootfs.ext4" 64M
 
 timeout "$TIMEOUT" "$QEMU" -M "$MACHINE" -accel "$ACCEL" -cpu "$CPU" -m "$MEM" -smp 1 \
