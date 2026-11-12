@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::Value;
+use triad_agent::assistant::{self, Memory, Store};
 use triad_agent::context::{self, ContextLimits, HistoryLine, Kind, Turn};
 use triad_agent::policy::{self, ChannelView, Decision, Incoming, Tier, ToolSet};
 use triad_agent::tools::{Audit, offered, servers};
@@ -21,7 +22,7 @@ use triad_agent::{
     Agent, AgentConfig, KEYS_FILE, TurnResult, configured_model, save_key, save_model,
 };
 use triad_core::envelope::Control;
-use triad_core::state::{BotRow, Job, JobState, NewJob};
+use triad_core::state::{BotRow, Job, JobState, MemoryRow, NewJob};
 
 use super::*;
 
@@ -124,6 +125,51 @@ impl Audit for JobAudit {
     }
 }
 
+/// The personal bot's rows, kept in `state.sqlite` through the second
+/// connection worker tasks use.
+struct StateStore(Arc<Mutex<State>>);
+
+impl StateStore {
+    fn db(&self) -> std::sync::MutexGuard<'_, State> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn memory(m: MemoryRow) -> Memory {
+    Memory {
+        id: m.id,
+        text: m.text,
+        pinned: m.pinned,
+        created_at_ms: m.created_at_ms,
+    }
+}
+
+/// A storage error as the model sees it; the detail goes to the log.
+fn store_error(e: anyhow::Error) -> String {
+    tracing::error!("bot store: {e:#}");
+    "the bot's storage failed; see triad.log".to_string()
+}
+
+impl Store for StateStore {
+    fn memory_count(&self) -> Result<u64, String> {
+        self.db().memory_count().map_err(store_error)
+    }
+    fn memory_save(&self, text: &str, pinned: bool) -> Result<i64, String> {
+        self.db().memory_save(text, pinned).map_err(store_error)
+    }
+    fn memory_search(&self, query: &str, count: usize) -> Result<Vec<Memory>, String> {
+        let rows = self.db().memory_search(query, count).map_err(store_error)?;
+        Ok(rows.into_iter().map(memory).collect())
+    }
+    fn memory_forget(&self, id: i64) -> Result<bool, String> {
+        self.db().memory_forget(id).map_err(store_error)
+    }
+    fn memory_pinned(&self) -> Result<Vec<Memory>, String> {
+        let rows = self.db().memory_pinned().map_err(store_error)?;
+        Ok(rows.into_iter().map(memory).collect())
+    }
+}
+
 fn access_level(a: AccessLevel) -> policy::Access {
     match a {
         AccessLevel::Manage => policy::Access::Manage,
@@ -148,7 +194,9 @@ impl Session {
     pub async fn start_bots(&mut self, config: &AgentConfig, streams: &mut Streams) -> Result<()> {
         let data_dir = self.data_dir.clone();
         let data_dir = data_dir.as_path();
-        let agent = Agent::start(config, data_dir).await?;
+        let audit_db = Arc::new(Mutex::new(State::open(data_dir)?));
+        let store: Arc<dyn Store> = Arc::new(StateStore(audit_db.clone()));
+        let agent = Agent::start(config, data_dir, Some(store)).await?;
         for w in &agent.warnings {
             self.printer.info(w);
         }
@@ -164,7 +212,7 @@ impl Session {
         }
         self.bots = Some(Bots {
             agent: Arc::new(agent),
-            audit_db: Arc::new(Mutex::new(State::open(data_dir)?)),
+            audit_db,
             busy: BTreeSet::new(),
         });
         self.ensure_dm(streams).await?;
@@ -507,6 +555,19 @@ impl Session {
         };
         let host = short_id(&self.me);
         let asker = short_id(&job.asker);
+        // Pinned memories go to the DM's turns only; a channel turn never
+        // reads them.
+        let notes = if dm {
+            let pinned: Vec<Memory> = self
+                .state
+                .memory_pinned()?
+                .into_iter()
+                .map(memory)
+                .collect();
+            assistant::pinned_notes(&pinned)
+        } else {
+            Vec::new()
+        };
         Ok(context::build(
             Turn {
                 kind,
@@ -521,6 +582,7 @@ impl Session {
                 tools,
                 unavailable,
                 host: &host,
+                notes: &notes,
             },
             ContextLimits::default(),
         ))
@@ -1064,6 +1126,48 @@ impl Session {
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
+                    },
+                );
+            }
+            "/memory" => {
+                let rows = self.state.memory_search(rest.trim(), 50)?;
+                let list: Vec<Value> = rows
+                    .iter()
+                    .map(|m| {
+                        json!({"id": m.id, "text": m.text, "pinned": m.pinned,
+                                    "created_at_ms": m.created_at_ms})
+                    })
+                    .collect();
+                let lines: Vec<String> = rows
+                    .into_iter()
+                    .map(|m| assistant::memory_line(&memory(m)))
+                    .collect();
+                self.printer.emit(
+                    json!({"event": "memory", "query": rest.trim(), "memories": list}),
+                    || {
+                        if lines.is_empty() {
+                            "no saved memories match".to_string()
+                        } else {
+                            lines.join("\n")
+                        }
+                    },
+                );
+            }
+            "/forget" => {
+                let id: i64 = rest
+                    .trim()
+                    .trim_start_matches('#')
+                    .parse()
+                    .context("usage: /forget <id>")?;
+                let removed = self.state.memory_forget(id)?;
+                self.printer.emit(
+                    json!({"event": "forgot", "id": id, "removed": removed}),
+                    || {
+                        if removed {
+                            format!("forgot memory #{id}")
+                        } else {
+                            format!("no memory #{id}")
+                        }
                     },
                 );
             }

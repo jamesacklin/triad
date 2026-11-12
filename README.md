@@ -255,6 +255,19 @@ get every tool apply to them unchanged.
 | `web.fetch` | Fetches a public page over http or https and returns its text. No JavaScript, no logins. The request comes from your machine, so the site sees your address. |
 | `time.now` | The date and time in UTC. |
 
+In your DM (`#agent`) only, the personal bot also has a memory that lasts
+between conversations:
+
+| Tool | What it does |
+| --- | --- |
+| `memory.save` | Saves a fact, preference or note (at most 2,000 bytes; at most 2,000 memories). A pinned one is shown to the bot in every DM turn (2,000 bytes of them in all). |
+| `memory.search` | Finds memories by their words, newest first. |
+| `memory.forget` | Deletes one by its ID. |
+
+Memories are rows in `state.sqlite` (encrypted with it under SQLCipher).
+Channel turns are never offered these tools and never see a memory, and a
+channel is not told they exist.
+
 `web.fetch` connects only to public addresses. It refuses this machine,
 private and shared networks and link-local addresses, and checks every
 redirect, so nobody can have your bot read your own network. A tool's result
@@ -269,6 +282,7 @@ or `time` is left out, with a warning at start.
 | `/grant <node> <server.tool \| server.*>`, `/revoke <node> [pattern]`, `/grants` | Edit grants in the focused channel. Host only. |
 | `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
 | `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
+| `/memory [query]`, `/forget <id>` | List (or search) what your personal bot remembers, or delete one memory. |
 
 ## Terminal interface
 

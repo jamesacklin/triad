@@ -4,6 +4,10 @@
 //! A string said only in the DM never appears in a channel turn; a string
 //! said only in `#garden` never appears in a DM turn or an `#other` turn; the
 //! DM turn's tool list contains nothing that reads or posts to a channel.
+//!
+//! A2: a memory saved in the DM never appears in any channel turn's input;
+//! a channel turn is offered no `memory.*` tool, and a scripted call to one
+//! from a channel is refused by the gate.
 
 use std::collections::BTreeSet;
 
@@ -29,6 +33,13 @@ fn turns_see_only_their_own_channel() {
     let work = tempfile::tempdir().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let mock_log = work.path().join("mock.log");
+    let script = work.path().join("script");
+    std::fs::write(
+        &script,
+        "remember the okapi => call memory.save {\"text\": \"memory-only-okapi\", \"pinned\": true} => {result}\n\
+         @bot garden recall => call memory.search {\"query\": \"okapi\"} => {result}\n",
+    )
+    .unwrap();
     let fake = work.path().join("fake.json");
     std::fs::write(
         &fake,
@@ -40,6 +51,7 @@ fn turns_see_only_their_own_channel() {
     let env = [
         ("TRIAD_AGENT_BRAIN", "mock"),
         ("TRIAD_AGENT_MOCK_LOG", mock_log.to_str().unwrap()),
+        ("TRIAD_AGENT_MOCK_SCRIPT", script.to_str().unwrap()),
         ("TRIAD_AGENT_TOOLS", "fake"),
         ("TRIAD_AGENT_FAKE_TOOLS", fake.to_str().unwrap()),
     ];
@@ -62,6 +74,14 @@ fn turns_see_only_their_own_channel() {
     a.wait_for("switched", |v| is_event(v, "switched"));
     a.send("dm-only-zebra");
     reply_to(&mut a, "agent", "dm-only-zebra");
+    a.send("remember the okapi");
+    a.wait_for("saved", |v| {
+        is_event(v, "message")
+            && v["bot"] == true
+            && v["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("Saved as memory"))
+    });
 
     a.send("/msg garden garden-only-walrus");
     a.send("/msg garden @bot garden ask");
@@ -69,6 +89,24 @@ fn turns_see_only_their_own_channel() {
 
     a.send("/msg other @bot other ask");
     reply_to(&mut a, "other", "@bot other ask");
+
+    // The host asks the channel's bot to search memory: refused by the
+    // gate, so the reply carries no memory.
+    a.send("/msg garden @bot garden recall");
+    let recall = a.wait_for("recall refused", |v| {
+        is_event(v, "message")
+            && v["bot"] == true
+            && v["channel"] == "garden"
+            && v["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("memory.search"))
+    });
+    let recall_text = recall["text"].as_str().unwrap();
+    assert!(
+        recall_text.contains("only available in the personal DM"),
+        "{recall_text}"
+    );
+    assert!(!recall_text.contains("okapi"), "{recall_text}");
 
     a.send("dm second ask");
     reply_to(&mut a, "agent", "dm second ask");
@@ -79,7 +117,7 @@ fn turns_see_only_their_own_channel() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(turns.len(), 4, "{turns:#?}");
+    assert_eq!(turns.len(), 6, "{turns:#?}");
     let find = |ask: &str| -> (Value, String) {
         let t = turns.iter().find(|t| t["ask"] == ask).unwrap().clone();
         let text = t.to_string();
@@ -111,17 +149,46 @@ fn turns_see_only_their_own_channel() {
     );
     assert!(!dm2_text.contains("walrus"), "#garden text in a DM turn");
 
-    // The DM turn's tools are the host's MCP tools only: nothing that reads
-    // or posts to a channel exists to offer.
-    let names: BTreeSet<&str> = dm2["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
+    // The DM turn's tools are the host's MCP tools and the DM's own memory:
+    // nothing that reads or posts to a channel exists to offer.
+    let names = |t: &Value| -> BTreeSet<String> {
+        t["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
     assert_eq!(
-        names,
-        BTreeSet::from(["calendar.create_event", "linear.create_issue"])
+        names(&dm2),
+        BTreeSet::from(
+            [
+                "calendar.create_event",
+                "linear.create_issue",
+                "memory.forget",
+                "memory.save",
+                "memory.search"
+            ]
+            .map(String::from)
+        )
     );
+    // The pinned memory reaches the DM's next turn...
+    assert!(
+        dm2_text.contains("memory-only-okapi"),
+        "control: DM sees memory"
+    );
+    // ...and no channel turn, whose tools include no memory tool.
+    for t in turns.iter().filter(|t| t["kind"] == "channel") {
+        let text = t.to_string();
+        assert!(!text.contains("okapi"), "memory in a channel turn: {text}");
+        assert!(
+            !text.contains("memory"),
+            "memory named in a channel turn: {text}"
+        );
+        assert!(
+            names(t).iter().all(|n| !n.starts_with("memory.")),
+            "a channel turn was offered a memory tool"
+        );
+    }
     let _ = BIN;
 }

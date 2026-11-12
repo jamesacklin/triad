@@ -57,6 +57,8 @@ pub const COMMANDS: &[Command] = &[
     c("/block", "<node>", "your bots never answer this node"),
     c("/unblock", "<node>", "answer this node again"),
     c("/audit", "[N]", "the focused channel's last tool calls"),
+    c("/memory", "[query]", "what your bot remembers"),
+    c("/forget", "<id>", "delete one of your bot's memories"),
     c("/quit", "", "leave"),
 ];
 

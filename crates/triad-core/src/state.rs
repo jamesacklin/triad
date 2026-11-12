@@ -384,7 +384,28 @@ impl State {
              );
              CREATE INDEX IF NOT EXISTS long_waiting_hash ON long_waiting (hash);
              CREATE INDEX IF NOT EXISTS messages_topic ON messages (topic);
-             CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);",
+             CREATE INDEX IF NOT EXISTS processed_ops_topic ON processed_ops (topic);
+             CREATE TABLE IF NOT EXISTS bot_memory (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 text TEXT NOT NULL,
+                 pinned INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS bot_memory_fts USING fts5(
+                 text, content='bot_memory', content_rowid='id'
+             );
+             CREATE TRIGGER IF NOT EXISTS bot_memory_ai AFTER INSERT ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (rowid, text) VALUES (new.id, new.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS bot_memory_ad AFTER DELETE ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (bot_memory_fts, rowid, text)
+                 VALUES ('delete', old.id, old.text);
+             END;
+             CREATE TRIGGER IF NOT EXISTS bot_memory_au AFTER UPDATE OF text ON bot_memory BEGIN
+                 INSERT INTO bot_memory_fts (bot_memory_fts, rowid, text)
+                 VALUES ('delete', old.id, old.text);
+                 INSERT INTO bot_memory_fts (rowid, text) VALUES (new.id, new.text);
+             END;",
         )?;
         Ok(State { conn })
     }
@@ -1147,6 +1168,106 @@ impl State {
     }
 }
 
+/// One saved memory of the personal bot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRow {
+    pub id: i64,
+    pub text: String,
+    pub pinned: bool,
+    pub created_at_ms: u64,
+}
+
+/// The words of a search, as FTS5 prefix terms. Anything but letters and
+/// digits separates words, so the query cannot use FTS5 syntax.
+fn fts_terms(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{}\"*", w.to_lowercase()))
+        .collect()
+}
+
+impl State {
+    // --- the personal bot's memory -------------------------------------
+
+    pub fn memory_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM bot_memory", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Saves a memory. Returns its ID.
+    pub fn memory_save(&self, text: &str, pinned: bool) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO bot_memory (text, pinned, created_at_ms) VALUES (?1, ?2, ?3)",
+            params![text, pinned, now_ms() as i64],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Whether a memory with this ID existed.
+    pub fn memory_forget(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM bot_memory WHERE id = ?1", params![id])?
+            > 0)
+    }
+
+    fn memories(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<MemoryRow>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(args, |r| {
+            Ok(MemoryRow {
+                id: r.get(0)?,
+                text: r.get(1)?,
+                pinned: r.get(2)?,
+                created_at_ms: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Up to `count` memories matching `query`. Those holding every word
+    /// (or a word it starts) come first, newest first; if there are none,
+    /// those holding any word, best match first. An empty query lists the
+    /// newest.
+    pub fn memory_search(&self, query: &str, count: usize) -> Result<Vec<MemoryRow>> {
+        let terms = fts_terms(query);
+        let limit = count as i64;
+        if terms.is_empty() {
+            return self.memories(
+                "SELECT id, text, pinned, created_at_ms FROM bot_memory
+                 ORDER BY id DESC LIMIT ?1",
+                &[&limit],
+            );
+        }
+        let all = self.memories(
+            "SELECT m.id, m.text, m.pinned, m.created_at_ms
+             FROM bot_memory_fts f JOIN bot_memory m ON m.id = f.rowid
+             WHERE bot_memory_fts MATCH ?1 ORDER BY m.id DESC LIMIT ?2",
+            &[&terms.join(" AND "), &limit],
+        )?;
+        if !all.is_empty() || terms.len() == 1 {
+            return Ok(all);
+        }
+        self.memories(
+            "SELECT m.id, m.text, m.pinned, m.created_at_ms
+             FROM bot_memory_fts f JOIN bot_memory m ON m.id = f.rowid
+             WHERE bot_memory_fts MATCH ?1 ORDER BY f.rank, m.id DESC LIMIT ?2",
+            &[&terms.join(" OR "), &limit],
+        )
+    }
+
+    /// Pinned memories, oldest first.
+    pub fn memory_pinned(&self) -> Result<Vec<MemoryRow>> {
+        self.memories(
+            "SELECT id, text, pinned, created_at_ms FROM bot_memory
+             WHERE pinned = 1 ORDER BY id",
+            &[],
+        )
+    }
+}
+
 fn migrate_layout(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let has_column = |table: &str, column: &str| -> Result<bool> {
@@ -1451,6 +1572,42 @@ mod tests {
                 .map(String::as_str),
             Some("Other")
         );
+    }
+
+    #[test]
+    fn memory_is_saved_searched_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(dir.path()).unwrap();
+        let plumber = state
+            .memory_save("The plumber is Dana, 555-0100", true)
+            .unwrap();
+        let dentist = state
+            .memory_save("Dentist appointment on Friday", false)
+            .unwrap();
+        state.memory_save("Dana likes tea", false).unwrap();
+        assert_eq!(state.memory_count().unwrap(), 3);
+        let ids = |q: &str| -> Vec<i64> {
+            state
+                .memory_search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        // Case, punctuation and prefixes; FTS5 syntax is just words.
+        assert_eq!(ids("PLUMB"), [plumber]);
+        assert_eq!(ids("dana"), [plumber + 2, plumber]);
+        assert_eq!(ids("who is the plumber?"), [plumber]);
+        assert_eq!(ids("\"dentist\" OR NEAR("), [dentist]);
+        assert_eq!(ids(""), [plumber + 2, dentist, plumber]);
+        assert!(ids("zebra").is_empty());
+        let pinned = state.memory_pinned().unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned[0].pinned && pinned[0].text.contains("Dana"));
+        assert!(state.memory_forget(plumber).unwrap());
+        assert!(!state.memory_forget(plumber).unwrap());
+        assert_eq!(ids("plumber"), Vec::<i64>::new());
+        assert!(state.memory_pinned().unwrap().is_empty());
     }
 
     #[test]

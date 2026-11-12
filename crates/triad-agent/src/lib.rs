@@ -6,6 +6,7 @@
 //! messages, asks [`policy`] what to do, builds a [`context`], and runs a
 //! turn with [`run_turn`] off its event loop.
 
+pub mod assistant;
 pub mod brain;
 pub mod builtin;
 pub mod context;
@@ -362,10 +363,16 @@ fn brain(config: &AgentConfig) -> Result<Arc<dyn Brain>> {
 }
 
 impl Agent {
-    pub async fn start(config: &AgentConfig, data_dir: &Path) -> Result<Agent> {
+    /// Starts the bots. With a `store`, the personal bot also has its own
+    /// DM-only tools (memory) over it.
+    pub async fn start(
+        config: &AgentConfig,
+        data_dir: &Path,
+        store: Option<Arc<dyn assistant::Store>>,
+    ) -> Result<Agent> {
         let brain = brain(config)?;
         let mut warnings = Vec::new();
-        let tools: Arc<dyn Tools> = match &config.tools {
+        let mut tools: Arc<dyn Tools> = match &config.tools {
             ToolsKind::Fake(path) => Arc::new(FakeTools::load(path)?),
             ToolsKind::Mcp => {
                 let path = data_dir.join(mcp::CONFIG_FILE);
@@ -399,6 +406,15 @@ impl Agent {
                 }
             }
         };
+        if let Some(store) = store {
+            let both = Both::new(Arc::new(assistant::Assistant::new(store)), tools);
+            for name in &both.hidden {
+                warnings.push(format!(
+                    "tool server {name} is left out: the personal bot's own tools use that name"
+                ));
+            }
+            tools = Arc::new(both);
+        }
         let persona = match &config.persona {
             Some(p) => Some(
                 std::fs::read_to_string(p)
