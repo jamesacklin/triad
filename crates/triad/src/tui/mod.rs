@@ -137,6 +137,11 @@ pub fn spawn(data_dir: &Path) -> Result<(Events, mpsc::Receiver<String>, Ui)> {
     let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A bot turn's panic is caught and shown as its job's failure; it
+        // must not end the interface (or print over it).
+        if crate::bots::in_turn() {
+            return;
+        }
         PANICKED.store(true, Ordering::SeqCst);
         previous(info);
     }));

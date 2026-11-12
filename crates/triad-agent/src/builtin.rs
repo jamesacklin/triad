@@ -472,7 +472,11 @@ fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let end = rest[..rest.len().min(12)].find(';');
+        // Search bytes, not `&str`: a fixed byte offset can fall inside a
+        // multi-byte character. `;` is ASCII, so its index is a boundary.
+        let end = rest.as_bytes()[..rest.len().min(12)]
+            .iter()
+            .position(|&b| b == b';');
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
             let c = match name {
@@ -515,6 +519,27 @@ fn decode_entities(s: &str) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn entities_next_to_multibyte_text() {
+        assert_eq!(
+            html_text("a &amp; b & हिन्दी &नमस्ते; &"),
+            "a & b & हिन्दी &नमस्ते; &"
+        );
+        // An `&` followed by multi-byte characters, so the 12-byte entity
+        // look-ahead ends inside one at every offset.
+        for pad in 0..12 {
+            let html = format!("<p>{}&{}ग;</p>", "x".repeat(pad), "y".repeat(pad));
+            assert_eq!(
+                html_text(&html),
+                format!("{}&{}ग;", "x".repeat(pad), "y".repeat(pad))
+            );
+            let html = format!("&{}हिन्दी", "y".repeat(pad));
+            assert_eq!(html_text(&html), html);
+        }
+        assert_eq!(html_text("fish &"), "fish &");
+        assert_eq!(html_text("&#x917; &#2327;"), "ग ग");
+    }
 
     #[test]
     fn html_becomes_text() {

@@ -44,6 +44,33 @@ pub struct Bots {
     pub busy: BTreeSet<Topic>,
 }
 
+tokio::task_local! {
+    /// Set while a bot turn runs, so the terminal interface's panic hook
+    /// can tell a contained turn panic from one that ends the session.
+    static TURN: ();
+}
+
+/// Whether the current task is a bot turn, whose panic is caught and
+/// reported as the job's failure.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+pub fn in_turn() -> bool {
+    TURN.try_with(|_| ()).is_ok()
+}
+
+/// The failure reason for a turn whose task panicked or was cancelled.
+fn turn_crashed(e: tokio::task::JoinError) -> String {
+    if !e.is_panic() {
+        return "the turn was cancelled".into();
+    }
+    let payload = e.into_panic();
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message");
+    format!("the turn crashed: {msg}")
+}
+
 /// A finished turn, back on the event loop.
 pub struct JobDone {
     pub topic: Topic,
@@ -576,9 +603,17 @@ impl Session {
         let (topic, op_hash, asker) = (job.topic, job.op_hash, job.asker);
         let started = Instant::now();
         streams.jobs.spawn(async move {
-            let result = triad_agent::run_turn(&agent, allowed, &audit, &input)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            // The turn runs on a task of its own, so a panic in it (a tool,
+            // the model client) ends only this job, as a failure.
+            let turn = TURN.scope((), async move {
+                triad_agent::run_turn(&agent, allowed, &audit, &input)
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            });
+            let result = match tokio::spawn(turn).await {
+                Ok(result) => result,
+                Err(e) => Err(turn_crashed(e)),
+            };
             JobDone {
                 topic,
                 op_hash,
@@ -1393,5 +1428,21 @@ fn ago(ms: u64) -> String {
         0..=59 => format!("{s} s"),
         60..=3599 => format!("{} min", s / 60),
         _ => format!("{} h", s / 3600),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_panicking_turn_is_a_failure() {
+        let turn = TURN.scope((), async {
+            assert!(in_turn());
+            panic!("inside a tool");
+        });
+        let e = tokio::spawn(turn).await.unwrap_err();
+        assert_eq!(turn_crashed(e), "the turn crashed: inside a tool");
+        assert!(!in_turn());
     }
 }
