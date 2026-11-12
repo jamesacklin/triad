@@ -10,20 +10,22 @@
 #      and, if that fails, 128 MB.
 #
 #   ANTHROPIC_API_KEY=... scripts/live-check.sh
+#   OPENROUTER_API_KEY=... scripts/live-check.sh     # the same model, through OpenRouter
 #
 # Output goes to the terminal and to target/live-check.log. The key is read
 # from the environment and never printed.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LOG=$ROOT/target/live-check.log
-[ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "set ANTHROPIC_API_KEY" >&2; exit 2; }
+[ -n "${ANTHROPIC_API_KEY:-}${OPENROUTER_API_KEY:-}" ] \
+  || { echo "set ANTHROPIC_API_KEY or OPENROUTER_API_KEY" >&2; exit 2; }
 mkdir -p "$ROOT/target"
 cd "$ROOT"
 {
   echo "=== live-check $(date -Is) at $(git rev-parse --short HEAD)"
   echo "=== H7: live tests"
   cargo test -p triad --test bots_live -- --ignored --nocapture --test-threads=1 2>&1 \
-    | grep -E '^test |test result|panicked|REPLY|TURN|CALLS|PLANTED_RESULT|assert'
+    | grep -E '^test |test result|panicked|BRAIN|REPLY|TURN|CALLS|PLANTED_RESULT|assert'
   echo "=== H8: guest on the real model with an HTTP MCP server"
   cargo build -q -p triad && cargo build -q -p triad --example mcp_fixture
   for mem in 64 128; do

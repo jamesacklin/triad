@@ -11,7 +11,8 @@
 # environment (default: the mock brain).
 #
 # LIVE=1 runs the real model instead (H8's manual run): the guest's bot uses
-# Anthropic with the ANTHROPIC_API_KEY of this shell, and an HTTP MCP server
+# Anthropic with the ANTHROPIC_API_KEY of this shell (or OpenRouter, with
+# OPENROUTER_API_KEY), and an HTTP MCP server
 # (examples/mcp_fixture, set FIXTURE) on this machine, reached from the guest
 # at QEMU's host address 10.0.2.2. The guest, which hosts the bot and so may
 # use every tool, asks its own bot to make a tool call; the member on this
@@ -39,8 +40,11 @@ export VM_WAIT=${VM_WAIT:-60} VM_SETTLE=${VM_SETTLE:-20}
 ASK="@bot hello from the host"
 FIXTURE_PID=""
 if [ "${LIVE:-0}" = 1 ]; then
-  if [ "${LIVE_BRAIN:-anthropic}" != mock ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    log "LIVE=1 needs ANTHROPIC_API_KEY (or LIVE_BRAIN=mock)"; exit 2
+  if [ -z "${LIVE_BRAIN:-}" ]; then
+    if [ -n "${OPENROUTER_API_KEY:-}" ]; then LIVE_BRAIN=openrouter
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then LIVE_BRAIN=anthropic
+    else log "LIVE=1 needs ANTHROPIC_API_KEY or OPENROUTER_API_KEY (or LIVE_BRAIN=mock)"; exit 2
+    fi
   fi
   FIXTURE=${FIXTURE:-$ROOT/target/debug/examples/mcp_fixture}
   "$FIXTURE" --server calendar --tool create_event --log "$RUN/tool-calls.log" \
@@ -57,11 +61,16 @@ if [ "${LIVE:-0}" = 1 ]; then
       >"$RUN/guest-data/script"
     export VM_ENV="TRIAD_AGENT_BRAIN=mock
 TRIAD_AGENT_MOCK_SCRIPT=/data/script"
+  elif [ "$LIVE_BRAIN" = openrouter ]; then
+    export VM_ENV="TRIAD_AGENT_BRAIN=openrouter
+OPENROUTER_API_KEY=$OPENROUTER_API_KEY
+RUST_LOG=warn"
   else
     export VM_ENV="TRIAD_AGENT_BRAIN=anthropic
 ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 RUST_LOG=warn"
   fi
+  log "live brain: $LIVE_BRAIN"
   export VM_WAIT=${VM_WAIT_LIVE:-25} VM_SETTLE=${VM_SETTLE_LIVE:-90}
   export VM_TIMEOUT=${VM_TIMEOUT:-240}
   export VM_LINE='@bot please use the calendar tool to create an event titled "hedge trimming", then tell me it is done'

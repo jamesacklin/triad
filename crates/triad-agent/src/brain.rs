@@ -166,20 +166,39 @@ impl Brain for MockBrain {
 }
 
 // ---------------------------------------------------------------------------
-// Anthropic through rig-core
+// Anthropic through rig-core, directly or through OpenRouter
 
 use rig_core::completion::{
-    AssistantContent, CompletionRequest, Message, ToolDefinition,
+    AssistantContent, CompletionRequest, CompletionResponse, Message, ToolDefinition,
     message::{ToolName, ToolResultContent},
 };
 use rig_core::providers::anthropic::AnthropicConfig;
+use rig_core::providers::openai::OpenAIConfig;
+use rig_core::providers::openai::wire::{Chat, OPENROUTER};
 
-/// Anthropic's Messages API, through `rig-core`. Tool names are sent as
-/// `server__tool`, because Anthropic allows only `[a-zA-Z0-9_-]` in a tool
-/// name and triad names tools `server.tool`.
+/// The two ways to reach the model: Anthropic's Messages API, or
+/// OpenRouter's OpenAI-format chat API (the same Claude model, routed).
+enum Backend {
+    Anthropic(Box<rig_core::Model<rig_core::providers::anthropic::Messages>>),
+    OpenRouter(Box<rig_core::Model<Chat>>),
+}
+
+impl Backend {
+    async fn call(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        match self {
+            Backend::Anthropic(m) => m.call(request).await,
+            Backend::OpenRouter(m) => m.call(request).await,
+        }
+        .map_err(|e| anyhow!("model request failed: {e}"))
+    }
+}
+
+/// Claude through `rig-core`, by Anthropic's API or OpenRouter. Tool names
+/// are sent as `server__tool`, because the APIs allow only `[a-zA-Z0-9_-]`
+/// in a tool name and triad names tools `server.tool`.
 pub struct AnthropicBrain {
-    model: rig_core::Model<rig_core::providers::anthropic::Messages>,
-    model_name: String,
+    model: Backend,
+    provider: String,
     max_tokens: u64,
 }
 
@@ -211,8 +230,37 @@ impl AnthropicBrain {
     fn with_config(config: AnthropicConfig, model: &str, http: reqwest::Client) -> Self {
         let client = config.connect(rig_reqwest::ReqwestClient::from(http));
         AnthropicBrain {
-            model: client.completion(model),
-            model_name: model.to_string(),
+            model: Backend::Anthropic(Box::new(client.completion(model))),
+            provider: format!("anthropic ({model})"),
+            max_tokens: 1024,
+        }
+    }
+
+    /// Through OpenRouter: reads `OPENROUTER_API_KEY`. The key is never
+    /// written anywhere. `model` is OpenRouter's name, such as
+    /// `anthropic/claude-opus-5.5`.
+    pub fn openrouter_from_env(model: &str, http: reqwest::Client) -> Result<Self> {
+        let config = OpenAIConfig::from_env_with(&OPENROUTER).map_err(|e| anyhow!("{e}"))?;
+        Ok(Self::openrouter_with_config(config, model, http))
+    }
+
+    /// OpenRouter with an explicit key and base URL, for tests against a
+    /// local stand-in.
+    pub fn openrouter_with_key(
+        key: &str,
+        base_url: &str,
+        model: &str,
+        http: reqwest::Client,
+    ) -> Self {
+        let config = OpenAIConfig::with_key(&OPENROUTER, key.to_string()).with_base_url(base_url);
+        Self::openrouter_with_config(config, model, http)
+    }
+
+    fn openrouter_with_config(config: OpenAIConfig, model: &str, http: reqwest::Client) -> Self {
+        let client = config.connect(rig_reqwest::ReqwestClient::from(http));
+        AnthropicBrain {
+            model: Backend::OpenRouter(Box::new(client.chat(model))),
+            provider: format!("openrouter ({model})"),
             max_tokens: 1024,
         }
     }
@@ -252,7 +300,7 @@ impl AnthropicBrain {
 
 impl Brain for AnthropicBrain {
     fn provider(&self) -> String {
-        format!("anthropic ({})", self.model_name)
+        self.provider.clone()
     }
 
     fn turn<'a>(
@@ -283,11 +331,7 @@ impl Brain for AnthropicBrain {
                     .tools(defs.clone())
                     .max_tokens(self.max_tokens);
                 let started = Instant::now();
-                let response = self
-                    .model
-                    .call(request)
-                    .await
-                    .map_err(|e| anyhow!("model request failed: {e}"))?;
+                let response = self.model.call(request).await?;
                 out.model_time += started.elapsed();
                 out.requests += 1;
                 if let Some(n) = response.usage.input_tokens {

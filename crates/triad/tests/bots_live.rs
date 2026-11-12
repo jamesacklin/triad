@@ -1,6 +1,7 @@
 //! H7: the real model. Ignored: these call Anthropic and need a key.
 //!
 //!   ANTHROPIC_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture
+//!   OPENROUTER_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture
 //!
 //! 1. The H2 exchange (three lines, three replies) and one tool call against
 //!    the MCP fixture server over stdio. Prints latency and token counts.
@@ -59,26 +60,35 @@ fn report(done: &Value) {
     );
 }
 
+fn set(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|k| !k.is_empty())
+}
+
+/// The brain to run: OpenRouter when its key is set, else Anthropic.
+fn brain() -> (&'static str, &'static str) {
+    if set("OPENROUTER_API_KEY") {
+        ("TRIAD_AGENT_BRAIN", "openrouter")
+    } else {
+        ("TRIAD_AGENT_BRAIN", "anthropic")
+    }
+}
+
 fn require_key() {
     assert!(
-        std::env::var("ANTHROPIC_API_KEY").is_ok_and(|k| !k.is_empty()),
-        "set ANTHROPIC_API_KEY to run the live tests"
+        set("ANTHROPIC_API_KEY") || set("OPENROUTER_API_KEY"),
+        "set ANTHROPIC_API_KEY or OPENROUTER_API_KEY to run the live tests"
     );
+    eprintln!("BRAIN {}", brain().1);
 }
 
 #[test]
-#[ignore = "calls Anthropic; run by hand with ANTHROPIC_API_KEY"]
+#[ignore = "calls the model; run by hand with ANTHROPIC_API_KEY or OPENROUTER_API_KEY"]
 fn live_dm_exchange_and_tool_call() {
     require_key();
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("calls.log");
     write_mcp(dir.path(), &log);
-    let mut a = Proc::spawn_env(
-        "A",
-        dir.path(),
-        &["chat", "--agent", "--json"],
-        &[("TRIAD_AGENT_BRAIN", "anthropic")],
-    );
+    let mut a = Proc::spawn_env("A", dir.path(), &["chat", "--agent", "--json"], &[brain()]);
     let ready = a.wait_for("ready", |v| is_event(v, "ready"));
     assert_eq!(ready["channel"], "agent");
     for word in ["one", "two", "three"] {
@@ -105,7 +115,7 @@ fn live_dm_exchange_and_tool_call() {
 }
 
 #[test]
-#[ignore = "calls Anthropic; run by hand with ANTHROPIC_API_KEY"]
+#[ignore = "calls the model; run by hand with ANTHROPIC_API_KEY or OPENROUTER_API_KEY"]
 fn live_planted_instruction() {
     require_key();
     let (da, db, dc) = (
@@ -126,7 +136,7 @@ fn live_planted_instruction() {
             "--auto-accept",
             "--json",
         ],
-        &[("TRIAD_AGENT_BRAIN", "anthropic")],
+        &[brain()],
     );
     let invite = a.wait_for("ready", |v| is_event(v, "ready"))["invite"]
         .as_str()

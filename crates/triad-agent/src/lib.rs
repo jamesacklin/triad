@@ -27,10 +27,16 @@ use crate::tools::{Audit, FakeTools, Gate, NoTools, ToolSpec, Tools};
 
 /// The default model.
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+/// The default model's name on OpenRouter.
+pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-5.5";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrainKind {
     Anthropic {
+        model: String,
+    },
+    /// The same model through OpenRouter (`OPENROUTER_API_KEY`).
+    OpenRouter {
         model: String,
     },
     Mock {
@@ -99,6 +105,17 @@ impl AgentConfig {
                     model: env("TRIAD_AGENT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.into()),
                 }
             }
+            "openrouter" => {
+                if env("OPENROUTER_API_KEY").is_none() {
+                    return Err(UsageError(
+                        "--agent with the openrouter brain needs OPENROUTER_API_KEY".into(),
+                    ));
+                }
+                BrainKind::OpenRouter {
+                    model: env("TRIAD_AGENT_MODEL")
+                        .unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.into()),
+                }
+            }
             "mock" => BrainKind::Mock {
                 script: env("TRIAD_AGENT_MOCK_SCRIPT").map(PathBuf::from),
                 log: env("TRIAD_AGENT_MOCK_LOG").map(PathBuf::from),
@@ -106,7 +123,7 @@ impl AgentConfig {
             },
             other => {
                 return Err(UsageError(format!(
-                    "TRIAD_AGENT_BRAIN must be anthropic or mock, got {other:?}"
+                    "TRIAD_AGENT_BRAIN must be anthropic, openrouter or mock, got {other:?}"
                 )));
             }
         };
@@ -165,6 +182,10 @@ impl Agent {
             BrainKind::Anthropic { model } => {
                 let (client, _) = http::client().map_err(anyhow::Error::msg)?;
                 Arc::new(AnthropicBrain::from_env(model, client)?)
+            }
+            BrainKind::OpenRouter { model } => {
+                let (client, _) = http::client().map_err(anyhow::Error::msg)?;
+                Arc::new(AnthropicBrain::openrouter_from_env(model, client)?)
             }
         };
         let mut warnings = Vec::new();

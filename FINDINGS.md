@@ -571,6 +571,14 @@ rounds and reported in the `job` event. `BotOn` announces the provider as
 `anthropic (claude-opus-5-5)`. Starting with `--agent`, the `anthropic`
 brain and no key exits with code 2 (`tests/bots_dm.rs`).
 
+**OpenRouter as a second route to the same model.** `TRIAD_AGENT_BRAIN=
+openrouter` (key in `OPENROUTER_API_KEY`, model `anthropic/claude-opus-5.5`
+by default, `TRIAD_AGENT_MODEL` to change it) sends the same turn through
+rig's OpenRouter client, OpenAI chat format, with the same tool loop and
+gate. `BotOn` then says `openrouter (anthropic/claude-opus-5.5)`, so members
+see that their messages go to OpenRouter as well as Anthropic. The offline
+test also runs this path against a stand-in for `POST /chat/completions`.
+
 **Not run against the real model.** This host has no `ANTHROPIC_API_KEY`,
 so the live tests (`tests/bots_live.rs`, `#[ignore]`d) were compiled but not
 run. They cover the H2 exchange, one tool call against the fixture server
@@ -578,7 +586,7 @@ over stdio, and the planted-instruction experiment, and print `TURN` lines
 with model time, tool time and token counts:
 
 ```sh
-ANTHROPIC_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture
+ANTHROPIC_API_KEY=... scripts/live-check.sh    # or OPENROUTER_API_KEY=...
 ```
 
 What was checked instead: `triad-agent/tests/anthropic_wire.rs` points the

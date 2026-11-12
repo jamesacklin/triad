@@ -170,3 +170,80 @@ async fn rig_brain_runs_a_tool_turn() {
         "{body}"
     );
 }
+
+/// The same turn through the OpenRouter backend, against a stand-in for its
+/// OpenAI-format `POST /chat/completions`.
+#[tokio::test]
+async fn openrouter_brain_runs_a_tool_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("fake.json");
+    std::fs::write(
+        &fake,
+        json!({"log": dir.path().join("calls.log"), "result": "event 42",
+               "servers": {"calendar": ["create_event"]}})
+        .to_string(),
+    )
+    .unwrap();
+    let tools = FakeTools::load(&fake).unwrap();
+    let (url, seen) = stand_in(vec![
+        json!({"id": "gen-1", "object": "chat.completion", "created": 1, "model": "anthropic/claude-opus-5.5",
+               "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant",
+                 "content": null, "tool_calls": [{"id": "call_1", "type": "function",
+                 "function": {"name": "calendar__create_event", "arguments": "{\"title\": \"hedge trimming\"}"}}]}}],
+               "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}}),
+        json!({"id": "gen-2", "object": "chat.completion", "created": 2, "model": "anthropic/claude-opus-5.5",
+               "choices": [{"index": 0, "finish_reason": "stop",
+                 "message": {"role": "assistant", "content": "Added it."}}],
+               "usage": {"prompt_tokens": 150, "completion_tokens": 10, "total_tokens": 160}}),
+    ]);
+    triad_agent::http::install_crypto_provider();
+    let brain = AnthropicBrain::openrouter_with_key(
+        "test-key",
+        &url,
+        "anthropic/claude-opus-5.5",
+        reqwest::Client::new(),
+    );
+    assert_eq!(brain.provider(), "openrouter (anthropic/claude-opus-5.5)");
+    let all_tools = tools.list();
+    let agent = Agent {
+        brain: Arc::new(brain),
+        tools: Arc::new(tools),
+        persona: None,
+        limits: Limits::default(),
+        all_tools: all_tools.clone(),
+        warnings: Vec::new(),
+    };
+    let input = TurnInput {
+        kind: Kind::Dm,
+        channel: "agent".into(),
+        system: "SYSTEM-PROMPT-MARKER".into(),
+        transcript: Vec::new(),
+        asker: "7c1d09ee".into(),
+        asker_tier: "host".into(),
+        ask: "add hedge trimming".into(),
+        tools: all_tools,
+        unavailable: Vec::new(),
+        host: "7c1d09ee".into(),
+    };
+    let result = run_turn(&agent, ToolSet::All, &NoAudit, &input)
+        .await
+        .unwrap();
+    assert_eq!(result.text, "Added it.");
+    assert_eq!(result.output.requests, 2);
+    assert_eq!(result.output.input_tokens, Some(250));
+    assert_eq!(result.output.output_tokens, Some(30));
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).unwrap();
+    assert!(calls.contains("calendar.create_event") && calls.contains("hedge trimming"));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0]["model"], "anthropic/claude-opus-5.5");
+    let first = seen[0].to_string();
+    assert!(
+        first.contains("SYSTEM-PROMPT-MARKER") && first.contains("calendar__create_event"),
+        "{first}"
+    );
+    let second = seen[1].to_string();
+    assert!(
+        second.contains("event 42") && second.contains("call_1"),
+        "{second}"
+    );
+}
