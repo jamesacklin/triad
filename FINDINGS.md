@@ -675,7 +675,7 @@ descriptor would be better).
   transcript is fenced and labeled as context, and every line carries its
   author's tier.
 - **How long from `@bot` to a reply on another member's screen?** On one
-  machine with the mock brain and fake tools, 100 to 170 ms over eight runs:
+  machine with the mock brain and fake tools, 100 to 170 ms over seven runs:
   about 25 to 75 ms sync from asker to host, 30 to 60 ms of host-side turn
   overhead (job bookkeeping, SQLite writes, the mock), model and tool time
   0 to 2 ms, and 30 to 70 ms sync from host to the third member. From the

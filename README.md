@@ -156,6 +156,31 @@ passes its own. Every JSON event about a channel has a `channel` field.
 There is no `/leave` yet. A `state.sqlite` from before channels is migrated
 on first open, and its group becomes `#main`.
 
+### Bots (`--agent`)
+
+`create`, `join` and `chat` take `--agent` to run this user's bots in the
+session ([HARNESS-PLAN.md](HARNESS-PLAN.md), results in
+[FINDINGS.md](FINDINGS.md#bots-2026-11-11)):
+
+- **A personal bot** in `#agent`, a space with you as its only member,
+  created on first use. It answers every line you type there.
+- **A channel bot** in every channel you create while running with
+  `--agent`, announced to members. Members address it with `@bot`. Admins
+  (`Manage`) may use all its tools; other members get answers and no tools
+  unless you grant some.
+
+The model is Anthropic's (`ANTHROPIC_API_KEY`, `TRIAD_AGENT_MODEL`, default
+`claude-opus-5-5`); `TRIAD_AGENT_BRAIN=mock` runs without one. MCP servers go
+in `mcp.json` in the data directory, tokens named by environment variable.
+Every message in a bot turn goes to the model provider in plaintext.
+
+| In chat mode | Behavior |
+| --- | --- |
+| `/bot`, `/bot on`, `/bot off` | Show, or turn on or off, the focused channel's bot. On and off: creator only. |
+| `/grant <node> <server.tool \| server.*>`, `/revoke <node> [pattern]`, `/grants` | Edit grants in the focused channel. Host only. |
+| `/block <node>`, `/unblock <node>` | Nodes your bots never answer, in every channel you host. |
+| `/audit [N]` | The focused channel's last tool calls: who asked, which tool, outcome. Host only. |
+
 ## Acceptance run (two machines)
 
 Put the machines on different networks, for example the Mac on home Wi-Fi and
@@ -239,8 +264,12 @@ cargo test                       # unit tests, the two-node test and the channel
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -p triad --test spaces_membership -- --ignored   # offline membership, about a minute each
+cargo test -p triad --features sqlcipher --test bots_at_rest  # SQLCipher state.sqlite (needs libcrypto)
+ANTHROPIC_API_KEY=... cargo test -p triad --test bots_live -- --ignored --nocapture  # the real model
 ```
 
 Layout: `crates/triad` (the binary and its integration tests),
 `crates/triad-core` (message and invite formats, identity, `state.sqlite`),
-`crates/triad-probe` (raw iroh echo, the only crate that names iroh).
+`crates/triad-probe` (raw iroh echo, the only crate that names iroh),
+`crates/triad-agent` (the bots' policy, context, brain and tools; the only
+crate that names `rig-core` and `rmcp`).
