@@ -271,6 +271,15 @@ Memories and schedules are rows in `state.sqlite` (encrypted with it under
 SQLCipher). Channel turns are never offered these tools and never see a
 memory, and a channel is not told they exist.
 
+**Skills** are standing instructions you write as `skills/<name>.md` in
+the data directory (`<name>` is letters, digits, `-` and `_`). When the bots
+start, every turn's system prompt lists each skill with a one-line summary
+(the `description:` of YAML front matter, else the file's first line), and
+`skills.read` lets the bot read one before a task it covers. `skills.read`
+works in channels too, for askers whose tools allow it, and reads nothing
+outside `skills/`. Restart the session after adding a skill. `persona` in
+`agent.json` is unchanged.
+
 A schedule fires by posting its prompt in `#agent` as a line from you,
 `[scheduled: <name>] <prompt>`, which the bot answers like any other. It
 fires only while triad is running with bots: a one-shot that came due while

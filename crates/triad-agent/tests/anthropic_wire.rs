@@ -114,6 +114,7 @@ async fn rig_brain_runs_a_tool_turn() {
         persona: None,
         limits: Limits::default(),
         utc_offset_minutes: 0,
+        skills: Vec::new(),
         all_tools: all_tools.clone(),
         warnings: Vec::new(),
     };
@@ -222,6 +223,7 @@ async fn openrouter_brain_runs_a_tool_turn() {
         persona: None,
         limits: Limits::default(),
         utc_offset_minutes: 0,
+        skills: Vec::new(),
         all_tools: all_tools.clone(),
         warnings: Vec::new(),
     };

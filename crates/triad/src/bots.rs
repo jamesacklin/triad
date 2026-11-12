@@ -676,6 +676,7 @@ impl Session {
                 unavailable,
                 host: &host,
                 notes: &notes,
+                skills: &bots.agent.skills,
             },
             ContextLimits::default(),
         ))

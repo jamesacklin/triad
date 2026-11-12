@@ -14,6 +14,7 @@ pub mod http;
 pub mod mcp;
 pub mod policy;
 pub mod schedule;
+pub mod skills;
 pub mod tools;
 
 use std::path::{Path, PathBuf};
@@ -349,6 +350,8 @@ pub struct Agent {
     pub limits: Limits,
     /// Minutes east of UTC that schedule times are written in.
     pub utc_offset_minutes: i32,
+    /// The host's skills, listed in the system prompt.
+    pub skills: Vec<skills::Skill>,
     /// Every tool the bots have.
     pub all_tools: Vec<ToolSpec>,
     /// Problems found at start (an MCP server that did not connect), for
@@ -423,6 +426,17 @@ impl Agent {
                 }
             }
         };
+        let mut skill_list = Vec::new();
+        if let Some(found) = skills::Skills::load(data_dir) {
+            skill_list = found.list.clone();
+            let both = Both::new(Arc::new(found), tools);
+            for name in &both.hidden {
+                warnings.push(format!(
+                    "tool server {name} is left out: the skills use that name"
+                ));
+            }
+            tools = Arc::new(both);
+        }
         if let Some(store) = store {
             let own = assistant::Assistant::new(store, config.utc_offset_minutes);
             let both = Both::new(Arc::new(own), tools);
@@ -450,6 +464,7 @@ impl Agent {
             persona,
             limits: config.limits,
             utc_offset_minutes: config.utc_offset_minutes,
+            skills: skill_list,
             all_tools,
             warnings,
         })
@@ -464,6 +479,7 @@ impl Agent {
             persona: self.persona.clone(),
             limits: self.limits,
             utc_offset_minutes: self.utc_offset_minutes,
+            skills: self.skills.clone(),
             all_tools: self.all_tools.clone(),
             warnings: Vec::new(),
         })
@@ -583,6 +599,7 @@ mod tests {
             persona: None,
             limits: Limits::default(),
             utc_offset_minutes: 0,
+            skills: Vec::new(),
             all_tools: Vec::new(),
             warnings: Vec::new(),
         };

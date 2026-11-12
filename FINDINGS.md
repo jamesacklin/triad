@@ -1087,7 +1087,8 @@ on branch `james/rig-tools-assistant-3773ad`.
 | A0 | Land stage 1 | `73dd271` | Committed after review; tests, fmt and clippy pass. By-hand check not run: no Brave key (`BRAVE_API_KEY` unset, none in `keys.json`) |
 | A1 | Context and scope | `89538e2` | `tools::tests::a_dm_only_tool_stays_in_the_dm` passes; no existing assertion changed |
 | A2 | Memory | `08d950a` | `bots_memory.rs` and the extended `bots_isolation.rs` pass; FTS5 checked in both SQLite builds |
-| A3 | Schedules | `A3` | `bots_schedules.rs` passes: one fire and one reply, none repeated after SIGKILL, overdue rules, interval advance |
+| A3 | Schedules | `0d6acae` | `bots_schedules.rs` passes: one fire and one reply, none repeated after SIGKILL, overdue rules, interval advance |
+| A4 | Skills | `A4` | `context` prompt tests and `bots_skills.rs` pass; no existing assertion changed |
 
 ### A0: stage 1
 
@@ -1208,6 +1209,24 @@ Changed assertions: the DM tool sets asserted in `bots_isolation.rs` and
 `bots_memory.rs` (both added or changed in A2) now include the three
 `schedule.*` tools. `bots_isolation.rs` also checks that no channel turn is
 offered a `schedule.*` tool or mentions schedules.
+
+### A4: skills
+
+`triad-agent/src/skills.rs`: `skills.read` (scope `Any`) and the list of
+`skills/*.md`, read once when the bots start. A skill's name must be letters,
+digits, `-` and `_` (a trailing `.md` is accepted), so `/`, `..` and absolute
+paths are refused before any path is built; `bots_skills.rs` shows both
+refused without the outside file's text reaching the reply. The summary is
+`description:` from YAML front matter (OpenClaw's `SKILL.md` form), else the
+first line without its `#`. The prompt lists skills only when `skills.read`
+is offered to the asker, before the persona, which is unchanged and still
+last.
+
+A choice the plan left open: `skills.read` exists only when `skills/` holds
+at least one skill. Offering it with nothing to read would have added a
+`skills` server to every channel's `BotOn` announcement and changed the
+`bots_tools.rs` assertions for no use. The cost is that a skill added while
+the session runs needs a restart, as `mcp.json` already does.
 
 ## Agent harness options (2026-11-11)
 

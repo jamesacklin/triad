@@ -96,6 +96,8 @@ pub struct Turn<'a> {
     /// The user's pinned memories. Read only in a DM turn; the caller
     /// passes none for a channel.
     pub notes: &'a [String],
+    /// The host's skills, listed when `skills.read` is offered.
+    pub skills: &'a [crate::skills::Skill],
 }
 
 /// Builds the model input for one turn.
@@ -178,6 +180,19 @@ fn system_prompt(turn: &Turn) -> String {
             turn.host
         ));
     }
+    if !turn.skills.is_empty() && turn.tools.iter().any(|t| t.name == "skills.read") {
+        s.push_str(
+            "\nSkills: the host's standing instructions for kinds of task. Before a task one \
+             covers, read it with skills.read and follow it.\n",
+        );
+        for k in turn.skills {
+            if k.summary.is_empty() {
+                s.push_str(&format!("- {}\n", k.name));
+            } else {
+                s.push_str(&format!("- {}: {}\n", k.name, k.summary));
+            }
+        }
+    }
     if turn.kind == Kind::Dm {
         let has = |name: &str| turn.tools.iter().any(|t| t.name == name);
         if has("memory.save") {
@@ -252,6 +267,7 @@ mod tests {
             unavailable: vec!["calendar".into()],
             host: "7c1d09ee",
             notes: &[],
+            skills: &[],
         }
     }
 
@@ -282,6 +298,44 @@ mod tests {
         assert!(input.system.contains("ask 7c1d09ee for access"));
         assert!(input.system.contains("Be brief."));
         assert!(input.system.contains("no tools"));
+    }
+
+    #[test]
+    fn skills_are_listed_when_they_can_be_read() {
+        use crate::skills::Skill;
+        let skills = [
+            Skill {
+                name: "standup".into(),
+                summary: "Run the daily standup.".into(),
+            },
+            Skill {
+                name: "packing".into(),
+                summary: String::new(),
+            },
+        ];
+        let read = crate::tools::ToolSpec {
+            name: "skills.read".into(),
+            description: String::new(),
+            schema: serde_json::Value::Null,
+            scope: crate::tools::Scope::Any,
+        };
+        let mut t = turn(&[], 1);
+        t.skills = &skills;
+        t.tools = vec![read];
+        let with = build(t, ContextLimits::default());
+        assert!(
+            with.system
+                .contains("read it with skills.read and follow it.\n- standup: Run the daily standup.\n- packing\n"),
+            "{}",
+            with.system
+        );
+        // The persona is still there, after the skills.
+        assert!(with.system.ends_with("Be brief.\n"), "{}", with.system);
+        // An asker who cannot read them is not told about them.
+        let mut t = turn(&[], 1);
+        t.skills = &skills;
+        let without = build(t, ContextLimits::default());
+        assert!(!without.system.contains("standup"), "{}", without.system);
     }
 
     #[test]
