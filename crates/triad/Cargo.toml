@@ -11,9 +11,10 @@ path = "src/main.rs"
 
 [features]
 sqlcipher = ["triad-core/sqlcipher"]
-# The full-screen terminal interface (crates/triad/src/tui). Filled in by
-# the next step; until then chat runs as plain text either way.
-tui = []
+default = ["tui"]
+# The full-screen terminal interface (crates/triad/src/tui). Without it,
+# chat runs as plain text.
+tui = ["dep:ratatui"]
 
 [dependencies]
 triad-core = { workspace = true }
@@ -28,6 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+ratatui = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

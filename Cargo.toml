@@ -45,6 +45,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 webpki-root-certs = "1"
 
+# The terminal interface (crates/triad/src/tui). Pinned exactly; crossterm
+# is used through ratatui's re-export and named nowhere else.
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+
 triad-core = { path = "crates/triad-core" }
 triad-probe = { path = "crates/triad-probe" }
 triad-agent = { path = "crates/triad-agent" }

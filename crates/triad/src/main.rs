@@ -18,6 +18,8 @@
 //! on the focused channel.
 
 mod bots;
+#[cfg(feature = "tui")]
+mod tui;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -314,7 +316,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Create { name, relay }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Create { name, relay }, opts, bots)?;
         }
         Cmd::Join {
             invite,
@@ -332,7 +334,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Join { invite, name }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Join { invite, name }, opts, bots)?;
         }
         Cmd::Chat {
             channel,
@@ -348,7 +350,7 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
                 verbose,
             };
             let bots = BotStart::new(no_bot, &data_dir);
-            rt.block_on(chat(&data_dir, Start::Resume { channel }, opts, bots))?;
+            run_chat(&rt, &data_dir, Start::Resume { channel }, opts, bots)?;
         }
         Cmd::Channels => {
             for g in State::open(&data_dir)?.groups()? {
@@ -526,8 +528,8 @@ enum Sink {
     Text,
     Json,
     /// The terminal interface's thread, which gets both.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-    Tui(mpsc::UnboundedSender<(serde_json::Value, String)>),
+    #[cfg(feature = "tui")]
+    Tui(tui::Events),
 }
 
 struct Printer {
@@ -540,6 +542,7 @@ impl Printer {
         match &self.sink {
             Sink::Json => println!("{value}"),
             Sink::Text => println!("{}", text()),
+            #[cfg(feature = "tui")]
             Sink::Tui(tx) => {
                 let _ = tx.send((value, text()));
             }
@@ -619,7 +622,46 @@ struct Channel {
     seen_self: bool,
 }
 
-async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Result<()> {
+/// Runs a chat session in the mode `opts` picked. With the terminal
+/// interface, the session's result is returned once the interface has
+/// restored the terminal, so an error prints on the normal screen.
+fn run_chat(
+    rt: &tokio::runtime::Runtime,
+    data_dir: &Path,
+    start: Start,
+    opts: Opts,
+    bots: BotStart,
+) -> Result<()> {
+    match opts.mode {
+        #[cfg(feature = "tui")]
+        Mode::Tui => {
+            let (events, lines, ui) = tui::spawn()?;
+            let result = rt.block_on(chat(
+                data_dir,
+                start,
+                opts,
+                bots,
+                Sink::Tui(events),
+                Some(lines),
+            ));
+            let shown = ui.join();
+            result.and(shown)
+        }
+        Mode::Json => rt.block_on(chat(data_dir, start, opts, bots, Sink::Json, None)),
+        _ => rt.block_on(chat(data_dir, start, opts, bots, Sink::Text, None)),
+    }
+}
+
+/// A chat session. `lines` is where typed lines come from: stdin unless
+/// the terminal interface supplies them.
+async fn chat(
+    data_dir: &Path,
+    start: Start,
+    opts: Opts,
+    bots: BotStart,
+    sink: Sink,
+    lines: Option<mpsc::Receiver<String>>,
+) -> Result<()> {
     let identity = Identity::load_or_create(data_dir)?;
     let me = identity.node_id();
     let state = State::open(data_dir)?;
@@ -683,11 +725,7 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         channels: BTreeMap::new(),
         focus: [0; 32],
         printer: Printer {
-            sink: match opts.mode {
-                Mode::Json => Sink::Json,
-                // The interface comes in a later step; plain until then.
-                Mode::Plain | Mode::Tui => Sink::Text,
-            },
+            sink,
             verbose: opts.verbose,
         },
         opts,
@@ -745,7 +783,8 @@ async fn chat(data_dir: &Path, start: Start, opts: Opts, bots: BotStart) -> Resu
         };
         session.ready()?;
         session.resume_jobs(&mut streams).await;
-        session.event_loop(&mut streams, spawn_stdin()).await
+        let lines = lines.unwrap_or_else(spawn_stdin);
+        session.event_loop(&mut streams, lines).await
     }
     .await;
     for (_, channel) in std::mem::take(&mut session.channels) {
