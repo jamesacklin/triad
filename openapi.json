@@ -1,0 +1,2408 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "triad WebSocket API",
+    "version": "1",
+    "description": "`triad serve` exposes one chat session on a WebSocket at `/v1`. HTTP is used only for the upgrade; every request and event is a JSON text frame, described by `Request` and `Event` under components. API.md is the prose reference (routing, close codes, the reconnect recipe). Generate client types from `components.schemas`.",
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "ws://127.0.0.1:7878",
+      "description": "The default `--listen` address."
+    }
+  ],
+  "paths": {
+    "/v1": {
+      "get": {
+        "operationId": "connect",
+        "summary": "Open the WebSocket.",
+        "description": "A WebSocket upgrade (RFC 6455). Send `Request` frames; receive `Event` frames, starting with `hello` then `ready`. Without an `Authorization` header, the first frame must be an `AuthRequest` within 5 seconds.",
+        "security": [
+          {
+            "bearer": []
+          },
+          {}
+        ],
+        "parameters": [
+          {
+            "name": "Upgrade",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "const": "websocket"
+            }
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Sent by browsers. Refused with 403 unless the server was started with `--allow-origin` for it."
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching Protocols. Frames follow.",
+            "x-websocket": {
+              "client": {
+                "$ref": "#/components/schemas/Request"
+              },
+              "server": {
+                "$ref": "#/components/schemas/Event"
+              }
+            }
+          },
+          "400": {
+            "description": "Not a WebSocket upgrade request."
+          },
+          "401": {
+            "description": "The bearer token is wrong."
+          },
+          "403": {
+            "description": "The `Origin` is not allowed."
+          },
+          "404": {
+            "description": "Not `/v1`."
+          },
+          "405": {
+            "description": "Not GET."
+          },
+          "408": {
+            "description": "The request head did not arrive within 5 seconds."
+          },
+          "431": {
+            "description": "The request head is over 8 KiB."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The 64-hex-character token in `<data-dir>/api-token`. Browsers cannot set this header; they send an `AuthRequest` first instead."
+      }
+    },
+    "schemas": {
+      "NodeId": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+        "description": "A node (user) ID, 32 bytes hex."
+      },
+      "OpHash": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+        "description": "An operation hash, 32 bytes hex. Unique per message; the key for de-duplication and the `history` cursor."
+      },
+      "Hex32": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "ChannelName": {
+        "type": "string",
+        "description": "A channel's local name, without `#`."
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "creator",
+          "member"
+        ]
+      },
+      "JoinStatus": {
+        "type": "string",
+        "enum": [
+          "none",
+          "pending",
+          "joined"
+        ]
+      },
+      "Access": {
+        "type": "string",
+        "enum": [
+          "pull",
+          "read",
+          "write",
+          "manage"
+        ]
+      },
+      "RequestId": {
+        "oneOf": [
+          {
+            "type": "integer"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "Chosen by the client; echoed as `re` on every reply."
+      },
+      "ChannelInfo": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/ChannelName"
+          },
+          "group": {
+            "$ref": "#/components/schemas/Hex32"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JoinStatus"
+          },
+          "invite": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "focused": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "channel",
+          "group",
+          "role",
+          "status",
+          "invite",
+          "focused"
+        ]
+      },
+      "HistoryMessage": {
+        "type": "object",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/NodeId"
+          },
+          "text": {
+            "type": "string"
+          },
+          "nickname": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "op": {
+            "$ref": "#/components/schemas/OpHash"
+          },
+          "mine": {
+            "type": "boolean"
+          },
+          "ts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bot": {
+            "type": "boolean"
+          },
+          "action": {
+            "type": "boolean"
+          },
+          "bot_claim": {
+            "type": "string",
+            "enum": [
+              "not accepted"
+            ]
+          }
+        },
+        "required": [
+          "author",
+          "text",
+          "nickname",
+          "op",
+          "mine",
+          "ts",
+          "bot",
+          "action"
+        ]
+      },
+      "FrameMeta": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-process frame counter. Gaps are frames sent to other clients or missed."
+          },
+          "re": {
+            "$ref": "#/components/schemas/RequestId"
+          }
+        },
+        "required": [
+          "seq"
+        ],
+        "description": "Fields the socket adds to every event."
+      },
+      "AuthRequest": {
+        "type": "object",
+        "description": "The first frame, when the token was not sent in an `Authorization: Bearer` header. Needs no `id`; `hello` acknowledges it.",
+        "properties": {
+          "op": {
+            "type": "string",
+            "const": "auth"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "token"
+        ]
+      },
+      "SendRequest": {
+        "type": "object",
+        "description": "Publishes a message (an action, like `/me`, when `action`). Never read as an answer to a join request.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "op": {
+            "type": "string",
+            "const": "send"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelName"
+          },
+          "text": {
+            "type": "string"
+          },
+          "action": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "op",
+          "channel",
+          "text"
+        ]
+      },
+      "AnswerRequest": {
+        "type": "object",
+        "description": "Answers a waiting `join_request`.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "op": {
+            "type": "string",
+            "const": "answer"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelName"
+          },
+          "member": {
+            "$ref": "#/components/schemas/NodeId"
+          },
+          "accept": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "op",
+          "channel",
+          "member",
+          "accept"
+        ]
+      },
+      "HistoryRequest": {
+        "type": "object",
+        "description": "Stored messages before `before` (newest when absent), oldest first.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "op": {
+            "type": "string",
+            "const": "history"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelName"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 50
+          },
+          "before": {
+            "$ref": "#/components/schemas/OpHash"
+          }
+        },
+        "required": [
+          "id",
+          "op",
+          "channel"
+        ]
+      },
+      "SnapshotRequest": {
+        "type": "object",
+        "description": "Re-sends `ready` to this client.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "op": {
+            "type": "string",
+            "const": "snapshot"
+          }
+        },
+        "required": [
+          "id",
+          "op"
+        ]
+      },
+      "CommandRequest": {
+        "type": "object",
+        "description": "Runs a `/command` as if typed with `channel` focused (the session's default channel when absent). `/quit`, `/switch`, `/s` and `/debug-*` are refused.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "op": {
+            "type": "string",
+            "const": "command"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelName"
+          },
+          "line": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "required": [
+          "id",
+          "op",
+          "line"
+        ]
+      },
+      "Request": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AuthRequest"
+          },
+          {
+            "$ref": "#/components/schemas/SendRequest"
+          },
+          {
+            "$ref": "#/components/schemas/AnswerRequest"
+          },
+          {
+            "$ref": "#/components/schemas/HistoryRequest"
+          },
+          {
+            "$ref": "#/components/schemas/SnapshotRequest"
+          },
+          {
+            "$ref": "#/components/schemas/CommandRequest"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "op",
+          "mapping": {
+            "auth": "#/components/schemas/AuthRequest",
+            "send": "#/components/schemas/SendRequest",
+            "answer": "#/components/schemas/AnswerRequest",
+            "history": "#/components/schemas/HistoryRequest",
+            "snapshot": "#/components/schemas/SnapshotRequest",
+            "command": "#/components/schemas/CommandRequest"
+          }
+        },
+        "description": "A client-to-server text frame: one JSON object."
+      },
+      "HelloEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "hello"
+              },
+              "protocol": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "version": {
+                "type": "string"
+              },
+              "node": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "client": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "protocol",
+              "version",
+              "node",
+              "client"
+            ]
+          }
+        ],
+        "description": "First frame on every connection, before `ready`.",
+        "x-routing": "socket"
+      },
+      "ReadyEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "ready"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "group": {
+                "$ref": "#/components/schemas/Hex32"
+              },
+              "role": {
+                "$ref": "#/components/schemas/Role"
+              },
+              "status": {
+                "$ref": "#/components/schemas/JoinStatus"
+              },
+              "invite": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "node": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "channels": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChannelInfo"
+                }
+              },
+              "bots": {
+                "type": "boolean"
+              },
+              "bot_provider": {
+                "type": "string"
+              },
+              "bot_servers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "group",
+              "role",
+              "status",
+              "invite",
+              "node",
+              "channels",
+              "bots"
+            ]
+          }
+        ],
+        "description": "The session: its default channel's fields at the top level, every channel in `channels`. Sent on connect and in answer to `snapshot`.",
+        "x-routing": "reply"
+      },
+      "DoneEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "done"
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "ok"
+            ]
+          }
+        ],
+        "description": "Ends every request, exactly once. `error` is set when `ok` is false.",
+        "x-routing": "reply"
+      },
+      "HistoryEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "history"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "messages": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HistoryMessage"
+                }
+              },
+              "more": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "messages",
+              "more"
+            ]
+          }
+        ],
+        "description": "Answer to `history`: up to `limit` messages before the cursor, oldest first.",
+        "x-routing": "reply"
+      },
+      "LaggedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "lagged"
+              },
+              "seq": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "seq"
+            ]
+          }
+        ],
+        "description": "This client fell more than 1024 frames behind. Sent just before closing with 4008; `seq` is the first frame it did not get.",
+        "x-routing": "socket"
+      },
+      "MessageEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "message"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "author": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "text": {
+                "type": "string"
+              },
+              "nickname": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "op": {
+                "$ref": "#/components/schemas/OpHash"
+              },
+              "mine": {
+                "type": "boolean"
+              },
+              "ts": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "bot": {
+                "type": "boolean"
+              },
+              "ask": {
+                "type": "boolean"
+              },
+              "long": {
+                "type": "boolean"
+              },
+              "action": {
+                "type": "boolean"
+              },
+              "bot_claim": {
+                "type": "string",
+                "enum": [
+                  "not accepted"
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "author",
+              "text",
+              "nickname",
+              "op",
+              "mine",
+              "ts",
+              "bot",
+              "ask",
+              "long",
+              "action"
+            ]
+          }
+        ],
+        "description": "A chat message, stored and shown. Your own messages arrive here too (`mine: true`) once published.",
+        "x-routing": "broadcast"
+      },
+      "InfoEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "info"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "text"
+            ]
+          }
+        ],
+        "description": "A note for a person. Under a request it answers that request.",
+        "x-routing": "reply"
+      },
+      "ErrorEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "error"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "text"
+            ]
+          }
+        ],
+        "description": "Something failed. Under a request, the request's `done` carries the same text.",
+        "x-routing": "reply"
+      },
+      "ChannelsEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "channels"
+              },
+              "channels": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChannelInfo"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channels"
+            ]
+          }
+        ],
+        "description": "Answer to `/channels`.",
+        "x-routing": "reply"
+      },
+      "ChannelEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "channel"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "group": {
+                "$ref": "#/components/schemas/Hex32"
+              },
+              "role": {
+                "$ref": "#/components/schemas/Role"
+              },
+              "status": {
+                "$ref": "#/components/schemas/JoinStatus"
+              },
+              "invite": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "focused": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "group",
+              "role",
+              "status",
+              "invite",
+              "focused"
+            ]
+          }
+        ],
+        "description": "A channel was added (`/create`, `/join`, the bot DM).",
+        "x-routing": "broadcast"
+      },
+      "SwitchedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "switched"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              }
+            },
+            "required": [
+              "event",
+              "channel"
+            ]
+          }
+        ],
+        "description": "The session's focus moved. Never sent over the socket: `/switch` is refused there.",
+        "x-routing": "reply"
+      },
+      "InviteEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "invite"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "invite": {
+                "type": "string"
+              },
+              "copied": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "system",
+                      "terminal"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "invite",
+              "copied"
+            ]
+          }
+        ],
+        "description": "Answer to `/invite`.",
+        "x-routing": "reply"
+      },
+      "MembersEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "members"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "members": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NodeId"
+                }
+              },
+              "access": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/Access"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "members",
+              "access"
+            ]
+          }
+        ],
+        "description": "Answer to `/members`.",
+        "x-routing": "reply"
+      },
+      "JoinedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "joined"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "members": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "access": {
+                "$ref": "#/components/schemas/Access"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "members",
+              "access"
+            ]
+          }
+        ],
+        "description": "A member is in the channel (including this node, when its space opens).",
+        "x-routing": "broadcast"
+      },
+      "PromotedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "promoted"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "access": {
+                "$ref": "#/components/schemas/Access"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "access"
+            ]
+          }
+        ],
+        "description": "A member's access changed.",
+        "x-routing": "broadcast"
+      },
+      "RemovedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "removed"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "members": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "members"
+            ]
+          }
+        ],
+        "description": "A member left or was removed.",
+        "x-routing": "broadcast"
+      },
+      "NickEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "nick"
+              },
+              "nickname": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "nickname"
+            ]
+          }
+        ],
+        "description": "This node's nickname changed.",
+        "x-routing": "broadcast"
+      },
+      "JoinRequestEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "join_request"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "auto": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "auto"
+            ]
+          }
+        ],
+        "description": "Someone asks to join a channel this node manages. Answer with the `answer` op unless `auto`.",
+        "x-routing": "broadcast"
+      },
+      "JoinDeclinedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "join_declined"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "reason"
+            ]
+          }
+        ],
+        "description": "A join request was declined: `bot DM` (never admitted) or `declined` (an `answer` with `accept: false`).",
+        "x-routing": "broadcast"
+      },
+      "SyncStartedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "sync_started"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "peer": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "incoming_ops": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "incoming_bytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "peer",
+              "incoming_ops",
+              "incoming_bytes"
+            ]
+          }
+        ],
+        "description": "Log sync with a peer began.",
+        "x-routing": "broadcast"
+      },
+      "SyncEndedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "sync_ended"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "peer": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "received_ops": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sent_ops": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "peer",
+              "received_ops",
+              "sent_ops",
+              "error"
+            ]
+          }
+        ],
+        "description": "Log sync with a peer ended.",
+        "x-routing": "broadcast"
+      },
+      "ToolCallEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "tool_call"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "asker": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "tool": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "sent",
+                  "ok",
+                  "error",
+                  "denied"
+                ]
+              },
+              "op": {
+                "$ref": "#/components/schemas/OpHash"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "asker",
+              "tool",
+              "state",
+              "op"
+            ]
+          }
+        ],
+        "description": "A bot turn called a tool.",
+        "x-routing": "broadcast"
+      },
+      "JobEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "job"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "op": {
+                "$ref": "#/components/schemas/OpHash"
+              },
+              "asker": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "queued",
+                  "started",
+                  "done",
+                  "refused",
+                  "abandoned",
+                  "failed"
+                ]
+              },
+              "reason": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "turn_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "model_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tool_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "requests": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "input_tokens": {
+                "description": "Null when the model's provider reported no count.",
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "output_tokens": {
+                "description": "Null when the model's provider reported no count.",
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "since_ask_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "denied": {
+                "description": "Names of the tools the turn was refused, one entry per refused call.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "op",
+              "asker",
+              "state",
+              "reason"
+            ]
+          }
+        ],
+        "description": "A bot turn's state. `done` carries timings and token counts.",
+        "x-routing": "broadcast"
+      },
+      "BotUnavailableEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot_unavailable"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "reason"
+            ]
+          }
+        ],
+        "description": "This session's bots could not start.",
+        "x-routing": "broadcast"
+      },
+      "BotsStartedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bots_started"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "servers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "provider",
+              "servers"
+            ]
+          }
+        ],
+        "description": "The bots started or changed provider.",
+        "x-routing": "broadcast"
+      },
+      "BotOnEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot_on"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "host": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "servers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "host",
+              "provider",
+              "servers"
+            ]
+          }
+        ],
+        "description": "A channel's bot was turned on.",
+        "x-routing": "broadcast"
+      },
+      "BotOffEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot_off"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "host": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "servers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "host",
+              "provider",
+              "servers"
+            ]
+          }
+        ],
+        "description": "A channel's bot was turned off.",
+        "x-routing": "broadcast"
+      },
+      "BotRejectedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot_rejected"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "author": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "host": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/NodeId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "author",
+              "host"
+            ]
+          }
+        ],
+        "description": "A bot claim from someone other than the channel's host was not accepted.",
+        "x-routing": "broadcast"
+      },
+      "BotEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "host": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/NodeId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "provider": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "servers": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "my_tools": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "host",
+              "provider",
+              "servers",
+              "enabled",
+              "my_tools"
+            ]
+          }
+        ],
+        "description": "Answer to `/bot`.",
+        "x-routing": "reply"
+      },
+      "BotModelEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "bot_model"
+              },
+              "model": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "running": {
+                "oneOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "model",
+              "running"
+            ]
+          }
+        ],
+        "description": "Answer to `/bot model`.",
+        "x-routing": "reply"
+      },
+      "PromptEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "prompt"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "system": {
+                "type": "string"
+              },
+              "tools": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "transcript_lines": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "system",
+              "tools",
+              "transcript_lines"
+            ]
+          }
+        ],
+        "description": "Answer to `/prompt`.",
+        "x-routing": "reply"
+      },
+      "GrantedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "granted"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "pattern": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "pattern"
+            ]
+          }
+        ],
+        "description": "A tool grant was added.",
+        "x-routing": "broadcast"
+      },
+      "RevokedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "revoked"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              "pattern": {
+                "type": "string"
+              },
+              "removed": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "member",
+              "pattern",
+              "removed"
+            ]
+          }
+        ],
+        "description": "Tool grants were removed.",
+        "x-routing": "broadcast"
+      },
+      "GrantsEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "grants"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "grants": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "member": {
+                      "$ref": "#/components/schemas/NodeId"
+                    },
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "member",
+                    "pattern"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "grants"
+            ]
+          }
+        ],
+        "description": "Answer to `/grants`.",
+        "x-routing": "reply"
+      },
+      "BlockedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "blocked"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              }
+            },
+            "required": [
+              "event",
+              "member"
+            ]
+          }
+        ],
+        "description": "A member was blocked from the bot.",
+        "x-routing": "broadcast"
+      },
+      "UnblockedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "unblocked"
+              },
+              "member": {
+                "$ref": "#/components/schemas/NodeId"
+              }
+            },
+            "required": [
+              "event",
+              "member"
+            ]
+          }
+        ],
+        "description": "A member was unblocked.",
+        "x-routing": "broadcast"
+      },
+      "AuditEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "audit"
+              },
+              "channel": {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              "calls": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "asker": {
+                      "$ref": "#/components/schemas/NodeId"
+                    },
+                    "tool": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    },
+                    "result_bytes": {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "at_ms": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "op": {
+                      "$ref": "#/components/schemas/OpHash"
+                    }
+                  },
+                  "required": [
+                    "asker",
+                    "tool",
+                    "state",
+                    "result_bytes",
+                    "at_ms",
+                    "op"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "event",
+              "channel",
+              "calls"
+            ]
+          }
+        ],
+        "description": "Answer to `/audit`.",
+        "x-routing": "reply"
+      },
+      "MemoryEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "memory"
+              },
+              "query": {
+                "type": "string"
+              },
+              "memories": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "pinned": {
+                      "type": "boolean"
+                    },
+                    "created_at_ms": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "text",
+                    "pinned",
+                    "created_at_ms"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "event",
+              "query",
+              "memories"
+            ]
+          }
+        ],
+        "description": "Answer to `/memory`.",
+        "x-routing": "reply"
+      },
+      "SchedulesEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "schedules"
+              },
+              "schedules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "prompt": {
+                      "type": "string"
+                    },
+                    "next_at_ms": {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "every_ms": {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "prompt",
+                    "next_at_ms",
+                    "every_ms"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "event",
+              "schedules"
+            ]
+          }
+        ],
+        "description": "Answer to `/schedules`.",
+        "x-routing": "reply"
+      },
+      "ScheduleFiredEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "schedule_fired"
+              },
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "name": {
+                "type": "string"
+              },
+              "late_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "next_at_ms": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "event",
+              "id",
+              "name",
+              "late_ms",
+              "next_at_ms"
+            ]
+          }
+        ],
+        "description": "A schedule of the personal bot fired.",
+        "x-routing": "broadcast"
+      },
+      "ScheduleMissedEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "schedule_missed"
+              },
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "name": {
+                "type": "string"
+              },
+              "late_ms": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "event",
+              "id",
+              "name",
+              "late_ms"
+            ]
+          }
+        ],
+        "description": "A schedule was too late to run.",
+        "x-routing": "broadcast"
+      },
+      "UnscheduledEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "unscheduled"
+              },
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "event",
+              "id",
+              "removed"
+            ]
+          }
+        ],
+        "description": "A schedule was removed.",
+        "x-routing": "broadcast"
+      },
+      "ForgotEvent": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/FrameMeta"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "event": {
+                "type": "string",
+                "const": "forgot"
+              },
+              "id": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "removed": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "event",
+              "id",
+              "removed"
+            ]
+          }
+        ],
+        "description": "A memory was deleted.",
+        "x-routing": "broadcast"
+      },
+      "Event": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/HelloEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ReadyEvent"
+          },
+          {
+            "$ref": "#/components/schemas/DoneEvent"
+          },
+          {
+            "$ref": "#/components/schemas/HistoryEvent"
+          },
+          {
+            "$ref": "#/components/schemas/LaggedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MessageEvent"
+          },
+          {
+            "$ref": "#/components/schemas/InfoEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ErrorEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ChannelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SwitchedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/InviteEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MembersEvent"
+          },
+          {
+            "$ref": "#/components/schemas/JoinedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/PromotedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RemovedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/NickEvent"
+          },
+          {
+            "$ref": "#/components/schemas/JoinRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/JoinDeclinedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SyncStartedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SyncEndedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallEvent"
+          },
+          {
+            "$ref": "#/components/schemas/JobEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotUnavailableEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotsStartedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotOnEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotOffEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotRejectedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BotModelEvent"
+          },
+          {
+            "$ref": "#/components/schemas/PromptEvent"
+          },
+          {
+            "$ref": "#/components/schemas/GrantedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/RevokedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/GrantsEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BlockedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UnblockedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/AuditEvent"
+          },
+          {
+            "$ref": "#/components/schemas/MemoryEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SchedulesEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ScheduleFiredEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ScheduleMissedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UnscheduledEvent"
+          },
+          {
+            "$ref": "#/components/schemas/ForgotEvent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "event",
+          "mapping": {
+            "hello": "#/components/schemas/HelloEvent",
+            "ready": "#/components/schemas/ReadyEvent",
+            "done": "#/components/schemas/DoneEvent",
+            "history": "#/components/schemas/HistoryEvent",
+            "lagged": "#/components/schemas/LaggedEvent",
+            "message": "#/components/schemas/MessageEvent",
+            "info": "#/components/schemas/InfoEvent",
+            "error": "#/components/schemas/ErrorEvent",
+            "channels": "#/components/schemas/ChannelsEvent",
+            "channel": "#/components/schemas/ChannelEvent",
+            "switched": "#/components/schemas/SwitchedEvent",
+            "invite": "#/components/schemas/InviteEvent",
+            "members": "#/components/schemas/MembersEvent",
+            "joined": "#/components/schemas/JoinedEvent",
+            "promoted": "#/components/schemas/PromotedEvent",
+            "removed": "#/components/schemas/RemovedEvent",
+            "nick": "#/components/schemas/NickEvent",
+            "join_request": "#/components/schemas/JoinRequestEvent",
+            "join_declined": "#/components/schemas/JoinDeclinedEvent",
+            "sync_started": "#/components/schemas/SyncStartedEvent",
+            "sync_ended": "#/components/schemas/SyncEndedEvent",
+            "tool_call": "#/components/schemas/ToolCallEvent",
+            "job": "#/components/schemas/JobEvent",
+            "bot_unavailable": "#/components/schemas/BotUnavailableEvent",
+            "bots_started": "#/components/schemas/BotsStartedEvent",
+            "bot_on": "#/components/schemas/BotOnEvent",
+            "bot_off": "#/components/schemas/BotOffEvent",
+            "bot_rejected": "#/components/schemas/BotRejectedEvent",
+            "bot": "#/components/schemas/BotEvent",
+            "bot_model": "#/components/schemas/BotModelEvent",
+            "prompt": "#/components/schemas/PromptEvent",
+            "granted": "#/components/schemas/GrantedEvent",
+            "revoked": "#/components/schemas/RevokedEvent",
+            "grants": "#/components/schemas/GrantsEvent",
+            "blocked": "#/components/schemas/BlockedEvent",
+            "unblocked": "#/components/schemas/UnblockedEvent",
+            "audit": "#/components/schemas/AuditEvent",
+            "memory": "#/components/schemas/MemoryEvent",
+            "schedules": "#/components/schemas/SchedulesEvent",
+            "schedule_fired": "#/components/schemas/ScheduleFiredEvent",
+            "schedule_missed": "#/components/schemas/ScheduleMissedEvent",
+            "unscheduled": "#/components/schemas/UnscheduledEvent",
+            "forgot": "#/components/schemas/ForgotEvent"
+          }
+        },
+        "description": "A server-to-client text frame: one JSON object. Clients must ignore events and fields they do not know."
+      }
+    }
+  },
+  "x-close-codes": {
+    "1000": "normal",
+    "1001": "the session ended, or no answer to pings",
+    "1003": "a binary frame was sent",
+    "1009": "a frame over 1 MiB",
+    "4001": "unauthorized: wrong or missing token",
+    "4002": "no token within 5 seconds",
+    "4008": "lagged: more than 1024 frames behind"
+  }
+}

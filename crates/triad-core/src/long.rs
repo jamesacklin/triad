@@ -77,6 +77,14 @@ pub fn seal(text: &str) -> Result<(LongRef, LongBody)> {
     seal_up_to(text, MAX_TEXT_BYTES)
 }
 
+/// 32 bytes from the operating system's random source: a long message's
+/// key, or the WebSocket API token.
+pub fn random_key() -> Result<[u8; 32]> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|e| anyhow!("no randomness for a key: {e}"))?;
+    Ok(key)
+}
+
 /// [`seal`] with a limit of `max` bytes.
 pub fn seal_up_to(text: &str, max: usize) -> Result<(LongRef, LongBody)> {
     ensure!(
@@ -84,8 +92,7 @@ pub fn seal_up_to(text: &str, max: usize) -> Result<(LongRef, LongBody)> {
         "message is {} bytes, limit is {max}",
         text.len()
     );
-    let mut key = [0u8; 32];
-    getrandom::fill(&mut key).map_err(|e| anyhow!("no randomness for a message key: {e}"))?;
+    let key = random_key()?;
     let ciphertext = cipher(&key)
         .encrypt(Nonce::from_slice(&NONCE), text.as_bytes())
         .map_err(|_| anyhow!("encrypting a long message failed"))?;

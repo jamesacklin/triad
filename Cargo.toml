@@ -52,6 +52,13 @@ webpki-root-certs = "1"
 # is used through ratatui's re-export and named nowhere else.
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 
+# The WebSocket API (crates/triad/src/ws, WEBSOCKET-PLAN.md). Both are
+# already in the build through iroh-relay, which enables the `server`
+# feature; pinned exactly at the lockfile's versions. `futures-sink` is the
+# trait tokio-websockets sends through.
+tokio-websockets = { version = "=0.13.3", default-features = false, features = ["server"] }
+futures-sink = "=0.3.34"
+
 triad-core = { path = "crates/triad-core" }
 triad-probe = { path = "crates/triad-probe" }
 triad-agent = { path = "crates/triad-agent" }

@@ -11,13 +11,15 @@ path = "src/main.rs"
 
 [features]
 sqlcipher = ["triad-core/sqlcipher"]
-default = ["tui", "clipboard"]
+default = ["tui", "clipboard", "ws"]
 # The full-screen terminal interface (crates/triad/src/tui). Without it,
 # chat runs as plain text.
 tui = ["dep:ratatui"]
 # `/invite` copies the invite to the system clipboard. Without it, or
 # with no display, it asks the terminal to copy (OSC 52).
 clipboard = ["dep:arboard"]
+# `triad serve`: the session on a WebSocket (crates/triad/src/ws, API.md).
+ws = ["dep:tokio-websockets", "dep:futures-sink"]
 
 [dependencies]
 triad-core = { workspace = true }
@@ -36,6 +38,8 @@ hex = { workspace = true }
 ratatui = { workspace = true, optional = true }
 arboard = { version = "3.6", optional = true, default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
+tokio-websockets = { workspace = true, optional = true }
+futures-sink = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

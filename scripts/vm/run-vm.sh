@@ -18,6 +18,8 @@
 #   VM_DATA_DISK an ext4 image attached as a second disk and mounted on /data,
 #                so the guest's data (and installed updates) outlive the run
 #   VM_RESUME    triad arguments for a restart by the supervisor (default: chat)
+#   VM_HOSTFWD   a QEMU hostfwd rule, e.g. tcp:127.0.0.1:17878-:7878, so this
+#                machine can reach a port in the guest (serve-test.sh)
 #
 # With TRIAD_SUPERVISE=1 in VM_ENV the guest's init keeps triad running and
 # updated instead of doing the test run; see init.c and update-test.sh.
@@ -83,6 +85,6 @@ timeout "$TIMEOUT" "$QEMU" -M "$MACHINE" -accel "$ACCEL" -cpu "$CPU" -m "$MEM" -
   -append "console=$CONSOLE root=/dev/vda rw ip=dhcp panic=-1 quiet $EXTRA" \
   -drive id=root,file="$WORK/rootfs.ext4",format=raw,if=none -device virtio-blk-device,drive=root \
   "${DATA_DISK[@]}" \
-  -netdev user,id=net -device virtio-net-device,netdev=net \
+  -netdev "user,id=net${VM_HOSTFWD:+,hostfwd=$VM_HOSTFWD}" -device virtio-net-device,netdev=net \
   -device virtio-rng-device \
   -serial file:"$LOG"
