@@ -9,6 +9,7 @@
 pub mod assistant;
 pub mod brain;
 pub mod builtin;
+pub mod channel;
 pub mod context;
 pub mod http;
 pub mod mcp;
@@ -407,11 +408,13 @@ fn brain(config: &AgentConfig) -> Result<Arc<dyn Brain>> {
 
 impl Agent {
     /// Starts the bots. With a `store`, the personal bot also has its own
-    /// DM-only tools (memory) over it.
+    /// DM-only tools (memory) over it; with `channels`, channel bots have
+    /// the channel tools (topics) over the session.
     pub async fn start(
         config: &AgentConfig,
         data_dir: &Path,
         store: Option<Arc<dyn assistant::Store>>,
+        channels: Option<Arc<dyn channel::Channels>>,
     ) -> Result<Agent> {
         let brain = brain(config)?;
         let mut warnings = Vec::new();
@@ -464,6 +467,16 @@ impl Agent {
             for name in &both.hidden {
                 warnings.push(format!(
                     "tool server {name} is left out: the personal bot's own tools use that name"
+                ));
+            }
+            tools = Arc::new(both);
+        }
+        if let Some(channels) = channels {
+            let own = channel::ChannelTools::new(channels);
+            let both = Both::new(Arc::new(own), tools);
+            for name in &both.hidden {
+                warnings.push(format!(
+                    "tool server {name} is left out: the channel tools use that name"
                 ));
             }
             tools = Arc::new(both);
@@ -529,7 +542,9 @@ impl Agent {
     }
 
     /// The servers a channel's bot can use: those with a tool of any scope.
-    /// This is what a channel is told about.
+    /// This is what a channel is told about: where its messages can go. The
+    /// channel tools (`channel.topic`) act on the session and reach nothing
+    /// else, so they are not listed.
     pub fn channel_servers(&self) -> Vec<String> {
         let any: Vec<ToolSpec> = self
             .all_tools
@@ -585,17 +600,17 @@ pub async fn run_turn(
     let output = agent.brain.turn(input, &gate).await?;
     let denied = gate.denied();
     // A tool that was offered can only have been refused by the step
-    // limit, and a DM-only one in a channel by its scope (the model was
-    // told why); the rest were not permitted for this asker.
-    let dm_only = |t: &str| {
+    // limit, and one out of scope for this turn by its scope (the model
+    // was told why); the rest were not permitted for this asker.
+    let out_of_scope = |t: &str| {
         agent
             .all_tools
             .iter()
-            .any(|s| s.name == t && s.scope == Scope::DmOnly)
+            .any(|s| s.name == t && !tools::in_scope(s, input.kind))
     };
     let refused: Vec<String> = denied
         .iter()
-        .filter(|t| !offered(input, t) && !dm_only(t))
+        .filter(|t| !offered(input, t) && !out_of_scope(t))
         .cloned()
         .collect();
     let text = if refused.is_empty() {

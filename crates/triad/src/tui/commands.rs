@@ -27,6 +27,7 @@ pub const COMMANDS: &[Command] = &[
     c("/list", "", "list channels"),
     c("/create", "<name> [--no-bot]", "create a channel"),
     c("/join", "<invite> [name]", "join a channel"),
+    c("/topic", "<name>", "open a topic under the focused channel"),
     c("/invite", "[name]", "print an invite to a channel"),
     c("/members", "", "the focused channel's members"),
     c("/status", "", "the focused channel's counts"),

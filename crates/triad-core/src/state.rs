@@ -94,23 +94,43 @@ impl Outcome {
     }
 }
 
-/// Longest channel name, in bytes.
+/// Longest channel name, in bytes. A topic's name has two such parts.
 pub const MAX_NAME_BYTES: usize = 32;
 
 /// Normalizes a channel name: an optional leading `#` is dropped, and the
-/// rest must be 1 to 32 characters of `a-z`, `0-9`, `-` or `_`.
+/// rest must be 1 to 32 characters of `a-z`, `0-9`, `-` or `_`. A topic's
+/// local name is its channel's name and its own joined by `/`
+/// (`design/ideas`), each part following the same rule.
 pub fn channel_name(raw: &str) -> Result<String> {
     let name = raw.trim().trim_start_matches('#').to_ascii_lowercase();
+    match name.split_once('/') {
+        Some((parent, sub)) => Ok(format!(
+            "{}/{}",
+            name_part(parent, "channel")?,
+            name_part(sub, "topic")?
+        )),
+        None => name_part(&name, "channel"),
+    }
+}
+
+/// Normalizes a topic's own name, the part after the `/`.
+pub fn topic_name(raw: &str) -> Result<String> {
+    let name = raw.trim().trim_start_matches('#').to_ascii_lowercase();
+    name_part(&name, "topic")
+}
+
+/// One part of a name; `what` is `channel` or `topic`, for the error.
+fn name_part(name: &str, what: &str) -> Result<String> {
     if name.is_empty() || name.len() > MAX_NAME_BYTES {
-        bail!("channel name must be 1 to {MAX_NAME_BYTES} characters");
+        bail!("{what} name must be 1 to {MAX_NAME_BYTES} characters");
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     {
-        bail!("channel name may only contain a-z, 0-9, '-' and '_'");
+        bail!("{what} name may only contain a-z, 0-9, '-' and '_'");
     }
-    Ok(name)
+    Ok(name.to_string())
 }
 
 /// One group (channel) in this data directory.
@@ -126,6 +146,10 @@ pub struct Meta {
     pub relay: String,
     pub role: Role,
     pub status: JoinStatus,
+    /// For a topic, the channel it was opened in. p2panda has no nesting:
+    /// a topic is a space of its own, and only this node files it under
+    /// its channel.
+    pub parent: Option<[u8; 32]>,
 }
 
 /// A decrypted chat message.
@@ -422,7 +446,7 @@ impl State {
     /// Every group in this data directory, in the order they were added.
     pub fn groups(&self) -> Result<Vec<Meta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, topic, creator, relay, role, status FROM groups ORDER BY rowid",
+            "SELECT name, topic, creator, relay, role, status, parent FROM groups ORDER BY rowid",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -432,11 +456,12 @@ impl State {
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<Vec<u8>>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (name, topic, creator, relay, role, status) = row?;
+            let (name, topic, creator, relay, role, status, parent) = row?;
             out.push(Meta {
                 name,
                 topic: to_32(&topic)?,
@@ -444,6 +469,7 @@ impl State {
                 relay,
                 role: Role::parse(&role)?,
                 status: JoinStatus::parse(&status)?,
+                parent: parent.as_deref().map(to_32).transpose()?,
             });
         }
         Ok(out)
@@ -475,8 +501,8 @@ impl State {
             }
         }
         self.conn.execute(
-            "INSERT INTO groups (topic, name, creator, relay, role, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO groups (topic, name, creator, relay, role, status, parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 meta.topic.as_slice(),
                 meta.name,
@@ -484,6 +510,7 @@ impl State {
                 meta.relay,
                 meta.role.as_str(),
                 meta.status.as_str(),
+                meta.parent.as_ref().map(|p| p.as_slice()),
             ],
         )?;
         Ok(())
@@ -1498,6 +1525,9 @@ fn migrate_layout(conn: &mut Connection) -> Result<()> {
     if !has_column("messages", "nickname")? {
         tx.execute_batch("ALTER TABLE messages ADD COLUMN nickname TEXT;")?;
     }
+    if !has_column("groups", "parent")? {
+        tx.execute_batch("ALTER TABLE groups ADD COLUMN parent BLOB;")?;
+    }
     if !has_column("messages", "action")? {
         tx.execute_batch("ALTER TABLE messages ADD COLUMN action INTEGER NOT NULL DEFAULT 0;")?;
     }
@@ -1579,6 +1609,7 @@ mod tests {
             relay: "https://r/".into(),
             role: Role::Member,
             status: JoinStatus::Pending,
+            parent: None,
         }
     }
 
@@ -1626,6 +1657,46 @@ mod tests {
         for bad in ["", "#", "two words", "é", &"x".repeat(MAX_NAME_BYTES + 1)] {
             assert!(channel_name(bad).is_err(), "{bad:?}");
         }
+        // A topic: its channel's name and its own.
+        assert_eq!(channel_name("#Design/Ideas").unwrap(), "design/ideas");
+        for bad in ["design/", "/ideas", "a/b/c", "a//b"] {
+            assert!(channel_name(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(topic_name("#Ideas").unwrap(), "ideas");
+        assert!(topic_name("a/b").is_err());
+    }
+
+    #[test]
+    fn topics_keep_their_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(dir.path()).unwrap();
+        state.insert_group(&meta("design", 1)).unwrap();
+        let topic = Meta {
+            parent: Some([1; 32]),
+            ..meta("design/ideas", 2)
+        };
+        state.insert_group(&topic).unwrap();
+        assert_eq!(state.groups().unwrap(), [meta("design", 1), topic]);
+    }
+
+    #[test]
+    fn groups_gain_a_parent_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE groups (
+                 topic BLOB PRIMARY KEY, name TEXT NOT NULL UNIQUE, creator BLOB NOT NULL,
+                 relay TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL
+             );
+             INSERT INTO groups VALUES (x'0101010101010101010101010101010101010101010101010101010101010101',
+                 'general', x'0202020202020202020202020202020202020202020202020202020202020202',
+                 'https://r/', 'member', 'pending');",
+        )
+        .unwrap();
+        drop(old);
+        let state = State::open(dir.path()).unwrap();
+        assert_eq!(state.groups().unwrap(), [meta("general", 1)]);
     }
 
     #[test]

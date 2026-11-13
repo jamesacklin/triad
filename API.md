@@ -186,8 +186,10 @@ and `lagged`. Field types are in [openapi.json](openapi.json); `node`,
 name without `#`. A channel object (in `ready.channels`, `channels` and the
 `channel` event) has `channel`, `group` (the space ID), `role`
 (`creator`/`member`), `status` (`none`/`pending`/`joined`), `invite` (null
-until joined, and always for the bot DM) and `focused` (the session's
-default channel; not a client's focus).
+until joined, and always for the bot DM), `focused` (the session's
+default channel; not a client's focus) and `parent`: for a topic, the
+channel it was opened in, else null. A topic's own `channel` is
+`parent/name` (`design/ideas`).
 
 ### Socket
 
@@ -204,7 +206,7 @@ default channel; not a client's focus).
 | Event | Fields | When |
 |---|---|---|
 | `message` | `channel`, `author`, `text`, `nickname`, `op`, `mine`, `ts`, `bot`, `ask`, `long`, `action`, `bot_claim?` | A message, including this node's own once published. `ts` is milliseconds since 1970. |
-| `channel` | channel object | A channel was added (`/create`, `/join`, the bot DM). |
+| `channel` | channel object | A channel was added (`/create`, `/join`, the bot DM), or a topic (`/topic`; a topic announced in a channel this node is in; one the bot opened). |
 | `channels` | `channels` | Answer to `/channels`. |
 | `switched` | `channel` | The session's focus moved. Never sent over the socket, which refuses `/switch`. |
 | `invite` | `channel`, `invite`, `copied` | Answer to `/invite`. `copied` is always null over the socket. |

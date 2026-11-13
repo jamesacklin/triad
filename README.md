@@ -141,6 +141,7 @@ channel.
 | --- | --- |
 | plain text | Send to the focused channel, up to 2,000 bytes. Over 400 bytes it goes as a long message: encrypted beside the space, because p2panda 0.8 cannot read back a longer space message ([FINDINGS.md](FINDINGS.md#long-messages-2026-11-12)). |
 | `/create <name> [--no-bot]` | Create a channel, focus it, print its invite. It gets your bot unless `--no-bot`. |
+| `/topic <name>` | Open a topic under the focused channel and focus it. Needs `Manage` access there. See "Topics" below. |
 | `/join <invite> [name]` | Join a channel and focus it. Messages there stay disabled until a manager adds you. |
 | `/switch <name>` (`/s`) | Focus another channel. |
 | `/msg <name> <text>` | Send to a channel without switching. |
@@ -157,6 +158,27 @@ an optional leading `#`. An invite carries the inviter's name as a suggestion.
 If that name is taken, the joiner gets it with the space ID appended, or
 passes its own. Every JSON event about a channel has a `channel` field.
 `ready` describes the focused channel and lists all of them in `channels`.
+
+### Topics
+
+A topic is a sub-channel for one subject: `/topic ideas` in `#design` opens
+`#design/ideas`. p2panda has no nesting, so a topic is a space of its own
+with its own key and history; only this node files it under its channel
+(the `parent` field of a channel object). The web app shows topics under
+their channel in the sidebar.
+
+Membership follows the channel. The topic is announced in the channel, and
+every member's client joins it on reading the announcement, including members
+who join the channel later and read it in the history. A manager of the topic
+lets in anyone who is a member of the channel, at the access they have
+there, without asking. Someone removed from the channel is removed from its
+topics too. Only a member with `Manage` access in the channel opens topics,
+and a client joins only topics announced by one. Topics have no topics.
+
+A channel whose bot is yours gets your bot in each topic you open there. The
+bot can open topics itself with its `channel.topic` tool, which the host and
+admins have, and a member has once granted (`/grant <node> channel.topic`).
+Builds without topics show the announcement as a message and do not join.
 
 There is no `/leave` yet. A `state.sqlite` from before channels is migrated
 on first open, and its group becomes `#main`.
