@@ -31,18 +31,16 @@ function count(v: unknown): number | null {
 }
 
 /**
- * A finished turn's figures. Read defensively: on the wire `denied` is a
- * list of tool names and the token counts can be null (the mock brain
- * reports none), though openapi.json declares integers. See FINDINGS.md.
+ * A finished turn's figures. `denied` is a list of tool names and the
+ * token counts can be null (the mock brain reports none).
  */
-export function turnFigures(job: EventOf<'job'>): string {
-  const j = job as Record<string, unknown>
+export function turnFigures(j: EventOf<'job'>): string {
   const requests = count(j.requests) ?? 0
   let s = `last turn ${secs(j.turn_ms)} (model ${secs(j.model_ms)}, tools ${secs(j.tool_ms)}) · ${plural(requests, 'request')}`
   const i = count(j.input_tokens)
   const o = count(j.output_tokens)
   if (i !== null || o !== null) s += ` · ${i ?? 0}→${o ?? 0} tokens`
-  const denied = Array.isArray(j.denied) ? j.denied.length : (count(j.denied) ?? 0)
+  const denied = j.denied?.length ?? 0
   if (denied > 0) s += ` · ${denied} denied`
   return s
 }

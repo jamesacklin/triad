@@ -1744,7 +1744,8 @@ and `/schedules` only empty. There are no component tests.
    `denied` is a list of tool names (`bots.rs:794`, `turn.denied:
    Vec<String>`) and the token counts are null with the mock brain. The
    recorded fixtures caught this, not the types (`ws_docs` checks event
-   names, not field types). The app reads those fields defensively.
+   names, not field types). Since corrected in `openapi.json`; the types
+   were regenerated and the app's defensive reads removed.
 2. **Replies needing their own rendering:** `members`, `channels`, `grants`,
    `audit`, `memory`, `schedules` and `prompt` as tables or blocks; `invite`
    and `channel` with a copy button; `error` in red; and 25 one-line
@@ -1805,7 +1806,8 @@ and `/schedules` only empty. There are no component tests.
   accept it, but undici (Node 24's built-in `WebSocket`) requires the value
   to be exactly `upgrade` and fails the handshake. The fixture recorder
   uses a 60-line client on `node:net` instead. Any Node client of the API
-  will hit this; dropping `close` from the 101 would fix it.
+  will hit this; dropping `close` from the 101 would fix it. Since fixed in
+  the listener (see "axum under the listener"); Node 24 now connects.
 - **`ready` arrives twice** for a client that connects before the session's
   event loop starts: once broadcast at start-up (`main.rs:1196`, no `re`)
   and once for the client (`requests.rs:21`). The app treats a `ready` as a

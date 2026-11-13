@@ -476,10 +476,13 @@ export interface components {
             model_ms?: number;
             tool_ms?: number;
             requests?: number;
-            input_tokens?: number;
-            output_tokens?: number;
+            /** @description Null when the model's provider reported no count. */
+            input_tokens?: number | null;
+            /** @description Null when the model's provider reported no count. */
+            output_tokens?: number | null;
             since_ask_ms?: number;
-            denied?: number;
+            /** @description Names of the tools the turn was refused, one entry per refused call. */
+            denied?: string[];
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
