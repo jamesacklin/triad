@@ -1342,20 +1342,39 @@
                 "minimum": 0
               },
               "input_tokens": {
-                "type": "integer",
-                "minimum": 0
+                "description": "Null when the model's provider reported no count.",
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "output_tokens": {
-                "type": "integer",
-                "minimum": 0
+                "description": "Null when the model's provider reported no count.",
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "since_ask_ms": {
                 "type": "integer",
                 "minimum": 0
               },
               "denied": {
-                "type": "integer",
-                "minimum": 0
+                "description": "Names of the tools the turn was refused, one entry per refused call.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
               }
             },
             "required": [

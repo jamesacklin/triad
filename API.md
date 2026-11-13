@@ -218,7 +218,7 @@ default channel; not a client's focus).
 | `bot_rejected` | `channel`, `author`, `host` | A bot claim from someone other than the host. |
 | `bot` | `channel`, `host`, `provider`, `servers`, `enabled`, `my_tools` | Answer to `/bot`. |
 | `bot_model` | `model`, `running` | Answer to `/bot model`. |
-| `job` | `channel`, `op`, `asker`, `state`, `reason`, and on `done`: `turn_ms`, `model_ms`, `tool_ms`, `requests`, `input_tokens`, `output_tokens`, `since_ask_ms`, `denied` | A bot turn's state: `queued`, `started`, `done`, `refused`, `abandoned`, `failed`. |
+| `job` | `channel`, `op`, `asker`, `state`, `reason`, and on `done`: `turn_ms`, `model_ms`, `tool_ms`, `requests`, `input_tokens`, `output_tokens`, `since_ask_ms`, `denied` (the token counts may be null; `denied` is a list of refused tool names) | A bot turn's state: `queued`, `started`, `done`, `refused`, `abandoned`, `failed`. |
 | `tool_call` | `channel`, `asker`, `tool`, `state`, `op` | A turn called a tool: `sent`, then `ok` or `error`; or `denied`. |
 | `prompt` | `channel`, `system`, `tools`, `transcript_lines` | Answer to `/prompt`. |
 | `granted` | `channel`, `member`, `pattern` | `/grant`. |
