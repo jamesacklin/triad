@@ -60,7 +60,10 @@ export class Session {
   }
 
   #onStatus(status: ConnectionStatus): void {
-    if (status.state !== 'open') this.#paging.clear()
+    if (status.state !== 'open') {
+      for (const channel of this.#paging) this.#dispatch({ type: 'paging', channel, on: false })
+      this.#paging.clear()
+    }
     if (status.state === 'reconnecting') this.#resyncDue = true
     this.#dispatch({ type: 'status', status })
   }
@@ -133,7 +136,10 @@ export class Session {
   }
 
   async #page(channel: string, before?: string, mark = true): Promise<EventOf<'history'> | null> {
-    if (mark) this.#paging.add(channel)
+    if (mark) {
+      this.#paging.add(channel)
+      this.#dispatch({ type: 'paging', channel, on: true })
+    }
     try {
       const body: RequestBody = before
         ? { op: 'history', channel, limit: PAGE, before }
@@ -149,7 +155,10 @@ export class Session {
       }
       return null
     } finally {
-      if (mark) this.#paging.delete(channel)
+      if (mark) {
+        this.#paging.delete(channel)
+        this.#dispatch({ type: 'paging', channel, on: false })
+      }
     }
   }
 
@@ -159,6 +168,21 @@ export class Session {
     } catch {
       return null
     }
+  }
+
+  /** A note of the app's own in a channel's pane (the focus when none is named). */
+  note(text: string, error = false, channel?: string): void {
+    this.#dispatch({ type: 'local', text, error, channel, now: this.#now() })
+  }
+
+  /** The status bar's error is cleared when the next line is submitted, as in the TUI. */
+  clearError(): void {
+    this.#dispatch({ type: 'clearError' })
+  }
+
+  /** A request whose replies are not shown in the pane (a dialog shows them). Rejects with the error text. */
+  query(body: RequestBody): Promise<Reply> {
+    return this.client.request(body)
   }
 
   /** Sends a request whose replies are shown in the pane. Resolves with the reply, or null if it failed (the error is shown). */

@@ -64,6 +64,8 @@ export interface Channel {
   loaded: boolean
   /** No older messages remain. */
   atStart: boolean
+  /** A page of history is being fetched. */
+  paging: boolean
   unread: number
   members: number | null
   bot: Bot | null
@@ -127,6 +129,7 @@ export type Action =
    */
   | { type: 'history'; ev: EventOf<'history'>; before?: string; resync?: boolean }
   | { type: 'focus'; channel: string }
+  | { type: 'paging'; channel: string; on: boolean }
   | { type: 'local'; text: string; error?: boolean; channel?: string; now: number }
   | { type: 'answered'; channel: string; member: string }
   | { type: 'clearError' }
@@ -159,6 +162,7 @@ function newChannel(info: ChannelInfo): Channel {
     ops: new Set(),
     loaded: false,
     atStart: false,
+    paging: false,
     unread: 0,
     members: null,
     bot: null,
@@ -418,6 +422,8 @@ export function reducer(state: State, action: Action): State {
       if (!state.channels.some((c) => c.name === action.channel)) return state
       return updateChannel({ ...state, focus: action.channel }, action.channel, (c) => ({ ...c, unread: 0 }))
     }
+    case 'paging':
+      return updateChannel(state, action.channel, (c) => (c.paging === action.on ? c : { ...c, paging: action.on }))
     case 'local': {
       const s = action.error ? { ...state, lastError: action.text } : state
       return addNotice(s, action.channel, { event: 'local', text: action.text, error: action.error }, action.now)

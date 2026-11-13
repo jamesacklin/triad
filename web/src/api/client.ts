@@ -91,7 +91,8 @@ export class TriadClient {
   constructor(opts: ClientOptions) {
     this.url = opts.url
     this.#token = opts.token
-    this.#opts = { backoffMs: 1000, maxBackoffMs: 30_000, ...opts }
+    // `??`, not a spread of defaults: an option passed as undefined keeps the default.
+    this.#opts = { ...opts, backoffMs: opts.backoffMs ?? 1000, maxBackoffMs: opts.maxBackoffMs ?? 30_000 }
   }
 
   /** The id the next request will carry. */

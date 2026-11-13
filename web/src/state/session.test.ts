@@ -112,8 +112,11 @@ describe('Session', () => {
   it('after a reconnect: resyncs every loaded channel, paging back until it overlaps, merged by op', async () => {
     const t = await connected()
     t.s().drop(1001) // serve restarted
-    expect(t.state().status).toMatchObject({ state: 'reconnecting' })
-    await vi.advanceTimersByTimeAsync(1000)
+    expect(t.state().status).toEqual({ state: 'reconnecting', reason: 'dropped', attempt: 1, retryInMs: 1000 })
+    await vi.advanceTimersByTimeAsync(999)
+    expect(t.fake.sockets).toHaveLength(1) // no tight retry loop
+    await vi.advanceTimersByTimeAsync(1)
+    expect(t.fake.sockets).toHaveLength(2)
     t.s().open()
     t.s().emit(hello())
     t.s().emit(ready(['agent', 'garden']))
