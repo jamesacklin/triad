@@ -1,11 +1,33 @@
 # triad
 
-A command-line chat built to check whether p2panda and iroh fit together into
-one stack for encrypted group chat. One user holds any number of encrypted
-spaces, each a named channel, as in an IRC client. iroh dials peers by public
-key. p2panda keeps a signed append-only log per author, syncs it, and
-encrypts every message with its built-in spaces. This is an exploration: the
-code is disposable, and [FINDINGS.md](FINDINGS.md) is the deliverable.
+An encrypted, peer-to-peer group chat in which every user runs their own AI
+bots. One user holds any number of encrypted spaces, each a named channel,
+as in an IRC client. iroh dials peers by public key. p2panda keeps a signed
+append-only log per author, syncs it, and encrypts every message with its
+built-in spaces. There is no server: each user runs one `triad` process, and
+their bots run inside it.
+
+What is in it:
+
+- **[Channels](#channels-several-spaces-per-user) and
+  [topics](#topics)**: any number of encrypted spaces per user, with
+  sub-channels, invites, join requests and access levels.
+- **[Bots](#bots)**: a personal bot in a DM only you are in, with memory,
+  schedules and skills, and a bot in each channel you host. Any model
+  rig-core can reach, built-in web tools, and MCP servers.
+- **Three front ends on one session**: a full-screen
+  [terminal interface](#terminal-interface), a
+  [WebSocket API](#websocket-api) (`triad serve`), and a
+  [web app](#web-app) that the binary can serve itself. `--plain` and
+  `--json` remain for pipes and scripts.
+- **[Updates](#updates)**: signed releases installed into A/B slots, and a
+  [minimal VM guest](scripts/vm/README.md) that keeps `triad` running and
+  updated.
+
+triad began as an exploration of whether p2panda and iroh fit together into
+one stack for encrypted group chat, and it is still a prototype.
+[FINDINGS.md](FINDINGS.md) records what each stage found, and the plan each
+stage was built from is listed under [Development](#development).
 
 An earlier `triad` encrypted with OpenMLS (RFC 9420), following
 [SPEC.md](SPEC.md). That code was removed after the comparison in FINDINGS.md
@@ -20,12 +42,14 @@ a fresh `--data-dir`.
 One binary, `triad`. One data directory is one user: one identity and
 one p2panda node, in any number of spaces. The app talks only to p2panda.
 iroh runs inside p2panda, and p2panda encrypts every message before storing
-or sending it.
+or sending it. The terminal interface, the WebSocket API and the web app are
+views of the same session, and the bots are members of it: only a bot turn
+sends plaintext anywhere else, to the model provider you chose.
 
 ```mermaid
 flowchart LR
   subgraph plain["Sees plaintext"]
-    app["<b>triad</b><br/>CLI, channels, history"] --> spaces["<b>p2panda spaces</b><br/>group keys, encryption"]
+    app["<b>triad</b><br/>channels, history, bots,<br/>terminal, WebSocket, web"] --> spaces["<b>p2panda spaces</b><br/>group keys, encryption"]
   end
   subgraph cipher["Sees ciphertext only"]
     p2p["<b>p2panda</b><br/>signs, logs, syncs"] --> iroh["<b>iroh</b><br/>QUIC by public key"] --> peer["<b>relay / peer</b><br/>hole punch or relay"]
@@ -35,7 +59,9 @@ flowchart LR
 
 | Layer | Library | Owns |
 | --- | --- | --- |
-| App | `triad`, `triad-core` | Channels and their names, invites, join prompts, readable history |
+| Front ends | ratatui 0.30.2, axum 0.8.9, `web/` (React) | The terminal interface, `triad serve`, the web app |
+| Bots | `triad-agent`, rig-core 0.46.0, rmcp 3.9.0 | Model calls, tools and MCP servers, grants, memory, schedules, skills |
+| App | `triad`, `triad-core` | Channels and topics, their names, invites, join prompts, readable history, long messages |
 | Encryption and membership | p2panda 0.8.0 spaces | Group key agreement, encryption, member list and access levels |
 | Log and sync | p2panda 0.8.0 | Signed append-only log per author, SQLite storage, discovery, catch-up |
 | Transport | iroh 1.4.1 | QUIC connections dialed by public key, hole punching, relay fallback |
@@ -45,11 +71,18 @@ flowchart LR
 A prototype, not a reliable chat system. The two-machine acceptance run
 passes across two networks
 ([Milestone 6](FINDINGS.md#milestone-6-p2panda-spaces-on-two-machines-2026-11-11)).
-Several channels per user are tested on one machine only. FINDINGS.md lists
-what an app still has to handle itself: a removed member is not told, a
-removed member who reconnects looks like a new join request, and new members
-can read messages from before they joined. p2panda's encryption is its own
-protocol, not a standard, and is documented as subject to change before 1.0.
+Several channels per user, topics, the bots, the WebSocket API and the web
+app are tested on one machine only: the bots against a scripted stand-in for
+the model, with a separate check against a real one
+([Development](#development)). The VM scripts check chat, a hosted bot,
+`triad serve` and an update with rollback between a QEMU guest and its host.
+
+FINDINGS.md lists what an app still has to handle itself: a removed member
+is not told, a removed member who reconnects looks like a new join request,
+and new members can read messages from before they joined. p2panda's
+encryption is its own protocol, not a standard, and is documented as subject
+to change before 1.0. There is no always-on node, no `/leave`, and no TLS on
+the WebSocket.
 
 ## Prerequisites
 
@@ -60,7 +93,8 @@ protocol, not a standard, and is documented as subject to change before 1.0.
 
 The C compiler is needed because SQLite is compiled from bundled source and
 the TLS backend includes C and assembly. `rust-toolchain.toml` pins the exact
-toolchain; rustup installs it on first build.
+toolchain (1.98.1); rustup installs it on first build. Node and pnpm are
+needed only to build the [web app](#web-app).
 
 No inbound ports are needed. Each node makes outbound UDP connections for
 direct paths and outbound HTTPS to the relay.
@@ -76,7 +110,8 @@ triad whoami
 ```
 
 `triad whoami` creates this install's identity and prints its node ID.
-A clean build takes a few minutes.
+A clean build takes a few minutes. This build has the terminal interface and
+`triad serve` but not the web app; see [Web app](#web-app) to embed it.
 
 ## Use
 
@@ -93,9 +128,13 @@ chat mode. On machine B:
 triad join triad1-…
 ```
 
-A is asked `join request for #general from 7c1d09ee. Accept? [y/N]`. After
-`y`, both sides print that B joined. Then type a line and press Enter to send
-it. Lines starting with `/` are commands.
+A is asked whether to accept the join request for `#general` from B's node
+(in the status line of the terminal interface, or as a `[y/N]` prompt with
+`--plain`). After `y`, both sides show that B joined. Then type a line and
+press Enter to send it. Lines starting with `/` are commands.
+
+Both sessions start with bots on, and say what to type if no model is chosen
+yet ([Bots](#bots)); pass `--no-bot` for a plain chat.
 
 Later, `triad chat` opens every channel again. Someone who has the
 missed messages must be online for a member to catch up, because there is no
@@ -107,10 +146,13 @@ always-on node.
 | `create [--name <name>]` | Create a channel (default `general`) with your bot in it, print its invite, enter chat mode. |
 | `join <invite> [--name <name>]` | Add a channel from an invite, enter chat mode, wait to be added. |
 | `chat [--channel <name>]` | Open every channel in chat mode, focused on the named or first one. |
+| `serve [--listen <addr>] [--channel <name>]` | Run a chat session with no terminal, on a WebSocket ([WebSocket API](#websocket-api)). |
 | `channels` | List the channels in this data directory. |
 | `invite [--channel <name>]` | Print an invite to a channel this node has joined. |
 | `history [--channel <name>] [--limit N]` | Print stored messages, oldest first: one channel, or all in one timeline. |
 | `status` | Print role, join status and operation counts for every channel. |
+| `bot [memory \| schedules \| skills \| persona]` | See and change what your personal bot keeps ([below](#seeing-and-changing-what-the-bot-keeps)). |
+| `update [--url <url>] [--slots <dir>]` | Look for a newer signed release, and with `--slots` install it ([Updates](#updates)). |
 | `reset [--yes] [--keep-bot-config]` | Delete everything in the data directory (channels, history, identity, bot settings and keys) and print a new node ID. Asks you to type `reset` unless `--yes`. `--keep-bot-config` keeps `agent.json`, `mcp.json` and `keys.json`. Refuses a directory with no triad files in it. Quit any session using the directory first. |
 | `inspect --grep <text>` | Scan the raw bytes of `p2panda.sqlite` for the text. Exit 0 if absent, 1 if found. |
 | `probe listen` | Start a raw iroh echo endpoint and print its address. |
@@ -120,10 +162,12 @@ always-on node.
 | --- | --- | --- |
 | `--data-dir <path>` | All | Use this data directory (default `~/Library/Application Support/triad` on macOS, `~/.local/share/triad` on Linux). |
 | `--relay <url>` | `create`, `probe` | Override the default relay (`https://use1-1.relay.n0.iroh.link./`). Joiners take the relay from the invite. |
-| `--auto-accept` | `create`, `join`, `chat` | Accept every join request, in every channel this node manages, without asking. |
-| `--no-bot` | `create`, `join`, `chat` | Run without your bots ([Bots](#bots)). Also `TRIAD_NO_BOT=1`. |
+| `--nickname <name>` | All | Set your nickname in the channels this session opens. |
+| `--auto-accept` | `create`, `join`, `chat`, `serve` | Accept every join request, in every channel this node manages, without asking. |
+| `--no-bot` | `create`, `join`, `chat`, `serve` | Run without your bots ([Bots](#bots)). Also `TRIAD_NO_BOT=1`. |
 | `--plain` | `create`, `join`, `chat` | Use the line-based prompt instead of the [terminal interface](#terminal-interface). |
-| `--json` | chat mode | Print one JSON object per event (`ready`, `channel`, `switched`, `join_request`, `joined`, `removed`, `promoted`, `message`, `sync_started`, `sync_ended`, `error`). |
+| `--json` | `create`, `join`, `chat` | Print one JSON object per event (`ready`, `channel`, `message`, `join_request`, `joined`, `job`, `error` and the rest). They are the events `triad serve` sends, listed in [API.md](API.md#events). |
+| `--listen <addr>`, `--allow-remote`, `--allow-origin <origin>` | `serve` | Where the WebSocket listens (default `127.0.0.1:7878`), and who may connect ([WebSocket API](#websocket-api)). |
 | `-v` | All | Also print sync and connection events. |
 
 Exit codes: 0 success, 1 runtime error, 2 usage error.
@@ -159,6 +203,9 @@ If that name is taken, the joiner gets it with the space ID appended, or
 passes its own. Every JSON event about a channel has a `channel` field.
 `ready` describes the focused channel and lists all of them in `channels`.
 
+There is no `/leave` yet. A `state.sqlite` from before channels is migrated
+on first open, and its group becomes `#main`.
+
 ### Topics
 
 A topic is a sub-channel for one subject: `/topic ideas` in `#design` opens
@@ -179,9 +226,6 @@ A channel whose bot is yours gets your bot in each topic you open there. The
 bot can open topics itself with its `channel.topic` tool, which the host and
 admins have, and a member has once granted (`/grant <node> channel.topic`).
 Builds without topics show the announcement as a message and do not join.
-
-There is no `/leave` yet. A `state.sqlite` from before channels is migrated
-on first open, and its group becomes `#main`.
 
 ### Bots
 
@@ -277,15 +321,20 @@ get every tool apply to them unchanged.
 | `web.fetch` | Fetches a public page over http or https and returns its text. No JavaScript, no logins. The request comes from your machine, so the site sees your address. |
 | `time.now` | The date and time in UTC. |
 
+`web.fetch` connects only to public addresses. It refuses this machine,
+private and shared networks and link-local addresses, and checks every
+redirect, so nobody can have your bot read your own network. A tool's result
+is cut to 24,000 bytes before the model sees it. An MCP server named `web`
+or `time` is left out, with a warning at start.
+
 In your DM (`#agent`) only, the personal bot also has a memory that lasts
-between conversations:
+between conversations, and schedules:
 
 | Tool | What it does |
 | --- | --- |
 | `memory.save` | Saves a fact, preference or note (at most 2,000 bytes; at most 2,000 memories). A pinned one is shown to the bot in every DM turn (2,000 bytes of them in all). |
 | `memory.search` | Finds memories by their words, newest first. |
 | `memory.forget` | Deletes one by its ID. |
-
 | `schedule.add` | Schedules a prompt: once (`at`: `in 20m`, `09:00`, `2026-11-13 09:00`) or repeating (`every`: `30m`, `1d`, at least `5m`, with an optional `time` of day). At most 50. |
 | `schedule.list`, `schedule.remove` | Lists schedules, or removes one by its ID. |
 
@@ -310,7 +359,7 @@ directory, or the file `persona` in `agent.json` names) are read again at
 every turn, so edits apply from the next one; only the first skill, which
 creates `skills/`, needs the session restarted before `skills.read` exists.
 
-### Seeing and changing what the bot keeps
+#### Seeing and changing what the bot keeps
 
 Everything is in the data directory (`~/.local/share/triad` by default).
 `triad bot` shows where, and these work whether or not a chat session is
@@ -336,11 +385,7 @@ is dropped otherwise; a repeating one fires once for everything it missed.
 Times are UTC, or set `"utc_offset_minutes"` in `agent.json` (`-300` for
 UTC-5; there is no time zone database, so change it for daylight saving).
 
-`web.fetch` connects only to public addresses. It refuses this machine,
-private and shared networks and link-local addresses, and checks every
-redirect, so nobody can have your bot read your own network. A tool's result
-is cut to 24,000 bytes before the model sees it. An MCP server named `web`
-or `time` is left out, with a warning at start.
+#### Bot commands in chat
 
 | In chat mode | Behavior |
 | --- | --- |
@@ -594,7 +639,7 @@ Logs go to `triad.log` in the data directory (`RUST_LOG=debug` for more).
 ## Development
 
 ```sh
-cargo test                       # unit tests, the two-node test and the channels test
+cargo test                       # unit tests and the integration tests: spaces, topics, bots (mock model), the WebSocket API
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -p triad --test spaces_membership -- --ignored   # offline membership, about a minute each
@@ -602,10 +647,42 @@ cargo test -p triad --features sqlcipher --test bots_at_rest  # SQLCipher state.
 OPENROUTER_API_KEY=... scripts/live-check.sh   # the real model (or ANTHROPIC_API_KEY=...)
 ```
 
-Layout: `crates/triad` (the binary and its integration tests),
-`crates/triad-core` (message and invite formats, identity, `state.sqlite`),
-`crates/triad-probe` (raw iroh echo, the only crate that names iroh),
-`crates/triad-agent` (the bots' policy, context, brain and tools; the only
-crate that names `rig-core` and `rmcp`),
-`crates/triad-update` (signed releases: the manifest, the verified download,
-the A/B slots).
+The web app, from `web/` ([web/README.md](web/README.md)):
+
+```sh
+pnpm install --frozen-lockfile
+pnpm typecheck && pnpm lint && pnpm test
+pnpm gen:types                   # regenerate src/api/types.gen.ts after changing openapi.json
+```
+
+`scripts/web-dev.sh` runs `triad serve` and the Vite dev server together.
+`scripts/vm/` builds a minimal Linux guest and runs the chat, bot, serve and
+update tests against it under QEMU ([scripts/vm/README.md](scripts/vm/README.md)).
+`scripts/cross-test.sh` is the [acceptance run](#acceptance-run-two-machines).
+
+Layout:
+
+| Path | Holds |
+| --- | --- |
+| `crates/triad` | The binary: the session, the terminal interface (`src/tui`), the WebSocket API and embedded web app (`src/ws`), topics, and the integration tests. |
+| `crates/triad-core` | Message and invite formats, identity, long messages, `state.sqlite`. |
+| `crates/triad-agent` | The bots' policy, context, brain, tools, memory, schedules and skills. The only crate that names `rig-core` and `rmcp`. |
+| `crates/triad-probe` | Raw iroh echo. The only crate that names iroh. |
+| `crates/triad-update` | Signed releases: the manifest, the verified download, the A/B slots. |
+| `web/` | The web app. |
+| `scripts/` | The acceptance run, the live model check, releases, the web dev server, the VM guest. |
+
+Cargo features of `triad`: `tui`, `clipboard` and `ws` are on by default;
+`web` (embed the web app) and `sqlcipher` (encrypt `state.sqlite`) are not.
+
+Each stage was built from a plan, and its results are in
+[FINDINGS.md](FINDINGS.md):
+
+| Plan | Stage |
+| --- | --- |
+| [SPEC.md](SPEC.md) | The original two-node chat on iroh, MLS and p2panda. |
+| [HARNESS-PLAN.md](HARNESS-PLAN.md) | Personal bots and channel-hosted bots. |
+| [TUI-PLAN.md](TUI-PLAN.md) | The terminal interface. |
+| [ASSISTANT-PLAN.md](ASSISTANT-PLAN.md) | The personal bot's built-in tools, memory, schedules and skills. |
+| [WEBSOCKET-PLAN.md](WEBSOCKET-PLAN.md), [AXUM-PLAN.md](AXUM-PLAN.md) | `triad serve`, and axum under it. |
+| [WEB-PLAN.md](WEB-PLAN.md) | The web app. |
