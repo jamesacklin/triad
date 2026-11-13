@@ -35,6 +35,9 @@ pub enum Scope {
     /// Only in the personal bot's DM: never offered to a channel turn, and
     /// refused by the gate there.
     DmOnly,
+    /// Only in channels: never offered in the DM, and refused by the gate
+    /// there.
+    ChannelOnly,
 }
 
 /// One tool, named `server.tool`.
@@ -110,7 +113,11 @@ pub fn servers(tools: &[ToolSpec]) -> Vec<String> {
 
 /// Whether a tool may be used in a turn of `kind`.
 pub fn in_scope(tool: &ToolSpec, kind: Kind) -> bool {
-    tool.scope == Scope::Any || kind == Kind::Dm
+    match tool.scope {
+        Scope::Any => true,
+        Scope::DmOnly => kind == Kind::Dm,
+        Scope::ChannelOnly => kind == Kind::Channel,
+    }
 }
 
 /// The tools an asker is offered in a turn of `kind`: those its tool set
@@ -312,6 +319,8 @@ pub const MAX_RESULT_BYTES: usize = 24_000;
 
 /// Why the gate refuses a DM-only tool in a channel.
 pub const DM_ONLY: &str = "only available in the personal DM";
+/// Why the gate refuses a channel-only tool in the DM.
+pub const CHANNEL_ONLY: &str = "only available in a channel";
 
 /// The permission gate for one turn.
 pub struct Gate<'t> {
@@ -382,7 +391,11 @@ impl ToolCaller for Gate<'_> {
                 return Err(format!("{name}: no such tool"));
             };
             if !in_scope(&spec, self.cx.kind) {
-                return Err(self.deny(name, &args, DM_ONLY));
+                let why = match spec.scope {
+                    Scope::ChannelOnly => CHANNEL_ONLY,
+                    _ => DM_ONLY,
+                };
+                return Err(self.deny(name, &args, why));
             }
             let id = self.audit.sent(name, &args);
             let started = Instant::now();

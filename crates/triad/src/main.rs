@@ -21,6 +21,7 @@
 mod bots;
 mod clipboard;
 mod manage;
+mod topics;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(feature = "ws")]
@@ -1008,6 +1009,8 @@ struct Streams {
     /// Long-message ciphertext, one plain stream per space, keyed by the
     /// space's topic.
     longs: StreamMap<Topic, StreamSubscription<LongBody>>,
+    /// Topics bot turns ask to open (`channel.topic`).
+    topic_asks: mpsc::UnboundedReceiver<topics::TopicAsk>,
 }
 
 impl Streams {
@@ -1121,11 +1124,13 @@ async fn chat(
 
     let dm = state.dm_topic()?;
     let (bot_events_tx, bot_events_rx) = mpsc::unbounded_channel();
+    let (topic_asks_tx, topic_asks_rx) = mpsc::unbounded_channel();
     let mut session = Session {
         data_dir: data_dir.to_path_buf(),
         dm,
         bots: None,
         bot_events: bot_events_tx,
+        topic_asks: topic_asks_tx,
         me,
         identity,
         node,
@@ -1151,6 +1156,7 @@ async fn chat(
         jobs: JoinSet::new(),
         bot_events: bot_events_rx,
         longs: StreamMap::new(),
+        topic_asks: topic_asks_rx,
     };
     let first = groups.first().map(|g| g.topic);
     for meta in groups {
@@ -1231,6 +1237,8 @@ struct Session {
     bots: Option<bots::Bots>,
     /// Where bot turns send display lines.
     bot_events: mpsc::UnboundedSender<bots::BotEvent>,
+    /// Where bot turns ask for topics.
+    topic_asks: mpsc::UnboundedSender<topics::TopicAsk>,
     /// Publishers for long-message ciphertext, by space topic.
     long_pubs: BTreeMap<Topic, StreamPublisher<LongBody>>,
     /// Test hook `/debug-long-hold`: ciphertext not yet published.
@@ -1328,6 +1336,21 @@ impl Session {
         streams: &mut Streams,
     ) -> Result<Topic> {
         let name = channel_name(name.unwrap_or(DEFAULT_CHANNEL))?;
+        if name.contains('/') {
+            bail!("#{name} is a topic's name; open topics with /topic in their channel");
+        }
+        self.create_space(name, None, relay, streams).await
+    }
+
+    /// Creates a space under this local name (a topic's when `parent` is
+    /// set), with this node as its only member and manager.
+    async fn create_space(
+        &mut self,
+        name: String,
+        parent: Option<Topic>,
+        relay: Option<String>,
+        streams: &mut Streams,
+    ) -> Result<Topic> {
         if self.channels.values().any(|c| c.meta.name == name) {
             bail!("a channel named #{name} already exists; pick another name");
         }
@@ -1340,6 +1363,7 @@ impl Session {
             relay: relay.unwrap_or_else(|| self.home_relay.clone()),
             role: Role::Creator,
             status: JoinStatus::Joined,
+            parent,
         };
         self.state.insert_group(&meta)?;
         tracing::info!(channel = %meta.name, space = %hex::encode(&topic[..4]), "created channel");
@@ -1373,6 +1397,9 @@ impl Session {
         let name = match name {
             Some(n) => {
                 let n = channel_name(n)?;
+                if n.contains('/') {
+                    bail!("#{n} is a topic's name; pick a channel name without '/'");
+                }
                 if taken(&n) {
                     bail!("a channel named #{n} already exists; pick another name");
                 }
@@ -1382,7 +1409,12 @@ impl Session {
                 // The invite's name is a suggestion from someone else: fall
                 // back to the space ID if it is unusable or already taken.
                 let id = hex::encode(&invite.topic[..4]);
-                let suggested = invite.name.as_deref().and_then(|n| channel_name(n).ok());
+                // A topic's invite suggests `channel/topic`; joined on its
+                // own, it is a channel here.
+                let suggested = invite
+                    .name
+                    .as_deref()
+                    .and_then(|n| channel_name(&n.replace('/', "-")).ok());
                 match suggested {
                     Some(n) if !taken(&n) => n,
                     Some(n) => {
@@ -1409,7 +1441,14 @@ impl Session {
             relay: invite.relay,
             role: Role::Member,
             status: JoinStatus::Pending,
+            parent: None,
         };
+        self.join_space(meta, streams).await
+    }
+
+    /// Records a space this node asks to join and subscribes to it, which
+    /// announces its key bundle there.
+    async fn join_space(&mut self, meta: Meta, streams: &mut Streams) -> Result<Topic> {
         self.state.insert_group(&meta)?;
         tracing::info!(channel = %meta.name, space = %hex::encode(&meta.topic[..4]), "joining channel");
         let topic = meta.topic;
@@ -1421,10 +1460,12 @@ impl Session {
         let invite = (c.meta.status == JoinStatus::Joined && !self.is_dm(&c.meta.topic))
             .then(|| invite_to(&c.meta, &self.me))
             .transpose()?;
+        let parent = c.meta.parent.map(|p| self.name(&p).to_string());
         Ok(json!({
             "channel": c.meta.name, "group": hex::encode(c.meta.topic),
             "role": c.meta.role.as_str(), "status": c.meta.status.as_str(),
             "invite": invite, "focused": c.meta.topic == self.focus,
+            "parent": parent,
         }))
     }
 
@@ -1549,6 +1590,7 @@ impl Session {
                 Some((value, text)) = streams.bot_events.recv() => {
                     self.printer.emit(value, || text);
                 }
+                Some(ask) = streams.topic_asks.recv() => self.on_topic_ask(ask, streams).await,
                 _ = schedules.tick() => self.fire_schedules().await,
                 _ = tokio::signal::ctrl_c() => break,
             }
@@ -1638,6 +1680,13 @@ impl Session {
                 if self.bots.is_some() && !no_bot {
                     self.bot_on(topic, streams).await?;
                 }
+            }
+            "/topic" => {
+                if rest.is_empty() {
+                    bail!("usage: /topic <name>");
+                }
+                let topic = self.open_topic(focus, rest, streams).await?;
+                self.added(topic)?;
             }
             "/join" => {
                 let mut words = rest.split_whitespace();
@@ -1968,6 +2017,9 @@ impl Session {
         if let Some(ctl) = &body.ctl {
             self.on_control(topic, author, ctl).await?;
         }
+        if let Some(sub) = &body.topic {
+            self.on_topic_announced(topic, author, sub, streams).await?;
+        }
         let mine = author == self.me;
         let profile = self.state.profile(&topic, &author)?;
         let base = message_sender(&msg, &self.me, profile.clone());
@@ -2163,6 +2215,9 @@ impl Session {
                 {
                     return Ok(());
                 }
+                if self.let_into_topic(topic, member).await? {
+                    return Ok(());
+                }
                 self.printer.emit(
                     json!({"event": "join_request", "channel": name, "member": hex_id(&member),
                            "auto": self.opts.auto_accept}),
@@ -2184,7 +2239,13 @@ impl Session {
                 // `Ejected` arrives with an empty member list.
                 let now: BTreeMap<NodeId, AccessLevel> =
                     members.iter().map(|(k, a)| (*k.as_bytes(), *a)).collect();
+                let before: Vec<NodeId> = self.channel(&topic)?.members.keys().copied().collect();
+                let gone: Vec<NodeId> = before
+                    .into_iter()
+                    .filter(|m| !now.contains_key(m))
+                    .collect();
                 self.announce(topic, now);
+                self.remove_from_topics(topic, &gone).await;
             }
             StreamEvent::SyncStarted {
                 remote_node_id,

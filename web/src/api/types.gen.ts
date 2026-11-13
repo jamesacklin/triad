@@ -33,7 +33,7 @@ export interface components {
         /** @description An operation hash, 32 bytes hex. Unique per message; the key for de-duplication and the `history` cursor. */
         OpHash: string;
         Hex32: string;
-        /** @description A channel's local name, without `#`. */
+        /** @description A channel's local name, without `#`. A topic's is `channel/topic`. */
         ChannelName: string;
         /** @enum {string} */
         Role: "creator" | "member";
@@ -50,6 +50,8 @@ export interface components {
             status: components["schemas"]["JoinStatus"];
             invite: string | null;
             focused: boolean;
+            /** @description For a topic, the channel it was opened in. */
+            parent?: components["schemas"]["ChannelName"] | null;
         };
         HistoryMessage: {
             author: components["schemas"]["NodeId"];

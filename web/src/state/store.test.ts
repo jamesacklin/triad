@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { EventOf, IncomingEvent } from '@/api/protocol'
 import { channelInfo, hello, ME, message, msg, OP, ready, SAM } from '@/test/fake-socket'
 import raw from '@/test/fixtures/session.jsonl?raw'
-import { focused, initialState, reducer, type Action, type Msg, type State } from './store'
+import { channelTree, focused, initialState, reducer, topicLabel, type Action, type Msg, type State } from './store'
 
 const frames = raw
   .trim()
@@ -268,5 +268,28 @@ describe('the store', () => {
     expect(notices(s, 'garden')).toEqual(['local'])
     expect(s.lastError).toBe('bad')
     expect(reducer(s, { type: 'clearError' }).lastError).toBeNull()
+  })
+})
+
+describe('topics', () => {
+  it('nest under their channel, and stand alone without it', () => {
+    const r = ev({
+      ...ready(['agent', 'garden']),
+      channels: [
+        channelInfo('agent'),
+        channelInfo('garden'),
+        channelInfo('garden/beds', { parent: 'garden' }),
+        channelInfo('garden-2'),
+        channelInfo('lost/seeds', { parent: 'lost' }),
+      ],
+    })
+    const s = reducer(initialState, { type: 'event', ev: r, show: true, now: 0 })
+    const tree = channelTree(s.channels).map((n) => [n.channel.name, n.topics.map(topicLabel)])
+    expect(tree).toEqual([
+      ['agent', []],
+      ['garden', ['beds']],
+      ['garden-2', []],
+      ['lost/seeds', []],
+    ])
   })
 })

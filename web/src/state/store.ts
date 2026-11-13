@@ -535,6 +535,38 @@ export function reducer(state: State, action: Action): State {
   }
 }
 
+export interface ChannelNode {
+  channel: Channel
+  /** Its topics, by name. */
+  topics: Channel[]
+}
+
+/**
+ * The sidebar's tree: each channel with its topics under it. A topic whose
+ * channel is not here (an older session, or a topic joined by invite) is
+ * shown as a channel.
+ */
+export function channelTree(channels: Channel[]): ChannelNode[] {
+  const names = new Set(channels.map((c) => c.name))
+  const parentOf = (c: Channel) => {
+    const p = c.info.parent
+    return p && names.has(p) && p !== c.name ? p : null
+  }
+  const nodes = channels.filter((c) => parentOf(c) === null).map((channel) => ({ channel, topics: [] as Channel[] }))
+  const byName = new Map(nodes.map((n) => [n.channel.name, n]))
+  for (const c of channels) {
+    const p = parentOf(c)
+    if (p) byName.get(p)?.topics.push(c)
+  }
+  return nodes
+}
+
+/** A topic's own name: what follows `channel/`. */
+export function topicLabel(c: Channel): string {
+  const p = c.info.parent
+  return p && c.name.startsWith(`${p}/`) ? c.name.slice(p.length + 1) : c.name
+}
+
 export function focused(state: State): Channel | null {
   return state.channels.find((c) => c.name === state.focus) ?? null
 }

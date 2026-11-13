@@ -105,7 +105,7 @@
       },
       "ChannelName": {
         "type": "string",
-        "description": "A channel's local name, without `#`."
+        "description": "A channel's local name, without `#`. A topic's is `channel/topic`."
       },
       "Role": {
         "type": "string",
@@ -169,6 +169,17 @@
           },
           "focused": {
             "type": "boolean"
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ChannelName"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a topic, the channel it was opened in."
           }
         },
         "required": [

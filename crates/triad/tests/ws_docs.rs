@@ -14,7 +14,11 @@ fn root() -> PathBuf {
 /// Rust files of the binary, with any `#[cfg(test)] mod tests` cut off.
 fn sources() -> Vec<String> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![src.join("main.rs"), src.join("bots.rs")];
+    let mut files = vec![
+        src.join("main.rs"),
+        src.join("bots.rs"),
+        src.join("topics.rs"),
+    ];
     for entry in std::fs::read_dir(src.join("ws")).unwrap() {
         files.push(entry.unwrap().path());
     }

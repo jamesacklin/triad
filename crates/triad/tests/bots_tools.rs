@@ -325,8 +325,9 @@ fn run(backend: Backend) {
     assert_eq!(c_turn["tools"], json!([]), "C was offered tools");
     assert_eq!(c_turn["asker_tier"], "member");
     let a_turn = t.iter().find(|t| t["ask"] == "@bot cal from a").unwrap();
-    // The host is offered everything: two tools, and the three built in.
-    let all = if check_broken { 5 } else { 2 };
+    // The host is offered everything: two tools, the three built in, and
+    // channel.topic.
+    let all = if check_broken { 6 } else { 3 };
     assert_eq!(a_turn["tools"].as_array().unwrap().len(), all);
     let b_turn = t.iter().find(|t| t["ask"] == "@bot cal from b").unwrap();
     assert_eq!(b_turn["asker_tier"], "admin");

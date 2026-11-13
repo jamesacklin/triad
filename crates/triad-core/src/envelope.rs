@@ -57,6 +57,24 @@ pub struct ChatBody {
     /// [`crate::long`]), and `text` holds [`crate::long::FALLBACK_TEXT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long: Option<LongRef>,
+    /// A topic opened in this channel. Members' clients join it; `text`
+    /// says so for builds that do not know topics. A field of its own, not
+    /// a [`Control`], so those builds still read the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<TopicRef>,
+}
+
+/// A topic: a space of its own, filed under the channel it was announced
+/// in. Joined through its creator, the announcement's author.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicRef {
+    /// The topic's own name (the part after `channel/`), a suggestion as an
+    /// invite's is.
+    pub name: String,
+    /// The topic's space ID.
+    pub space: [u8; 32],
+    /// The creator's relay.
+    pub relay: String,
 }
 
 /// A channel announcement about its bot.
@@ -145,6 +163,7 @@ impl ChatBody {
             action: false,
             ctl: None,
             long: None,
+            topic: None,
             nickname: None,
         })
     }
@@ -170,6 +189,12 @@ impl ChatBody {
     /// Makes this message an announcement.
     pub fn with_ctl(mut self, ctl: Control) -> Self {
         self.ctl = Some(ctl);
+        self
+    }
+
+    /// Makes this message the announcement of a topic.
+    pub fn with_topic(mut self, topic: TopicRef) -> Self {
+        self.topic = Some(topic);
         self
     }
 
@@ -377,6 +402,29 @@ mod tests {
         let pieces = split_text(&long, 7);
         assert!(pieces.iter().all(|p| p.len() <= 7), "{pieces:?}");
         assert_eq!(pieces.concat(), long);
+    }
+
+    #[test]
+    fn topic_announcements_fit_and_old_builds_read_their_text() {
+        let body = ChatBody::new(&format!("opened a topic: #{}", "x".repeat(32)), 42)
+            .unwrap()
+            .with_topic(TopicRef {
+                name: "x".repeat(32),
+                space: [0xff; 32],
+                relay: format!("https://{}.example.com/", "r".repeat(40)),
+            });
+        let bytes = body.encode().unwrap();
+        // Spaces carry a message in an operation header, which cannot hold
+        // much more than SEND_TEXT_BYTES; see that constant.
+        assert!(bytes.len() <= SEND_TEXT_BYTES, "{} bytes", bytes.len());
+        assert_eq!(ChatBody::decode(&bytes).unwrap(), body);
+
+        #[derive(Deserialize)]
+        struct Old {
+            text: String,
+        }
+        let old: Old = cbor_decode(&bytes).unwrap();
+        assert_eq!(old.text, body.text);
     }
 
     #[test]

@@ -255,7 +255,9 @@ impl Session {
         let data_dir = data_dir.as_path();
         let audit_db = Arc::new(Mutex::new(State::open(data_dir)?));
         let store: Arc<dyn Store> = Arc::new(StateStore(audit_db.clone()));
-        let agent = Agent::start(config, data_dir, Some(store)).await?;
+        let channels: Arc<dyn triad_agent::channel::Channels> =
+            Arc::new(topics::Opener(self.topic_asks.clone()));
+        let agent = Agent::start(config, data_dir, Some(store), Some(channels)).await?;
         for w in &agent.warnings {
             self.printer.info(w);
         }
@@ -315,6 +317,7 @@ impl Session {
             relay: self.home_relay.clone(),
             role: Role::Creator,
             status: JoinStatus::Joined,
+            parent: None,
         };
         self.state.insert_group(&meta)?;
         self.state.set_dm_topic(&topic)?;
@@ -425,7 +428,7 @@ impl Session {
     }
 
     /// Whether this node runs the channel's bot right now.
-    fn hosting(&self, topic: &Topic) -> bool {
+    pub(crate) fn hosting(&self, topic: &Topic) -> bool {
         self.bots.is_some()
             && matches!(self.state.bot(topic), Ok(Some(b)) if b.enabled && b.host == self.me)
     }
