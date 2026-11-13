@@ -394,6 +394,32 @@ triad --data-dir /tmp/bob --nickname bob join triad1-…
 Alice answers `y` to bob's join request. `TRIAD_AGENT_BRAIN=mock` gives
 alice a bot that echoes `@bot` asks with no model key.
 
+## WebSocket API
+
+`triad serve` runs a session with no terminal and puts it on a WebSocket,
+for a web or mobile front end, a script, or a harness outside a VM:
+
+```text
+$ triad serve
+listening  ws://127.0.0.1:7878/v1
+token      /home/me/.local/share/triad/api-token
+```
+
+Clients authenticate with the token in that file (`Authorization: Bearer`,
+or a first frame `{"op":"auth","token":"…"}` from a browser), then receive
+the same events `--json` prints, one JSON object per frame, and send
+requests such as `{"id":1,"op":"send","channel":"garden","text":"hello"}`.
+Any `/command` runs through `{"id":2,"op":"command","channel":"garden","line":"/members"}`.
+Replies go to the client that asked; changes go to everyone.
+
+It listens on loopback only unless given `--allow-remote`, has no TLS (use
+an SSH tunnel or a proxy), and refuses connections from web pages unless
+their origin is passed with `--allow-origin`. [API.md](API.md) documents
+every request, event and close code, and the reconnect recipe;
+[openapi.json](openapi.json) has the same frames as OpenAPI 3.1 schemas for
+generating clients. Build without it with `--no-default-features` (or drop
+the `ws` feature).
+
 ## Updates
 
 `triad` can update itself from a release published as static files, over

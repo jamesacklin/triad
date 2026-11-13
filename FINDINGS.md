@@ -1316,6 +1316,202 @@ when it held a skill). `bots_manage.rs` covers it end to end.
 - **Daylight saving:** `utc_offset_minutes` is fixed; a user in a zone with
   DST must change it twice a year.
 
+## WebSocket API (2026-11-13)
+
+`triad serve` runs a chat session with no terminal on a WebSocket
+(`crates/triad/src/ws/`, behind the default feature `ws`). The plan is
+`WEBSOCKET-PLAN.md`; the protocol is [API.md](API.md), and
+[openapi.json](openapi.json) carries the same requests and events as
+OpenAPI 3.1 schemas (added at the user's request, beyond the plan, for
+generating clients). It went in as the TUI did: a new sink (`Sink::Ws`, into
+a hub task) and a new input source, with no emit site changed.
+
+### Milestones
+
+| | What | Tests |
+|---|---|---|
+| W0 | Upgrade path chosen (below); sizes measured | |
+| W1 | `serve`, `Mode::Ws`, `Sink::Ws`, the hub, `hello`/`ready`, `seq`, ping, 1 MiB limit, lag | `ws_listen`; hub unit tests |
+| W2 | Token file, header or first-frame auth, 5 s timeout, `Origin`, `--allow-origin`, `--allow-remote` | `ws_auth` |
+| W3 | `Input` enum, the request cell, `send`, `command`, `done`, routing | `ws_requests` |
+| W4 | `answer`, `history` with `before` (`State::history_page`), `snapshot` | `ws_history` |
+| W5 | The personal bot over the socket, mock brain; the VM run | `ws_bots`; `scripts/vm/serve-test.sh` |
+| W6 | API.md, openapi.json, README section, this section | `ws_docs` |
+
+All existing tests pass unedited; `cargo fmt --check` and `cargo clippy
+--workspace --all-targets -- -D warnings` are clean; `cargo build -p triad
+--no-default-features` builds (no `serve`, no `ws` code).
+
+### W0: the upgrade path
+
+`tokio-websockets` 0.13.3 is already in the build through `iroh-relay`
+1.4.1, which turns on `client`, `server`, `ring`, `getrandom`, `rand`,
+`sha1_smol` and `rustls-bring-your-own-connector`. Its server side
+(`ServerBuilder::accept`) parses the request with its own codec, **writes
+`101 Switching Protocols` and only then returns** the `http::Request`. So
+`Origin` and `Authorization` can be read, but only after the upgrade is
+accepted; refusing then means a WebSocket close, not an HTTP 401/403. The
+codec that does the parsing (`upgrade::client_request`) is `pub(crate)`.
+
+The plan's fallback was hyper. Instead the listener reads the request head
+itself (up to the blank line), checks the method, the path, `Origin` and any
+bearer token, and answers a refusal with a plain HTTP status. The read is
+bounded: a head over 8 KiB gets `431`, and the head shares the 5 s the
+token has to arrive in, so a head that is slow as a whole (even one sent a
+byte at a time, each byte prompt) gets `408`. `ws_auth`'s
+`ws_request_head_is_bounded` covers both, and that a 7 KiB head with the
+token is still accepted. The header parsing is a dozen lines (split on
+CRLF, then on the first colon); `httparse` was not needed. An accepted connection's bytes are
+replayed into `accept` through a small `AsyncRead` wrapper, so the
+handshake proper (key, `Sec-WebSocket-Accept`, version checks) is still
+tokio-websockets'. This needs no hyper in the normal build, no SHA-1 of our
+own, and no new crate.
+
+One deviation from the dependency rule: **`futures-sink` (=0.3.34) is named
+in the manifest beside tokio-websockets.** `WebSocketStream` sends only
+through the `futures_sink::Sink` trait, and no crate triad already depends
+on re-exports it, so it cannot be called without naming the trait's crate.
+It is already compiled into the binary (through flume, sqlx and others), and
+is pinned at that exact version in `[workspace.dependencies]`. The
+alternative was writing outgoing frames by hand beside the library's
+reader. The plan's author accepted it (see "Where the plan was wrong").
+
+Release binary (`cargo build --release -p triad`, x86_64 Linux, not
+stripped):
+
+| Build | Bytes |
+|---|---|
+| Before (`df35e76`, default features) | 63,497,784 |
+| After (default features, with `ws`) | 63,950,736 |
+| Difference | +452,952 (+0.7%) |
+
+The VM's static, stripped, size-optimised guest binary with `ws` is
+25,283,608 bytes.
+
+### What changed outside `ws/`
+
+- `event_loop` takes `mpsc::Receiver<Input>` (`Line`, and under `ws`,
+  `Connected` and `Request`). `spawn_stdin` sends `Input::Line`; the TUI's
+  line receiver is bridged by a forwarding task, so `tui/` is unchanged.
+- `Printer` gained a `ws::Current` (the request being handled and the last
+  `error` under it) and a `Sink::Ws` arm.
+- `triad-core`: `long::random_key()` (the token; `seal_up_to` now uses it)
+  and `State::history_page(topic, limit, before)`, the paged variant, with
+  the row mapping shared with `State::history`.
+- The VM scripts: `init.c` does not append `--json` for `serve` and stops it
+  with SIGINT instead of `/quit`; `run-vm.sh` takes `VM_HOSTFWD`;
+  `serve-test.sh` and its client `ws-chat.py` (standard-library Python) are
+  new.
+
+### Answers to the plan's questions
+
+1. **Upgrade path and size.** The head is read by hand and replayed into
+   tokio-websockets' `accept` (W0 above). The feature adds 452,952 bytes
+   (0.7%) to the release binary; tokio-websockets itself was already linked for
+   iroh's relay client.
+2. **How long `/join` and `/create` stall the loop.** Measured in
+   `ws_requests` as the time a second client's `snapshot` takes while the
+   first client's command runs (debug build, loopback, no peers):
+   `/create` 93 ms, `/join` of an invite whose inviter is unreachable
+   117 ms, an idle `snapshot` 2 ms. `/join` does not wait to be admitted
+   (that happens later, off the loop), so neither stall is long. A `/join`
+   that has to wait on `insert_bootstrap` over a slow network could be
+   longer; not measured. Moving them to tasks stays a follow-up, not needed
+   yet.
+3. **Emit sites.** None of the `emit` calls changed. Two kinds of check
+   around them did: the two `printer.json()` tests that decide whether
+   `sync_started`/`sync_ended` are printed became `machine_readable()`
+   (true for `--json` and the socket), so the socket gets sync events as
+   `--json` does; and `/invite`'s clipboard copy also skips `Mode::Ws`, so a
+   headless server never touches a clipboard. Over the socket `answer` with
+   `accept: false` emits the existing `join_declined` event (reason
+   `declined`) where the line protocol prints an `info`: other clients need
+   to know the request is gone.
+4. **The reply set.** The plan's set was right as far as it went; it also
+   needed `hello`, `ready` (on connect and for `snapshot`), and the bot's
+   query answers `bot` and `bot_model`, which were missing. Everything not
+   in the explicit broadcast list is requester-only, as the plan's risk
+   section recommended, so `bot`/`bot_model` would have been safe anyway.
+   The only clients so far are the tests and `ws-chat.py`; neither wanted a
+   reply broadcast. Candidate for review: `info` under a request goes to the
+   asker only, which is right for `/status` but means a command whose only
+   output is an `info` describing a change would not reach other clients.
+   No current command does that.
+5. **What a browser client finds awkward.**
+   - The token cannot go in a header, so it is the first frame; a page must
+     hold the token, which means pasting it or serving it from somewhere
+     the page can read. Every allowed origin must be named exactly
+     (scheme, host and port); a page opened from `file://` sends
+     `Origin: null`.
+   - `send`'s `done` does not say which `message` is the result: p2panda's
+     space `publish` does not return the operation hash, so a client
+     matches its own message by `mine` and text. A client-chosen nonce in
+     the message, or the hash from p2panda, would fix it.
+   - `seq` is per process and counts every client's replies, so a gap is
+     not proof of loss; only `lagged` is. A per-client sequence would make
+     gaps meaningful.
+   - Channel objects carry `focused`, which is the session's default
+     channel, not anything the client chose; a client should ignore it.
+   - Reconnecting means paging `history` per channel; join requests that
+     arrived while disconnected are not resent.
+
+### Where the plan was wrong
+
+- **"tokio-websockets is the only dependency this plan may add."** A
+  WebSocket library whose send side is a `futures_sink::Sink` cannot be
+  driven without naming the trait's crate, and nothing in triad's tree
+  re-exports it. `futures-sink` (trait only, already linked, pinned at the
+  lockfile's 0.3.34) is named too. The rule's intent, no new code in the
+  build, holds.
+- **"Confirm its server side exposes the request headers before the
+  upgrade is accepted."** It exposes them only after writing the `101`.
+  The fallback the plan named (hyper) was not needed; see W0.
+
+### Other findings
+
+- **Two processes on one data directory.** Two `chat --json` on the same
+  directory both start. Each publishes and stores its own messages (both
+  show in `triad history` afterwards), but neither sees the other's live,
+  and iroh logs `accepting failed: … protocol compliance` as two endpoints
+  with one identity meet. Nothing is corrupted that this run could see, but
+  it is not a supported setup; `serve` adds no lock, as planned.
+- **`serve` on an empty data directory with `--no-bot`** fails as `chat`
+  does: "no channels in this data directory; run `create` or `join`". With
+  bots on it opens on the DM, which `ws_bots` and the VM run rely on.
+- **Stopping `serve`.** It stops on SIGINT (Ctrl-C), like `chat`. SIGTERM
+  kills it without closing spaces; a service manager should send SIGINT.
+- **`/debug-*` are refused over the socket**, as the plan says, so the test
+  hooks that need them stay on `--json`.
+
+### The VM run
+
+`scripts/vm/serve-test.sh` (new): the guest runs `serve --listen
+0.0.0.0:7878 --allow-remote` with the mock brain, so it starts on its DM;
+QEMU forwards `127.0.0.1:17878` to it; the token is made on the host and
+copied into the guest's `/data`. On the host a `create --json` pipe holds
+the channel, and `ws-chat.py` has the guest `/join` it through a `command`
+request, waits to be let in, sees the host's line, and answers with `send`.
+The kernel was copied from an earlier build (`VM_KERNEL=skip`; same
+`kernel-*.config`).
+
+| Guest RAM | Result | Free after | `VmHWM` | `RssAnon` |
+|---|---|---|---|---|
+| 128 MB | pass, `TRIAD_EXIT=0` | 84 MB | 38.0 MB | 20.5 MB |
+| 64 MB | pass, `TRIAD_EXIT=0` | 24 MB | 36.6 MB | 18.9 MB |
+
+x86_64 under KVM only; arm64 was not run.
+
+### Proposed follow-ups
+
+- Stop on SIGTERM as on SIGINT (for systemd and the VM supervisor).
+- Return the operation hash from `send` (needs p2panda's `publish` to
+  expose it, or a client nonce in `ChatBody`).
+- `triad chat --listen`: tee the sink so the TUI and a socket share a
+  session (the plan's first follow-up).
+- A lock on the data directory, now that a second process is one command
+  away.
+- A per-client `seq`, if clients want to detect loss without `lagged`.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

@@ -753,31 +753,10 @@ impl State {
              WHERE topic = ?1
              ORDER BY COALESCE(op_ts, sent_at_ms * 1000) ASC, op_hash ASC",
         )?;
-        let rows = stmt.query_map(params![topic.as_slice()], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, bool>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, bool>(7)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![topic.as_slice()], message_row)?;
         let mut out = Vec::new();
         for row in rows {
-            let (h, a, sent, ts, text, bot, nickname, action) = row?;
-            out.push(StoredMessage {
-                op_hash: to_32(&h)?,
-                author: to_32(&a)?,
-                sent_at_ms: sent as u64,
-                op_ts: ts.map(|t| t as u64),
-                text,
-                bot,
-                nickname,
-                action,
-            });
+            out.push(stored_message(row?)?);
         }
         if let Some(limit) = limit
             && out.len() > limit
@@ -785,6 +764,72 @@ impl State {
             out.drain(..out.len() - limit);
         }
         Ok(out)
+    }
+
+    /// One page of [`Self::history`]: up to `limit` messages, oldest first,
+    /// that sort before the message `before` (all of them when `None`).
+    /// The flag says whether older messages remain. `None` when `before`
+    /// is not a message in this channel.
+    pub fn history_page(
+        &self,
+        topic: &[u8; 32],
+        limit: usize,
+        before: Option<&[u8; 32]>,
+    ) -> Result<Option<(Vec<StoredMessage>, bool)>> {
+        let cursor: Option<(i64, Vec<u8>)> = match before {
+            None => None,
+            Some(hash) => {
+                let found = self
+                    .conn
+                    .query_row(
+                        "SELECT COALESCE(op_ts, sent_at_ms * 1000), op_hash FROM messages
+                         WHERE topic = ?1 AND op_hash = ?2",
+                        params![topic.as_slice(), hash.as_slice()],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+                    )
+                    .optional()?;
+                match found {
+                    Some(c) => Some(c),
+                    None => return Ok(None),
+                }
+            }
+        };
+        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let rows = match &cursor {
+            None => self
+                .conn
+                .prepare(
+                    "SELECT op_hash, author, sent_at_ms, op_ts, text, bot, nickname, action
+                     FROM messages WHERE topic = ?1
+                     ORDER BY COALESCE(op_ts, sent_at_ms * 1000) DESC, op_hash DESC
+                     LIMIT ?2",
+                )?
+                .query_map(params![topic.as_slice(), fetch], message_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            Some((key, hash)) => self
+                .conn
+                .prepare(
+                    "SELECT op_hash, author, sent_at_ms, op_ts, text, bot, nickname, action
+                     FROM messages WHERE topic = ?1
+                     AND (COALESCE(op_ts, sent_at_ms * 1000) < ?2
+                          OR (COALESCE(op_ts, sent_at_ms * 1000) = ?2 AND op_hash < ?3))
+                     ORDER BY COALESCE(op_ts, sent_at_ms * 1000) DESC, op_hash DESC
+                     LIMIT ?4",
+                )?
+                .query_map(
+                    params![topic.as_slice(), key, hash.as_slice(), fetch],
+                    message_row,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        let mut out = rows
+            .into_iter()
+            .map(stored_message)
+            .collect::<Result<Vec<_>>>()?;
+        let more = out.len() > limit;
+        out.truncate(limit);
+        out.reverse();
+        Ok(Some((out, more)))
     }
 
     /// One stored message by operation hash.
@@ -1468,6 +1513,45 @@ fn migrate_layout(conn: &mut Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// The columns [`State::history`] selects.
+type MessageRow = (
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    Option<i64>,
+    String,
+    bool,
+    Option<String>,
+    bool,
+);
+
+fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+    ))
+}
+
+fn stored_message(row: MessageRow) -> Result<StoredMessage> {
+    let (h, a, sent, ts, text, bot, nickname, action) = row;
+    Ok(StoredMessage {
+        op_hash: to_32(&h)?,
+        author: to_32(&a)?,
+        sent_at_ms: sent as u64,
+        op_ts: ts.map(|t| t as u64),
+        text,
+        bot,
+        nickname,
+        action,
+    })
 }
 
 fn to_32(bytes: &[u8]) -> Result<[u8; 32]> {

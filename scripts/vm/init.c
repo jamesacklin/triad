@@ -58,7 +58,8 @@ static void print_mem(pid_t pid) {
     puts("---END---");
 }
 
-// Fills argv with `<bin> --data-dir /data <words of file, or of dflt> --json`.
+// Fills argv with `<bin> --data-dir /data <words of file, or of dflt> --json`
+// (no `--json` for `serve`, whose output is the socket).
 static void triad_argv(char *argv[32], const char *bin, const char *file, const char *dflt) {
     static char args[4096];
     int n = 0;
@@ -68,7 +69,8 @@ static void triad_argv(char *argv[32], const char *bin, const char *file, const 
     if (!a || !fgets(args, sizeof args, a) || !args[strspn(args, " \n")]) snprintf(args, sizeof args, "%s", dflt);
     if (a) fclose(a);
     for (char *t = strtok(args, " \n"); t && n < 29; t = strtok(NULL, " \n")) argv[n++] = t;
-    argv[n++] = "--json"; argv[n] = NULL;
+    if (n < 4 || strcmp(argv[3], "serve")) argv[n++] = "--json";
+    argv[n] = NULL;
 }
 
 #define SLOTS "/data/bin"
@@ -239,7 +241,9 @@ int main(void) {
     dprintf(p[1], "%s\n", send_line);
     sleep(settle_s);
     print_mem(pid);
-    dprintf(p[1], "/quit\n");
+    // `serve` reads no stdin; it stops on SIGINT, as on Ctrl-C.
+    if (!strcmp(argv[3], "serve")) kill(pid, SIGINT);
+    else dprintf(p[1], "/quit\n");
     int st = 0; waitpid(pid, &st, 0);
     printf("TRIAD_EXIT=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
     sync();

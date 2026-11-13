@@ -18,6 +18,7 @@ for every run.
 | [run-vm.sh](run-vm.sh) | Boots the guest once with a given memory size and `triad` arguments. |
 | [chat-test.sh](chat-test.sh) | Host creates a group, the guest joins, each sends one message. Exits 0 on success. |
 | [bot-test.sh](bot-test.sh) | The guest creates a channel (with its bot, the default; mock brain) and hosts it; the host joins and asks it. Exits 0 on the bot's reply. |
+| [serve-test.sh](serve-test.sh) | The guest runs `triad serve` (mock brain); a socket client on this machine ([ws-chat.py](ws-chat.py)), through a QEMU port forward, has it join a channel the host created and chat. Exits 0 when both sides saw both messages. |
 | [update-test.sh](update-test.sh) | The guest updates itself from a release served by the host, then rolls back a bad release. Exits 0 on success. |
 | [init.c](init.c) | Guest PID 1: mounts, DNS, sets `/etc/triad.env`. Then either the test run (`triad --json`, one line, memory figures, reboot) or, with `TRIAD_SUPERVISE=1`, the supervisor that keeps `triad` running and updated. |
 | `kernel-*.config` | Kernel options added on top of `tinyconfig`, shared and per architecture. |

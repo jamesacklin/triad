@@ -23,6 +23,8 @@ mod clipboard;
 mod manage;
 #[cfg(feature = "tui")]
 mod tui;
+#[cfg(feature = "ws")]
+mod ws;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -133,6 +135,32 @@ enum Cmd {
         /// Plain line-based output instead of the full-screen interface.
         #[arg(long, conflicts_with = "json")]
         plain: bool,
+        /// Run without my bots: no personal bot, and no bot in channels I
+        /// create or host.
+        #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
+        no_bot: bool,
+    },
+    /// Run a chat session with no terminal, on a WebSocket (API.md).
+    #[cfg(feature = "ws")]
+    Serve {
+        /// Address to listen on. Loopback unless --allow-remote.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:7878")]
+        listen: String,
+        /// Allow a non-loopback --listen address. The socket is not
+        /// encrypted; put it behind an SSH tunnel or a TLS proxy.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Accept connections from a web page at this origin (for example
+        /// http://localhost:5173). Repeat for more. Without it, any
+        /// connection that sends an Origin header is refused.
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allow_origins: Vec<String>,
+        /// Channel the session's commands act on when a request names none
+        /// (default: as for `chat`).
+        #[arg(long, value_name = "NAME")]
+        channel: Option<String>,
+        #[arg(long)]
+        auto_accept: bool,
         /// Run without my bots: no personal bot, and no bot in channels I
         /// create or host.
         #[arg(long, env = "TRIAD_NO_BOT", value_parser = clap::builder::BoolishValueParser::new())]
@@ -262,6 +290,9 @@ enum Mode {
     Plain,
     /// The full-screen terminal interface.
     Tui,
+    /// `triad serve`: JSON frames on a WebSocket.
+    #[cfg(feature = "ws")]
+    Ws,
 }
 
 impl Mode {
@@ -578,6 +609,29 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
             let bots = BotStart::new(no_bot, &data_dir);
             run_chat(&rt, &data_dir, Start::Resume { channel }, opts, bots)?;
         }
+        #[cfg(feature = "ws")]
+        Cmd::Serve {
+            listen,
+            allow_remote,
+            allow_origins,
+            channel,
+            auto_accept,
+            no_bot,
+        } => {
+            let opts = Opts {
+                nickname,
+                auto_accept,
+                mode: Mode::Ws,
+                verbose,
+            };
+            let bots = BotStart::new(no_bot, &data_dir);
+            let listen = ws::Listen {
+                addr: listen,
+                allow_remote,
+                allow_origins,
+            };
+            ws::serve(&rt, &data_dir, listen, channel, opts, bots)?;
+        }
         Cmd::Channels => {
             for g in State::open(&data_dir)?.groups()? {
                 println!(
@@ -844,6 +898,16 @@ enum Start {
     },
 }
 
+/// What the session is told: a typed line (stdin or the terminal
+/// interface), or, under `triad serve`, a client connecting or a request.
+enum Input {
+    Line(String),
+    #[cfg(feature = "ws")]
+    Connected(ws::ClientId),
+    #[cfg(feature = "ws")]
+    Request(ws::Request),
+}
+
 /// Name given to `create` when none is passed.
 const DEFAULT_CHANNEL: &str = "general";
 
@@ -855,11 +919,17 @@ enum Sink {
     /// The terminal interface's thread, which gets both.
     #[cfg(feature = "tui")]
     Tui(tui::Events),
+    /// The WebSocket hub (`triad serve`), which gets the JSON.
+    #[cfg(feature = "ws")]
+    Ws(ws::Hub),
 }
 
 struct Printer {
     sink: Sink,
     verbose: bool,
+    /// The socket request being handled, which output is tagged with.
+    #[cfg(feature = "ws")]
+    request: ws::Current,
 }
 
 impl Printer {
@@ -871,11 +941,20 @@ impl Printer {
             Sink::Tui(tx) => {
                 let _ = tx.send((value, text()));
             }
+            #[cfg(feature = "ws")]
+            Sink::Ws(hub) => self.request.emit(hub, value),
         }
     }
 
-    fn json(&self) -> bool {
-        matches!(self.sink, Sink::Json)
+    /// Whether output is read by a program (`--json` or the socket), which
+    /// gets the events a person would find noisy.
+    fn machine_readable(&self) -> bool {
+        match self.sink {
+            Sink::Json => true,
+            #[cfg(feature = "ws")]
+            Sink::Ws(_) => true,
+            _ => false,
+        }
     }
 
     fn info(&self, text: &str) {
@@ -960,32 +1039,37 @@ fn run_chat(
     match opts.mode {
         #[cfg(feature = "tui")]
         Mode::Tui => {
-            let (events, lines, ui) = tui::spawn(data_dir)?;
-            let result = rt.block_on(chat(
-                data_dir,
-                start,
-                opts,
-                bots,
-                Sink::Tui(events),
-                Some(lines),
-            ));
+            let (events, mut lines, ui) = tui::spawn(data_dir)?;
+            let result = rt.block_on(async move {
+                let (tx, inputs) = mpsc::channel(64);
+                tokio::spawn(async move {
+                    while let Some(line) = lines.recv().await {
+                        if tx.send(Input::Line(line)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                chat(data_dir, start, opts, bots, Sink::Tui(events), Some(inputs)).await
+            });
             let shown = ui.join();
             result.and(shown)
         }
         Mode::Json => rt.block_on(chat(data_dir, start, opts, bots, Sink::Json, None)),
+        #[cfg(feature = "ws")]
+        Mode::Ws => unreachable!("serve runs through ws::serve"),
         _ => rt.block_on(chat(data_dir, start, opts, bots, Sink::Text, None)),
     }
 }
 
-/// A chat session. `lines` is where typed lines come from: stdin unless
-/// the terminal interface supplies them.
+/// A chat session. `lines` is where its input comes from: stdin unless
+/// the terminal interface or the socket supplies it.
 async fn chat(
     data_dir: &Path,
     start: Start,
     opts: Opts,
     bots: BotStart,
     sink: Sink,
-    lines: Option<mpsc::Receiver<String>>,
+    lines: Option<mpsc::Receiver<Input>>,
 ) -> Result<()> {
     let identity = Identity::load_or_create(data_dir)?;
     let me = identity.node_id();
@@ -1052,6 +1136,8 @@ async fn chat(
         printer: Printer {
             sink,
             verbose: opts.verbose,
+            #[cfg(feature = "ws")]
+            request: ws::Current::default(),
         },
         opts,
         asks: VecDeque::new(),
@@ -1151,7 +1237,7 @@ struct Session {
     held_long: Option<(Topic, LongBody)>,
 }
 
-fn spawn_stdin() -> mpsc::Receiver<String> {
+fn spawn_stdin() -> mpsc::Receiver<Input> {
     let (tx, rx) = mpsc::channel(64);
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -1160,10 +1246,8 @@ fn spawn_stdin() -> mpsc::Receiver<String> {
             match std::io::stdin().read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if tx
-                        .blocking_send(line.trim_end_matches(['\n', '\r']).to_string())
-                        .is_err()
-                    {
+                    let line = line.trim_end_matches(['\n', '\r']).to_string();
+                    if tx.blocking_send(Input::Line(line)).is_err() {
                         break;
                     }
                 }
@@ -1420,19 +1504,25 @@ impl Session {
     async fn event_loop(
         &mut self,
         streams: &mut Streams,
-        mut lines: mpsc::Receiver<String>,
+        mut lines: mpsc::Receiver<Input>,
     ) -> Result<()> {
         // The personal bot's schedules are checked once a second.
         let mut schedules = tokio::time::interval(std::time::Duration::from_secs(1));
         schedules.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                line = lines.recv() => {
-                    let Some(line) = line else { break };
-                    match self.on_line(line.trim(), streams).await {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(e) => self.printer.error(&format!("{e:#}")),
+                input = lines.recv() => {
+                    let Some(input) = input else { break };
+                    match input {
+                        Input::Line(line) => match self.on_line(line.trim(), streams).await {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(e) => self.printer.error(&format!("{e:#}")),
+                        },
+                        #[cfg(feature = "ws")]
+                        Input::Connected(client) => self.on_ws_connected(client),
+                        #[cfg(feature = "ws")]
+                        Input::Request(request) => self.on_ws_request(request, streams).await,
                     }
                 }
                 Some(res) = streams.joining.join_next() => match res {
@@ -1574,6 +1664,8 @@ impl Session {
                 // Scripts reading --json copy for themselves.
                 let copied = match self.opts.mode {
                     Mode::Json => None,
+                    #[cfg(feature = "ws")]
+                    Mode::Ws => None,
                     _ => self.clipboard.copy(&invite),
                 };
                 self.printer.emit(
@@ -2101,7 +2193,7 @@ impl Session {
                 ..
             } => {
                 let peer = *remote_node_id.as_bytes();
-                if self.printer.json() || self.printer.verbose {
+                if self.printer.machine_readable() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_started", "channel": name, "peer": hex_id(&peer),
                                "incoming_ops": incoming_operations, "incoming_bytes": incoming_bytes}),
@@ -2118,7 +2210,7 @@ impl Session {
             } => {
                 let peer = *remote_node_id.as_bytes();
                 let error = error.map(|e| e.to_string());
-                if self.printer.json() || self.printer.verbose {
+                if self.printer.machine_readable() || self.printer.verbose {
                     self.printer.emit(
                         json!({"event": "sync_ended", "channel": name, "peer": hex_id(&peer),
                                "received_ops": received_operations, "sent_ops": sent_operations,
