@@ -1529,7 +1529,7 @@ x86_64 under KVM only; arm64 was not run.
 The plan is `AXUM-PLAN.md`. `triad serve`'s listener no longer reads the
 request head by hand: each accepted TCP connection is served by hyper 1.12's
 HTTP/1 server (`http1::Builder` with `TokioTimer`, `header_read_timeout(5 s)`,
-`max_buf_size(8192)`, `keep_alive(false)`, `with_upgrades()`), running an
+`max_buf_size(8192)`, `with_upgrades()`), running an
 axum 0.8.9 `Router` through `hyper_util::service::TowerToHyperService`. The
 router is built per connection, with the accept time in its state, so the
 5 s deadline still runs from TCP accept and covers the head and the first
@@ -1545,6 +1545,13 @@ rather than `404`. The connection task and `run` port line for line onto
 exactly in `[workspace.dependencies]` and optional behind `ws`;
 `tokio-websockets` and `futures-sink` are gone from both manifests.
 tokio-tungstenite is used only through axum and is not named anywhere.
+
+One request per connection is kept by a response layer that adds
+`Connection: close` to every answer except the `101`. The first version set
+`keep_alive(false)` on the builder instead, which also put `close` in the
+upgrade's own header (`Connection: upgrade, close`); browsers accept that
+but Node's built-in WebSocket refuses it. `ws_frames` now asserts the
+header is exactly `upgrade`, and a Node 24 client was seen to connect.
 
 #### A0: four questions, answered with a throwaway listener
 

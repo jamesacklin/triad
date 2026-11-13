@@ -104,6 +104,14 @@ fn ws_ping_is_answered_and_binary_closes_1003() {
         got.push(b[0]);
     }
     assert!(got.starts_with(b"HTTP/1.1 101"), "{got:?}");
+    // The upgrade must not also say `close`: strict clients (Node's
+    // built-in WebSocket) refuse `Connection: upgrade, close`.
+    let head = String::from_utf8_lossy(&got).to_ascii_lowercase();
+    let connection = head
+        .lines()
+        .find_map(|l| l.strip_prefix("connection:"))
+        .expect("a Connection header");
+    assert_eq!(connection.trim(), "upgrade", "{head}");
 
     s.write_all(&frame(0x9, b"are you there")).unwrap();
     assert_eq!(

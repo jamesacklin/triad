@@ -270,18 +270,33 @@ async fn serve_connection(tcp: TcpStream, client: ClientId, shared: Arc<Shared>)
     let app = Router::new()
         .route(PATH, any(upgrade))
         .fallback(elsewhere)
+        .layer(axum::middleware::map_response(close_unless_upgraded))
         .with_state(conn);
     let served = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(AUTH_TIMEOUT)
         .max_buf_size(MAX_HEAD)
-        .keep_alive(false)
         .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(app))
         .with_upgrades()
         .await;
     if let Err(e) = served {
         tracing::debug!(client, "websocket request: {e}");
     }
+}
+
+/// One request per connection: every answer but the upgrade itself asks
+/// for the connection to be closed, and hyper then closes it. Turning
+/// keep-alive off on the builder would do the same but also adds `close`
+/// to the `101`'s `Connection` header, which strict clients (Node's
+/// built-in WebSocket) refuse.
+async fn close_unless_upgraded(mut response: Response) -> Response {
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
 }
 
 fn refuse(status: StatusCode, why: &'static str) -> Response {
