@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { DEFAULT_URL, looksLikeToken, type Credentials } from '@/lib/credentials'
+import { DEFAULT_URL, SERVED_BY_TRIAD, looksLikeToken, type Credentials } from '@/lib/credentials'
 
 interface Props {
   initial: (Credentials & { remembered: boolean }) | null
@@ -32,7 +32,10 @@ function Problem({ reason, url }: { reason: CloseReason; url: string }) {
         <>
           <p>
             Could not connect to <code>{url}</code>. Either nothing is listening there, or <code>triad serve</code>{' '}
-            refused this page&apos;s origin (a browser cannot tell the two apart). Start it with:
+            refused this page&apos;s origin (a browser cannot tell the two apart).
+            {SERVED_BY_TRIAD
+              ? ' A page served by triad is allowed on a loopback address; reached any other way, start serve with:'
+              : ' Start it with:'}
           </p>
           <pre className="mt-2 overflow-x-auto rounded-md bg-muted px-3 py-2 text-xs">
             triad serve --allow-origin {origin}
@@ -97,8 +100,16 @@ export function ConnectDialog({ initial, reason, url: lastUrl, onConnect }: Prop
             aria-invalid={!urlOk}
           />
           <p className="text-xs text-muted-foreground">
-            The <code>listening</code> line <code>serve</code> printed. Start it with{' '}
-            <code>--allow-origin {window.location.origin}</code>.
+            {SERVED_BY_TRIAD ? (
+              <>
+                The <code>listening</code> line <code>serve</code> printed; by default the server this page came from.
+              </>
+            ) : (
+              <>
+                The <code>listening</code> line <code>serve</code> printed. Start it with{' '}
+                <code>--allow-origin {window.location.origin}</code>.
+              </>
+            )}
           </p>
         </div>
 

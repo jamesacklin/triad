@@ -7,10 +7,25 @@ comes from the socket, and everything it does is a `send`, `command`,
 `answer`, `history` or `snapshot` request.
 
 React 19, Vite 8, TypeScript 7, Tailwind 4, shadcn/ui 4 (radix), Vitest,
-pnpm. Every version is pinned exactly. The build is static files; `triad`
-does not serve them.
+pnpm. Every version is pinned exactly.
 
-## Run it
+## Served by triad
+
+```sh
+pnpm -C web install --frozen-lockfile && pnpm -C web build
+cargo build -p triad --features web
+target/debug/triad serve
+```
+
+`build.rs` embeds `web/dist` in the binary (the `web` feature fails the
+build, naming these commands, if `web/dist` is missing). `serve` prints an
+`open http://127.0.0.1:7878/` line; the page there connects to its own host
+by default and needs no `--allow-origin` on a loopback address. It is sent
+with a Content-Security-Policy (scripts, styles and images from the page's
+origin only, sockets to `ws:`/`wss:`, no framing); see API.md, "The web
+app". Rebuild both after changing the app.
+
+## Develop it
 
 ```sh
 scripts/web-dev.sh
@@ -75,7 +90,9 @@ src/
 
 ## Behaviour
 
-- **Connecting.** Address and token are typed into the connect screen and
+- **Connecting.** Address and token are typed into the connect screen (the
+  address defaults to the page's own host when `triad` serves it, and to
+  `ws://127.0.0.1:7878/v1` under the dev server) and
   kept in `sessionStorage` (a reload reconnects; closing the tab forgets).
   "Remember on this device" also keeps them in `localStorage`. The token
   goes in the first frame, never in a URL, and is never logged. A refused

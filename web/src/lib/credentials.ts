@@ -7,7 +7,17 @@ export interface Credentials {
   token: string
 }
 
-export const DEFAULT_URL = 'ws://127.0.0.1:7878/v1'
+/**
+ * Whether this page was built to be served by `triad serve` itself (a
+ * production build) rather than by the Vite dev server. Served by triad,
+ * the socket is on the page's own host, and that origin needs no
+ * `--allow-origin`.
+ */
+export const SERVED_BY_TRIAD = !import.meta.env.DEV
+
+export const DEFAULT_URL = SERVED_BY_TRIAD
+  ? `${globalThis.location?.protocol === 'https:' ? 'wss' : 'ws'}://${globalThis.location?.host ?? '127.0.0.1:7878'}/v1`
+  : 'ws://127.0.0.1:7878/v1'
 const KEY = 'triad.connection'
 
 function read(store: Storage | undefined): Credentials | null {

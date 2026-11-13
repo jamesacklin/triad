@@ -24,7 +24,9 @@ else:
 ```
 
 React, Vite, TypeScript, Tailwind and shadcn/ui. No server of its own: the
-build is static files, and all data comes over `ws://…/v1`.
+build is static files, and all data comes over `ws://…/v1`. (Changed after
+F5, 2026-11-13: `triad serve` serves the built files itself, with the `web`
+feature; see "Follow-ups the user asked for" below.)
 
 ## Where things stand
 
@@ -52,7 +54,8 @@ Three facts about the API shape the design:
 
 **It lives in `web/` in this repository,** outside the cargo workspace,
 with its own `package.json` and lockfile. pnpm, versions pinned exactly.
-Nothing in `crates/` changes.
+Nothing in `crates/` changes. (Reversed for serving the app: the routes and
+the `web` feature are in `crates/triad`.)
 
 **The stack is small.** React, Vite, TypeScript, Tailwind, shadcn/ui
 components copied in by its CLI, Vitest. No router (one screen and a
@@ -91,9 +94,10 @@ formatted JSON, so a new command works before the app knows it.
 **Messages are plain text,** with line breaks kept. No Markdown rendering.
 
 **Development runs two processes.** `triad serve --allow-origin
-http://localhost:5173` and `pnpm dev`. A script starts both. Serving the
+http://localhost:5173` and `pnpm dev`. A script starts both. ~~Serving the
 built files from `triad serve` itself is a follow-up (it needs a route on
-the axum router, which AXUM-PLAN.md ruled out for now).
+the axum router, which AXUM-PLAN.md ruled out for now).~~ Done at the
+user's request: see below.
 
 ## Design
 
@@ -215,8 +219,8 @@ a `web/README.md`, a README section, and a FINDINGS.md section.
 
 ## What this does not do
 
-- No server-side code, no route added to `triad serve`, no bundled
-  hosting.
+- ~~No server-side code, no route added to `triad serve`, no bundled
+  hosting.~~ Reversed: `triad serve` serves the app (below).
 - No accounts or multiple identities in one tab; one tab, one session.
 - No Markdown, attachments, notifications, search or message editing.
 - No mobile app. The layout works on a narrow window; that is all.
@@ -245,3 +249,15 @@ a `web/README.md`, a README section, and a FINDINGS.md section.
    requests on reconnect.)
 4. How does it behave when `serve` restarts, and when the network drops?
 5. Bundle size, and the dependency count in the lockfile.
+
+## Follow-ups the user asked for (2026-11-13, after F5)
+
+These reverse four decisions above; FINDINGS.md "Web app" has the results.
+
+1. **Served by triad.** `GET /` and `GET /assets/…` on the axum router,
+   the files embedded from `web/dist` by `crates/triad/build.rs` behind a
+   cargo feature `web` (not a default). The page's own loopback origins may
+   open the socket without `--allow-origin`; they come from the bound
+   address, never from `Host`. `index.html` carries a strict
+   Content-Security-Policy.
+

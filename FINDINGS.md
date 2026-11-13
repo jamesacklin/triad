@@ -1682,8 +1682,9 @@ in a row.
 
 `web/` is a React app on the WebSocket API (`WEB-PLAN.md`). It does what
 the TUI does, in a browser, through `send`, `command`, `answer`, `history`
-and `snapshot` only. Nothing under `crates/` changed. The protocol was not
-changed either; what the app wanted from it is listed below as follow-ups.
+and `snapshot` only. F0–F5 changed nothing under `crates/`; the follow-ups
+the user asked for afterwards (below) add the web app's routes there. The
+protocol was not changed; what the app wanted from it is listed below.
 
 ### Milestones
 
@@ -1857,8 +1858,72 @@ the template.
 - One Playwright run against a real `serve` (the plan's first follow-up).
 - The protocol items under question 3, and the handshake and schema fixes
   above.
-- Serve `web/dist` from `triad serve` (needs a route; AXUM-PLAN.md ruled it
-  out for now).
+- ~~Serve `web/dist` from `triad serve`~~: done, below.
+
+### Follow-up 1: served by triad itself
+
+At the user's request (reversing "no route on the router" and "nothing
+under `crates/` changes"). `triad serve` built with the new cargo feature
+`web` (not a default) answers `GET /` with the app's page and
+`GET /assets/…` with its files; `/v1` is unchanged and every existing
+`ws_*` test passes unedited.
+
+- **Embedding:** `crates/triad/build.rs` writes a table of
+  `(path, content type, include_bytes!(…))` from `web/dist` into
+  `OUT_DIR`; no new crate. Without the feature the table is empty and
+  nothing under `web/` is read, so a plain `cargo build` needs no Node.
+  With the feature and no `web/dist/index.html`, the build fails naming
+  `pnpm -C web install --frozen-lockfile && pnpm -C web build`. Without
+  the feature, `GET /` is a `404` with a line saying this build has no web
+  app (404 rather than 200, so nothing mistakes the note for a page).
+- **Caching and headers:** `index.html` is `no-cache`; `/assets/*` (hashed
+  names) `public, max-age=31536000, immutable`; both `nosniff` and
+  `Referrer-Policy: no-referrer`. The page's CSP is `default-src 'none';
+  script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self';
+  connect-src ws: wss:; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'`, plus `X-Frame-Options: DENY`.
+- **Inline styles are not allowed, and one is blocked.** In the browser,
+  opening a dialog logs one CSP violation: Radix's scroll lock
+  (`react-remove-scroll`) injects a `<style>` element to stop the body
+  scrolling behind the dialog. This page's body never scrolls (it is
+  exactly the viewport's height), so blocking it changes nothing visible;
+  the dialogs open, trap focus and close as before. Allowing it would mean
+  `'unsafe-inline'` for styles, or a per-response nonce passed to
+  `get-nonce`; neither seemed worth it. React's `style` props are set
+  through the CSSOM and are not affected.
+- **Origins:** the page's own origins are allowed without
+  `--allow-origin`, computed once from the bound address: on a loopback
+  bind, `http://<bound address>:<port>` and `http://localhost:<port>`.
+  Never from the request's `Host` (`ws_web` checks that an `Origin`
+  matching a forged `Host` is still `403`, with and without the token).
+  **One deviation from the request:** the IPv6 form `http://[::1]:<port>`
+  is added only for an IPv6 bind. Bound to `127.0.0.1`, the port on `::1`
+  is not ours, and another local process could listen there and serve a
+  page from that origin. (`localhost` carries the same residual risk when a
+  browser resolves it to `::1` first; it was kept because it is what people
+  type.) A non-loopback bind adds none. Without the feature no origin is
+  added, since no page is served.
+- **The app:** a production build defaults the connect address to
+  `ws://<location.host>/v1` (`wss:` under https) and drops the
+  `--allow-origin` advice; the dev server keeps `ws://127.0.0.1:7878/v1`.
+  The Vite favicon was removed (it was Vite's logo, and a 404 is fine).
+  `serve` prints a third line, `open       http://<address>/`.
+- **Seen in a browser:** the page at `http://127.0.0.1:7880/` from a
+  `--features web` build, with no `--allow-origin`: the address prefilled,
+  connect, create a channel, the invite dialog (focus trapped, Escape
+  closes), no console errors besides the scroll-lock style above.
+- **Tests:** `crates/triad/tests/ws_web.rs`: the forged-`Host` refusal and
+  `/other` still `404` in every build; without the feature, the note, no
+  allowed origin and no `open` line; with it (`cargo test -p triad
+  --features web --test ws_web`, after `pnpm -C web build`), the page, its
+  CSP and cache headers, both assets with their types, `404` and `405`,
+  the two own origins accepted and `[::1]` and another port refused. `cargo
+  fmt --check`, clippy `-D warnings` with and without `web`, the
+  `--no-default-features` build and `cargo test --workspace` (158 tests)
+  are clean.
+- **Size:** the release binary is 64,536,216 bytes without `web` and
+  65,083,160 with it (+546,944: the 485,620 bytes of `web/dist` plus
+  the table).
 
 ## Agent harness options (2026-11-11)
 
