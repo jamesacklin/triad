@@ -1678,6 +1678,354 @@ in a row.
   `404` and let the `WebSocketUpgrade` extractor run before the token check;
   `any` plus a method check in the handler and fallback keeps the old order.
 
+## Web app (2026-11-13)
+
+`web/` is a React app on the WebSocket API (`WEB-PLAN.md`). It does what
+the TUI does, in a browser, through `send`, `command`, `answer`, `history`
+and `snapshot` only. F0–F5 changed nothing under `crates/`; the follow-ups
+the user asked for afterwards (below) add the web app's routes there. The
+protocol was not changed; what the app wanted from it is listed below.
+
+### Milestones
+
+| | What | Checked |
+|---|---|---|
+| F0 | Scaffold (create-vite 9, Tailwind 4, shadcn 4 radix/nova), types from `openapi.json`, `scripts/web-dev.sh`, `.gitignore` | build; the script run on spare ports |
+| F1 | `TriadClient`, the reducer, `Session` (history, resync) | 44 Vitest tests: a fake `WebSocket`, plus 74 frames recorded from a real `serve` with two identities |
+| F2 | Connect screen, sidebar, chat pane, paging, unread counts | in a browser |
+| F3 | Composer, `/` menu, `send`/`command`, reply rendering, JSON fallback, invite/new/join | in a browser |
+| F4 | Status bar, join request bar | in a browser |
+| F5 | Narrow layout, focus order, empty and error states, docs | in a browser (375 px wide and desktop) |
+
+`pnpm lint`, `pnpm typecheck`, `pnpm test` and `pnpm build` are clean;
+`cargo build -p triad` builds.
+
+**Seen working in a browser** (the Claude app's Chromium pane, against
+`serve` with `TRIAD_AGENT_BRAIN=mock` on a throwaway data directory, with bob
+and carol as `triad … --json` on their own data directories): a wrong token
+(4001: the message, and the token forgotten from storage); "unreachable" with
+the exact `--allow-origin` flag to pass; connect and auto-reconnect on reload
+from `sessionStorage`; a DM turn with the mock bot; `/bot model`, `/memory`
+and an unknown command rendered; the `/` menu with Up/Down/Tab; New channel
+(focuses the channel, shows the invite with a copy button); bob's join request
+accepted and carol's declined with the buttons; unread counts while on
+another channel; Alt-Down to switch; a two-line message and `/me`; a slow
+scripted turn (`TRIAD_AGENT_MOCK_DELAY_MS=6000`) with the ticking clock, a
+real `time.now` call and the finished turn's figures, including a denied
+call for bob; `serve` killed and restarted mid-session, with a message bob
+sent meanwhile appearing once; 70 messages paged back to the start with the
+position held, and a new message not moving a scrolled-up pane; joining
+carol's channel from the Join dialog (pending, then let in); the narrow
+layout; Tab order; no token in the console.
+
+**Unit-tested only:** close codes 4002 and 4008 and the backoff sequence
+(1, 2, 4 … 30 s); the tool-call arrow and the queue count in the status bar
+(the mock turn's tool call and a second ask were faster than I could catch);
+`bot_unavailable`/`bots_started`; a genuine network drop (killing `serve`
+was the stand-in).
+
+The reply renderings were all opened in the browser against real replies:
+`/members`, `/channels` (with copy buttons), `/grant` then `/grants`,
+`/audit` (an `ok` and a `denied` call), `/prompt`, `/bot model`; `/memory`
+and `/schedules` only empty. There are no component tests.
+
+### Answers to the plan's questions
+
+1. **Type generation** works, with a detour: openapi-typescript 7.13 drives
+   the TypeScript compiler API, which TypeScript 7 (the native compiler)
+   does not ship, so it fails under the app's TypeScript. Pinning its peer
+   through pnpm (`overrides`, `packageExtensions`) did not move it off the
+   root TypeScript 7. `pnpm gen:types` runs it through `pnpm dlx` with
+   `typescript@5.9.3`; the output is checked in. The generated union types
+   (`Event` discriminated on `event`, `Request` on `op`) are used everywhere.
+   They caught my own slips while building, not protocol drift. **They are
+   wrong in one place:** `openapi.json` declares `job.denied`,
+   `job.input_tokens` and `job.output_tokens` as integers, but on the wire
+   `denied` is a list of tool names (`bots.rs:794`, `turn.denied:
+   Vec<String>`) and the token counts are null with the mock brain. The
+   recorded fixtures caught this, not the types (`ws_docs` checks event
+   names, not field types). Since corrected in `openapi.json`; the types
+   were regenerated and the app's defensive reads removed.
+2. **Replies needing their own rendering:** `members`, `channels`, `grants`,
+   `audit`, `memory`, `schedules` and `prompt` as tables or blocks; `invite`
+   and `channel` with a copy button; `error` in red; and 25 one-line
+   events (`info`, `bot`, `bot_model`, `joined`, `bot_on` …) as text, in the
+   session's own wording, copied from `main.rs` and `bots.rs`. That is
+   `ReplyBlock.tsx` (252 lines) and `lib/format.ts` (204), about a sixth of
+   the 2,800 hand-written lines (tests not counted). Anything else is shown
+   as JSON, which is what a command added later would get.
+3. **What the app needed and the protocol does not give** (each is a
+   follow-up; none was worked around by guessing):
+   - **Which channel is the bot DM.** Channel objects have no `dm` flag. The
+     app reads it from API.md's wording ("`invite` null until joined, and
+     always for the bot DM"): a joined channel with a null invite. Add
+     `dm: bool`.
+   - **A channel's bot and member count.** Not in the channel object; the
+     TUI reads them from the store. The app sends `/members` and `/bot`
+     quietly the first time a joined channel is shown (and `/bot` again when
+     a pending channel lets it in). Put `bot` and `members` in channel
+     objects.
+   - **Running and queued turns on (re)connect.** `ready` does not carry
+     them and there is no replay, so after a reconnect the app clears its
+     turn clock rather than show one that never stops. Add them to `ready`.
+   - **Join requests on (re)connect.** Not repeated (as API.md says). After
+     a `serve` restart or a dropped socket a waiting request is gone from the
+     app. Add waiting asks to `ready`.
+   - **A text form for replies** (the plan's expected candidate): the 25
+     wordings in `format.ts` will drift from the session's. An optional
+     `text` field on each reply would remove `noticeText` entirely.
+   - **The `op` of a sent message** in `send`'s `done`: not needed in the
+     end (messages appear on their `message` event, as decided), but a
+     failed publish after `done` cannot be tied to the line typed.
+   - **A dead connection:** the server pings, but a browser cannot see
+     WebSocket pings, so a half-open socket (laptop asleep, NAT dropped) is
+     only noticed when TCP gives up. An application-level ping or an idle
+     `snapshot` would fix it; not done.
+4. **Restarts and drops:** on close (1001, 1006, 4008) the client retries
+   after 1 s, doubling to 30 s; on `ready` it replaces the channel list and
+   resyncs every channel already shown (newest page, older pages until one
+   overlaps, merged by `op`). Seen in the browser: `serve` killed, the status
+   bar said "connection lost; reconnecting", `serve` restarted, the page
+   reconnected and showed the message bob had sent meanwhile, once. A first
+   connection that never opens (nothing listening, or `403` for the origin:
+   a browser cannot tell them apart) is not retried: the connect screen says
+   both possibilities and the exact flag. So a reload while `serve` is down
+   lands on the connect screen, with the address and token kept.
+5. **Size:** `pnpm build` gives 412 kB of JavaScript (133 kB gzipped) and
+   74 kB of CSS (12 kB gzipped). 7 runtime dependencies (`react`,
+   `react-dom`, `radix-ui`, `cmdk`, `lucide-react`, `class-variance-authority`,
+   `cn`), 86 runtime packages in all (`radix-ui` is an umbrella over ~60
+   `@radix-ui/*` packages), and 218 packages in `pnpm-lock.yaml` with the dev
+   tools.
+
+### Found on the way
+
+- **Node's WebSocket refuses `serve`'s handshake.** The `101` from the axum
+  listener says `Connection: upgrade, close` (hyper's `keep_alive(false)`,
+  `ws/mod.rs:278`). RFC 6455 only needs the `Upgrade` token, and browsers
+  accept it, but undici (Node 24's built-in `WebSocket`) requires the value
+  to be exactly `upgrade` and fails the handshake. The fixture recorder
+  uses a 60-line client on `node:net` instead. Any Node client of the API
+  will hit this; dropping `close` from the 101 would fix it. Since fixed in
+  the listener (see "axum under the listener"); Node 24 now connects.
+- **`ready` arrives twice** for a client that connects before the session's
+  event loop starts: once broadcast at start-up (`main.rs:1196`, no `re`)
+  and once for the client (`requests.rs:21`). The app treats a `ready` as a
+  reconnect only after a socket closed, not by counting them.
+- **`focused` is not stable:** `/create` through the socket moves the
+  session's focus (`added()` sets `self.focus`), so the `channel` event and a
+  later `/channels` say the new channel is focused, while `snapshot`'s
+  `ready` still names the old default. API.md says no client can change the
+  default channel. The app ignores `focused` as told, so it is harmless here.
+- **`serve` prints `listening` before the session is ready.** After a
+  restart the socket opened at once, but `hello` came about 4 s later; the
+  status bar says "connecting…" meanwhile.
+- **A reconnect loop of my own,** found only in the browser: an
+  `undefined` backoff option overrode the default and every retry was
+  immediate. Unit tests built the client without the option; a `Session`
+  test now asserts the 1 s delay.
+- **`/bot provider-key` is not hidden** in the composer, as the TUI hides
+  it; a textarea cannot mask part of its text. Not addressed.
+
+### Where the plan was wrong or out of date
+
+- TypeScript 7 cannot run openapi-typescript (above).
+- create-vite 9's React template lints with **oxlint**, not ESLint; kept
+  (one package instead of five). `pnpm lint` is `oxlint --deny-warnings`.
+- `shadcn init` (4.23) adds the `shadcn` package as a runtime dependency
+  for one stylesheet, which pulls in its whole CLI (about 800 lockfile
+  entries). The stylesheet is copied to `src/shadcn.css` instead and the
+  CLI is run with `pnpm dlx shadcn@4.23.0`. Its Nova preset also adds a
+  Geist font package (dropped for the system font) and its `sonner`
+  component needs `next-themes` (dropped). `sonner` itself was removed in
+  the end: nothing in the app raises a toast. shadcn 4 uses `cn` (one
+  package) where earlier versions used `clsx` and `tailwind-merge`.
+- shadcn's Vite guide says to add `baseUrl` to `tsconfig`; TypeScript 7
+  does not need it (`paths` alone).
+- The plan's component list included `popover` and `scroll-area`; neither
+  is used (the `/` menu is drawn inline over the composer with `command`,
+  and the pane scrolls natively, which makes stick-to-bottom simpler).
+- The plan said to check the app against "one in the app and one in the
+  TUI"; the second identity was driven with `triad … --json`, as the task
+  asked, so the TUI was not run.
+
+Dependencies beyond React, Vite, TypeScript, Tailwind, shadcn/ui and
+Vitest: `radix-ui`, `cmdk`, `lucide-react`, `class-variance-authority`, `cn`
+and `tw-animate-css` are what shadcn's generated components import; `oxlint`
+is the template's linter; `@types/*` and `@vitejs/plugin-react` come with
+the template.
+
+### Follow-ups
+
+- One Playwright run against a real `serve` (the plan's first follow-up).
+- The protocol items under question 3, and the handshake and schema fixes
+  above.
+- ~~Serve `web/dist` from `triad serve`~~: done, below.
+
+### Follow-up 1: served by triad itself
+
+At the user's request (reversing "no route on the router" and "nothing
+under `crates/` changes"). `triad serve` built with the new cargo feature
+`web` (not a default) answers `GET /` with the app's page and
+`GET /assets/…` with its files; `/v1` is unchanged and every existing
+`ws_*` test passes unedited.
+
+- **Embedding:** `crates/triad/build.rs` writes a table of
+  `(path, content type, include_bytes!(…))` from `web/dist` into
+  `OUT_DIR`; no new crate. Without the feature the table is empty and
+  nothing under `web/` is read, so a plain `cargo build` needs no Node.
+  With the feature and no `web/dist/index.html`, the build fails naming
+  `pnpm -C web install --frozen-lockfile && pnpm -C web build`. Without
+  the feature, `GET /` is a `404` with a line saying this build has no web
+  app (404 rather than 200, so nothing mistakes the note for a page).
+- **Caching and headers:** `index.html` is `no-cache`; `/assets/*` (hashed
+  names) `public, max-age=31536000, immutable`; both `nosniff` and
+  `Referrer-Policy: no-referrer`. The page's CSP is `default-src 'none';
+  script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self';
+  connect-src ws: wss:; base-uri 'none'; form-action 'none';
+  frame-ancestors 'none'`, plus `X-Frame-Options: DENY`.
+- **Inline styles are not allowed, and one is blocked.** In the browser,
+  opening a dialog logs one CSP violation: Radix's scroll lock
+  (`react-remove-scroll`) injects a `<style>` element to stop the body
+  scrolling behind the dialog. This page's body never scrolls (it is
+  exactly the viewport's height), so blocking it changes nothing visible;
+  the dialogs open, trap focus and close as before. Allowing it would mean
+  `'unsafe-inline'` for styles, or a per-response nonce passed to
+  `get-nonce`; neither seemed worth it. React's `style` props are set
+  through the CSSOM and are not affected.
+- **Origins:** the page's own origins are allowed without
+  `--allow-origin`, computed once from the bound address: on a loopback
+  bind, `http://<bound address>:<port>` and `http://localhost:<port>`.
+  Never from the request's `Host` (`ws_web` checks that an `Origin`
+  matching a forged `Host` is still `403`, with and without the token).
+  **One deviation from the request:** the IPv6 form `http://[::1]:<port>`
+  is added only for an IPv6 bind. Bound to `127.0.0.1`, the port on `::1`
+  is not ours, and another local process could listen there and serve a
+  page from that origin. (`localhost` carries the same residual risk when a
+  browser resolves it to `::1` first; it was kept because it is what people
+  type.) A non-loopback bind adds none. Without the feature no origin is
+  added, since no page is served.
+- **The app:** a production build defaults the connect address to
+  `ws://<location.host>/v1` (`wss:` under https) and drops the
+  `--allow-origin` advice; the dev server keeps `ws://127.0.0.1:7878/v1`.
+  The Vite favicon was removed (it was Vite's logo, and a 404 is fine).
+  `serve` prints a third line, `open       http://<address>/`.
+- **Seen in a browser:** the page at `http://127.0.0.1:7880/` from a
+  `--features web` build, with no `--allow-origin`: the address prefilled,
+  connect, create a channel, the invite dialog (focus trapped, Escape
+  closes), no console errors besides the scroll-lock style above.
+- **Tests:** `crates/triad/tests/ws_web.rs`: the forged-`Host` refusal and
+  `/other` still `404` in every build; without the feature, the note, no
+  allowed origin and no `open` line; with it (`cargo test -p triad
+  --features web --test ws_web`, after `pnpm -C web build`), the page, its
+  CSP and cache headers, both assets with their types, `404` and `405`,
+  the two own origins accepted and `[::1]` and another port refused. `cargo
+  fmt --check`, clippy `-D warnings` with and without `web`, the
+  `--no-default-features` build and `cargo test --workspace` (158 tests)
+  are clean.
+- **Size:** the release binary is 64,536,216 bytes without `web` and
+  65,083,160 with it (+546,944: the 485,620 bytes of `web/dist` plus
+  the table).
+
+### Follow-up 2: optimistic sends
+
+At the user's request (reversing "sent messages appear when the server's
+`message` event arrives"). A message sent from the tab shows at once,
+greyed out under the channel's lines, and is removed when its echo merges
+in as an ordinary message.
+
+- **Matching:** the API does not link a `send` to its `message`, so an echo
+  settles the oldest pending message in the same channel with `mine: true`,
+  `bot: false` (my bot's replies are also `mine`), the same text and the
+  same action flag. Two identical sends settle one each. A failed send
+  never matches. An echo whose `ts` is more than ten minutes before the
+  send cannot settle it (an old message of the same text in a history
+  page). The session stores the text exactly as sent (`send_body`; an
+  over-long message is refused, not cut), so text matching held in every
+  case tried; no client id was needed.
+- **States:** `sending`, then `sent` when `done` is ok (the echo can also
+  come first, which settles it at once; seen in the recorded frames, where
+  the `message` precedes its `done`); `failed` when `done` is `ok: false`,
+  with the session's error and Retry and Discard; `unconfirmed` after 30 s
+  without an echo, also with Retry and Discard. The session's `error` for a
+  failed send is not repeated as a notice or in the status bar: the pending
+  line carries it.
+- **Across a reconnect:** a send whose request the dropped socket cut off
+  becomes `unconfirmed` ("the connection dropped before the server
+  answered"), since it may or may not have gone out. It is kept: the resync
+  after the reconnect merges history pages through the same path, so if it
+  was published its echo arrives there and settles it; if not, it stays
+  with Retry. A send attempted while disconnected fails at once ("not
+  connected"). Pending messages are kept only in the tab: a reload or
+  Disconnect drops them.
+- **`/me`** now goes as a `send` with `action: true` (API.md's form), so
+  actions are optimistic too; it used to go as a `command`.
+- **Seen in a browser:** two identical sends, each passing
+  sending → sent → settled, two confirmed lines and nothing left pending;
+  a send into a channel still waiting to be let in (`#shed`, whose host was
+  offline), failed with the session's own error, then discarded; with
+  `serve` frozen (SIGSTOP), a send stayed `sending`, became "not confirmed"
+  at 30 s, and settled when `serve` was resumed (SIGCONT) and the echo
+  came. **Unit-tested only:** retry, the dropped-socket case and its
+  settling by a resync page, the ten-minute rule.
+- **Ambiguity left:** another client of the same session (a second tab)
+  sending the same text in the same channel at the same time can settle
+  this tab's pending message with its own echo. Harmless (one of the two
+  stays pending until its own echo), but only a client id echoed in the
+  `message` event would remove it; that is a protocol change and was not
+  made.
+
+### Follow-up 3: Markdown in messages
+
+At the user's request (reversing "messages are plain text"). People's and
+bots' messages render Markdown; `/me` actions, notices and command replies
+stay plain (`web/src/components/MessageText.tsx`).
+
+- **Library:** react-markdown 10.1.0 with remark-gfm 4.0.1, pinned. It
+  builds React elements from the syntax tree, so there is no HTML string
+  and no `dangerouslySetInnerHTML`; raw HTML in a message becomes a text
+  node by default (read in its source: `raw` nodes are replaced with
+  `text` unless `rehype-raw` is added, which it is not). It is the
+  unified collective's maintained React renderer; its last release is
+  from March 2025, stable rather than abandoned. The string renderers
+  (markdown-it, marked) were ruled out because they produce HTML that would
+  have to be injected.
+- **Narrowed further than its defaults:** an allow-list of elements
+  (paragraphs, emphasis, strikethrough, code, pre, links, lists, quotes,
+  rules, tables, headings drawn as bold lines), others unwrapped to their
+  text, so task-list checkboxes and footnote markup drop out; a URL filter
+  allowing only absolute `http`, `https` and `mailto` (react-markdown's
+  default also passes relative URLs, `irc`, `ircs` and `xmpp`), and a link
+  without an allowed target is shown as its text; links open with
+  `target="_blank" rel="noopener noreferrer"`; images are drawn as a link
+  `[image: alt]` to their address and never fetched. No highlighting.
+  Single line breaks are kept (`white-space: pre-wrap` on paragraphs), as
+  in plain text.
+- **Tests** (`MessageText.test.tsx`, rendered with `renderToStaticMarkup`):
+  script tags, an `<img onerror>`, an `onclick` attribute and an HTML
+  block with an iframe stay text with no element or `on*` attribute;
+  `javascript:` (any case, with a leading space), `data:`, `vbscript:`,
+  `file:`, relative, fragment and `irc:` targets give no link; an image is
+  a link and never an `<img>`; a link title and a reference definition
+  cannot add attributes; the GFM basics render.
+- **Seen in a browser:** bold, emphasis, strikethrough, inline code, an
+  autolink, a fenced code block, a list and a table from the composer; a
+  bot reply rendered the same way; `/me **waves**` left literal. A message
+  with `[js](javascript:…)`, `[data](data:…)`, an image, an inline
+  `<img onerror>` and `<b onclick>`: the two hostile links as plain text,
+  the image as a link with no request made for it, the HTML as text; no
+  `<img>`, no `on*` attribute in the pane and the trapped `alert` never
+  called. One CommonMark detail showed up: a line that starts with
+  `<script>` is an HTML block to the end of the line, so Markdown after it
+  on that line is not parsed (it stays text, which is safe).
+- **Cost:** the JavaScript grew from 416 kB to 583 kB (134 kB to 184 kB
+  gzipped), past Vite's 500 kB warning, which `vite.config.ts` now sets at
+  600 kB with a comment. Runtime packages went from 86 to 186 and the
+  lockfile from 218 to 317 (the unified, micromark and mdast/hast
+  packages); direct runtime dependencies from 7 to 9. A `--features web`
+  binary carries `web/dist`, so it grows by about the same 170 kB over the
+  size measured in follow-up 1.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

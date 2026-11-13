@@ -1,0 +1,270 @@
+// Wires a TriadClient to the store: turns socket events into actions, asks
+// for history when a channel is shown, resyncs after a reconnect, and sends
+// what the user types. It follows API.md's recipes and holds no session
+// logic: anything the session decides comes back as an event.
+import {
+  RequestError,
+  TriadClient,
+  type ClientOptions,
+  type ConnectionStatus,
+  type Reply,
+} from '@/api/client'
+import type { EventOf, IncomingEvent, RequestBody } from '@/api/protocol'
+import { oldestOp, PENDING_TIMEOUT_MS, type Action, type State } from './store'
+
+export const PAGE = 50
+
+export interface SessionOptions {
+  url: string
+  token: string
+  dispatch: (a: Action) => void
+  getState: () => State
+  socket?: ClientOptions['socket']
+  now?: () => number
+  backoffMs?: number
+}
+
+export class Session {
+  readonly client: TriadClient
+  #dispatch: (a: Action) => void
+  #state: () => State
+  #now: () => number
+  /** Requests whose replies belong in the pane (the user typed them), with the channel they were about. */
+  #shown = new Map<number | string, string | undefined>()
+  /** Channels with a history request in flight, so scrolling does not ask twice. */
+  #paging = new Set<string>()
+  /** Set by a reconnect, consumed by the next `ready`. (`serve` sends `ready` twice on connect, so counting them would not do.) */
+  #resyncDue = false
+  #syncing = false
+  #pendingId = 0
+  /** The 30-second timers of pending sends, cleared on close. */
+  #timers = new Set<ReturnType<typeof setTimeout>>()
+
+  constructor(opts: SessionOptions) {
+    this.#dispatch = opts.dispatch
+    this.#state = opts.getState
+    this.#now = opts.now ?? Date.now
+    this.client = new TriadClient({
+      url: opts.url,
+      token: opts.token,
+      socket: opts.socket,
+      backoffMs: opts.backoffMs,
+      onEvent: (ev) => this.#onEvent(ev),
+      onStatus: (s) => this.#onStatus(s),
+    })
+  }
+
+  connect(): void {
+    this.client.connect()
+  }
+
+  close(): void {
+    for (const t of this.#timers) clearTimeout(t)
+    this.#timers.clear()
+    this.client.close()
+  }
+
+  #onStatus(status: ConnectionStatus): void {
+    if (status.state !== 'open') {
+      for (const channel of this.#paging) this.#dispatch({ type: 'paging', channel, on: false })
+      this.#paging.clear()
+    }
+    if (status.state === 'reconnecting') this.#resyncDue = true
+    this.#dispatch({ type: 'status', status })
+  }
+
+  #onEvent(ev: IncomingEvent): void {
+    const re = ev.re
+    const shown = re !== undefined && this.#shown.has(re)
+    const target = re !== undefined ? this.#shown.get(re) : undefined
+    if (ev.event === 'done' && re !== undefined) this.#shown.delete(re)
+    if (ev.event === 'history') return // applied by the request that asked for it
+    this.#dispatch({ type: 'event', ev, show: shown, target, now: this.#now() })
+    if (ev.event === 'ready') void this.#afterReady()
+    // Let into a channel shown while it was pending: learn its bot now.
+    if (ev.event === 'joined' && ev.member === this.#state().node) {
+      const c = this.#state().channels.find((x) => x.name === ev.channel)
+      if (c?.loaded && !c.dm) void this.#quiet({ op: 'command', channel: c.name, line: '/bot' })
+    }
+  }
+
+  /** On every `ready`: load the focused channel; after a reconnect, resync every channel already shown. */
+  async #afterReady(): Promise<void> {
+    const reconnect = this.#resyncDue
+    this.#resyncDue = false
+    if (reconnect && !this.#syncing) {
+      this.#syncing = true
+      try {
+        for (const c of this.#state().channels) {
+          if (c.loaded) await this.resync(c.name)
+        }
+      } finally {
+        this.#syncing = false
+      }
+    }
+    const f = this.#state().focus
+    if (f) await this.show(f)
+  }
+
+  /** Focus a channel in this tab, loading its newest page if it has none. */
+  async show(channel: string): Promise<void> {
+    this.#dispatch({ type: 'focus', channel })
+    const c = this.#state().channels.find((x) => x.name === channel)
+    if (!c || c.loaded || this.#paging.has(channel)) return
+    await this.#page(channel)
+    // The member count and the channel's bot are not in the channel object;
+    // ask once, quietly (the replies update state and are not shown).
+    const after = this.#state().channels.find((x) => x.name === channel)
+    if (after && after.info.status === 'joined' && !after.dm) {
+      await this.#quiet({ op: 'command', channel, line: '/members' })
+      await this.#quiet({ op: 'command', channel, line: '/bot' })
+    }
+  }
+
+  /** Scrolled to the top: fetch the page before the oldest message held. */
+  async older(channel: string): Promise<void> {
+    const c = this.#state().channels.find((x) => x.name === channel)
+    if (!c || c.atStart || !c.loaded || this.#paging.has(channel)) return
+    const before = oldestOp(c)
+    if (!before) return
+    await this.#page(channel, before)
+  }
+
+  /**
+   * API.md's reconnect recipe for one channel: the newest page, then older
+   * pages until one overlaps what is already held. Merged by `op`.
+   */
+  async resync(channel: string): Promise<void> {
+    const held = this.#state().channels.find((x) => x.name === channel)?.ops ?? new Set<string>()
+    let before: string | undefined
+    for (;;) {
+      const page = await this.#page(channel, before, false)
+      if (!page || !page.more || page.messages.length === 0) return
+      if (page.messages.some((m) => held.has(m.op))) return
+      before = page.messages[0].op
+    }
+  }
+
+  async #page(channel: string, before?: string, mark = true): Promise<EventOf<'history'> | null> {
+    if (mark) {
+      this.#paging.add(channel)
+      this.#dispatch({ type: 'paging', channel, on: true })
+    }
+    try {
+      const body: RequestBody = before
+        ? { op: 'history', channel, limit: PAGE, before }
+        : { op: 'history', channel, limit: PAGE }
+      const reply = await this.client.request(body)
+      const ev = reply.events.find((e): e is EventOf<'history'> => e.event === 'history')
+      if (!ev) return null
+      this.#dispatch({ type: 'history', ev, before, resync: !mark })
+      return ev
+    } catch (e) {
+      if (e instanceof RequestError && e.message !== 'connection lost' && e.message !== 'closed') {
+        this.#dispatch({ type: 'local', channel, text: `history: ${e.message}`, error: true, now: this.#now() })
+      }
+      return null
+    } finally {
+      if (mark) {
+        this.#paging.delete(channel)
+        this.#dispatch({ type: 'paging', channel, on: false })
+      }
+    }
+  }
+
+  async #quiet(body: RequestBody): Promise<Reply | null> {
+    try {
+      return await this.client.request(body)
+    } catch {
+      return null
+    }
+  }
+
+  /** A note of the app's own in a channel's pane (the focus when none is named). */
+  note(text: string, error = false, channel?: string): void {
+    this.#dispatch({ type: 'local', text, error, channel, now: this.#now() })
+  }
+
+  /** The status bar's error is cleared when the next line is submitted, as in the TUI. */
+  clearError(): void {
+    this.#dispatch({ type: 'clearError' })
+  }
+
+  /** A request whose replies are not shown in the pane (a dialog shows them). Rejects with the error text. */
+  query(body: RequestBody): Promise<Reply> {
+    return this.client.request(body)
+  }
+
+  /** Sends a request whose replies are shown in the pane. Resolves with the reply, or null if it failed (the error is shown). */
+  async ask(body: RequestBody, channel?: string): Promise<Reply | null> {
+    // request() sends synchronously, so nothing for this id can arrive
+    // before the map has it.
+    const id = this.client.nextId
+    this.#shown.set(id, channel)
+    try {
+      return await this.client.request(body)
+    } catch (e) {
+      this.#shown.delete(id)
+      const text = e instanceof Error ? e.message : String(e)
+      // A failure the session reported already arrived as an `error` event.
+      const reported = e instanceof RequestError && e.events.some((x) => x.event === 'error')
+      if (!reported) this.#dispatch({ type: 'local', channel, text, error: true, now: this.#now() })
+      return null
+    }
+  }
+
+  /**
+   * Plain text (or a `/me` action) to a channel. It shows at once as
+   * pending, greyed out, and is settled by the session's `message` event
+   * for it (see `settle` in the store). Resolves when the request ends:
+   * true if the session took it.
+   */
+  send(channel: string, text: string, action = false): Promise<boolean> {
+    const id = ++this.#pendingId
+    this.#dispatch({ type: 'pending', channel, id, text, action, now: this.#now() })
+    return this.#deliver(channel, id, text, action)
+  }
+
+  /** Sends a failed or unconfirmed message again. */
+  retry(channel: string, id: number): Promise<boolean> {
+    const p = this.#state().channels.find((c) => c.name === channel)?.pending.find((x) => x.id === id)
+    if (!p) return Promise.resolve(false)
+    this.#dispatch({ type: 'pendingRetry', channel, id, now: this.#now() })
+    return this.#deliver(channel, id, p.text, p.action)
+  }
+
+  discard(channel: string, id: number): void {
+    this.#dispatch({ type: 'pendingDiscard', channel, id })
+  }
+
+  async #deliver(channel: string, id: number, text: string, action: boolean): Promise<boolean> {
+    const timer = setTimeout(() => {
+      this.#timers.delete(timer)
+      this.#dispatch({ type: 'pendingStale', channel, id })
+    }, PENDING_TIMEOUT_MS)
+    this.#timers.add(timer)
+    try {
+      await this.client.request(action ? { op: 'send', channel, text, action } : { op: 'send', channel, text })
+      this.#dispatch({ type: 'pendingDone', channel, id, ok: true })
+      return true
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e)
+      // Cut off after it went out: it may have been published. Never sent
+      // (no socket): plainly failed.
+      const lost = e instanceof RequestError && error === 'connection lost'
+      this.#dispatch({ type: 'pendingDone', channel, id, ok: false, error, lost })
+      return false
+    }
+  }
+
+  /** A `/command` line, run as if typed with `channel` focused. */
+  command(channel: string | undefined, line: string): Promise<Reply | null> {
+    return this.ask(channel ? { op: 'command', channel, line } : { op: 'command', line }, channel)
+  }
+
+  async answer(channel: string, member: string, accept: boolean): Promise<boolean> {
+    const r = await this.ask({ op: 'answer', channel, member, accept }, channel)
+    if (r) this.#dispatch({ type: 'answered', channel, member })
+    return r !== null
+  }
+}

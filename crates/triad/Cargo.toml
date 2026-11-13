@@ -20,6 +20,9 @@ tui = ["dep:ratatui"]
 clipboard = ["dep:arboard"]
 # `triad serve`: the session on a WebSocket (crates/triad/src/ws, API.md).
 ws = ["dep:axum", "dep:hyper", "dep:hyper-util"]
+# `triad serve` also serves the web app (web/) at `/`, embedded from
+# web/dist by build.rs. Not a default: it needs `pnpm -C web build` first.
+web = ["ws"]
 
 [dependencies]
 triad-core = { workspace = true }

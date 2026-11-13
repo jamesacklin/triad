@@ -1,8 +1,9 @@
 //! `triad serve`: a chat session with no terminal, on a WebSocket.
 //!
 //! Each connection is served by hyper's HTTP/1 server (head capped at
-//! 8 KiB and 5 s, no keep-alive) running an axum router with one route,
-//! `/v1`. Its handler refuses a bad method, a foreign `Origin` or a wrong
+//! 8 KiB and 5 s, no keep-alive) running an axum router: `/v1`, the socket,
+//! and `/` and `/assets/…`, the web app (`web.rs`; embedded with the `web`
+//! feature, a note without it). The socket's handler refuses a bad method, a foreign `Origin` or a wrong
 //! bearer token with an HTTP error before anything is upgraded, then
 //! upgrades with axum's WebSocket. See API.md for the protocol,
 //! WEBSOCKET-PLAN.md for the design and AXUM-PLAN.md for the listener.
@@ -10,6 +11,7 @@
 mod hub;
 pub mod proto;
 mod requests;
+mod web;
 
 use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -24,7 +26,7 @@ use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
+use axum::routing::{any, get};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -183,11 +185,16 @@ pub fn serve(
         .with_context(|| format!("listening on {}", listen.addr))?;
     std_listener.set_nonblocking(true)?;
     let local = std_listener.local_addr()?;
+    let mut origins = listen.allow_origins;
+    origins.extend(web::own_origins(local));
     {
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         writeln!(out, "listening  ws://{local}{PATH}")?;
         writeln!(out, "token      {}", token_path.display())?;
+        if web::EMBEDDED {
+            writeln!(out, "open       http://{local}/")?;
+        }
         if remote {
             writeln!(
                 out,
@@ -207,7 +214,7 @@ pub fn serve(
             hub: hub.clone(),
             input,
             token,
-            origins: listen.allow_origins,
+            origins,
         });
         tokio::spawn(accept_loop(listener, shared));
         crate::chat(
@@ -269,6 +276,8 @@ async fn serve_connection(tcp: TcpStream, client: ClientId, shared: Arc<Shared>)
     };
     let app = Router::new()
         .route(PATH, any(upgrade))
+        .route("/", get(web::index))
+        .route("/assets/{*path}", get(web::asset))
         .fallback(elsewhere)
         .layer(axum::middleware::map_response(close_unless_upgraded))
         .with_state(conn);
@@ -303,7 +312,7 @@ fn refuse(status: StatusCode, why: &'static str) -> Response {
     (status, why).into_response()
 }
 
-/// Any path but [`PATH`].
+/// Any path but [`PATH`] and the web app's.
 async fn elsewhere(method: Method) -> Response {
     if method != Method::GET {
         return refuse(StatusCode::METHOD_NOT_ALLOWED, "use GET\n");

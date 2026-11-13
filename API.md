@@ -38,7 +38,7 @@ Only one process should use a data directory at a time; nothing locks it.
 
 ## Connecting and authenticating
 
-The only path is `/v1`. Every connection needs the token from
+The socket's path is `/v1`. Every connection to it needs the token from
 `<data-dir>/api-token`: 64 hex characters, created with mode 0600 on the
 first `serve`. Whoever holds it can do anything the user can: send as them,
 change membership, drive the bot's tools. Delete the file and restart
@@ -57,7 +57,29 @@ connection is closed (`4002`). The token is never accepted in the URL.
 
 A request with an `Origin` header (every browser sends one) is refused with
 `403` unless that origin was passed with `--allow-origin`. Without this rule
-any web page the user visits could open `ws://127.0.0.1:7878`.
+any web page the user visits could open `ws://127.0.0.1:7878`. A build with
+the web app (below) also allows the page it serves: on a loopback address,
+`http://<bound address>:<port>` and `http://localhost:<port>`. These are
+fixed when `serve` starts, from the address it bound, and never taken from
+a request's `Host` header, which a DNS-rebinding page controls. The IPv6
+form `http://[::1]:<port>` is allowed only when bound to `[::1]`. On a
+non-loopback address no origin is added; pass `--allow-origin` for the name
+the page is reached by.
+
+## The web app
+
+A build with the `web` feature (`pnpm -C web build`, then `cargo build -p
+triad --features web`) embeds the app from `web/` and serves it on the same
+port, with no token (the files are not secret; the socket still needs it):
+
+| Path | Answer |
+|---|---|
+| `GET /` | The app's page, `text/html`, `Cache-Control: no-cache`, with a Content-Security-Policy: `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, and `X-Frame-Options: DENY`. |
+| `GET /assets/<file>` | The built files, with their content type and `Cache-Control: public, max-age=31536000, immutable` (their names carry a content hash). `404` for any other file. |
+
+`serve` then prints a third line, `open       http://<address>/`. Without
+the feature, `GET /` answers `404` with a line of text saying this build has
+no web app. Every other path is as before.
 
 There is no TLS. For remote use, tunnel (`ssh -L 7878:127.0.0.1:7878 host`)
 or put a TLS-terminating proxy in front.
@@ -245,7 +267,7 @@ default channel; not a client's focus).
 | `4008` | Lagged: more than 1024 frames behind. Preceded by `lagged`. |
 
 Refusals before the upgrade are HTTP responses: `401` (wrong bearer token),
-`403` (origin not allowed), `404` (not `/v1`), `405` (not GET), `400` (not a
+`403` (origin not allowed), `404` (not `/v1` or a web app path), `405` (not GET), `400` (not a
 WebSocket upgrade), `431` (a request head over 8 KiB). A request head that
 does not arrive within 5 seconds gets no response; the connection is closed.
 

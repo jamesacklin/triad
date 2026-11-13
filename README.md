@@ -420,6 +420,34 @@ every request, event and close code, and the reconnect recipe;
 generating clients. Build without it with `--no-default-features` (or drop
 the `ws` feature).
 
+## Web app
+
+[`web/`](web/README.md) is a single-page app that does in a browser what the
+terminal interface does: channel list, chat pane with history paging, the
+status line, join requests as Accept and Decline buttons, and one input box
+where `/` opens the command list. It talks only to `triad serve` over the
+WebSocket and holds no session logic. React, Vite, TypeScript, Tailwind and
+shadcn/ui.
+
+`triad` can serve it itself. Build the app, then `triad` with the `web`
+feature (not a default, so a plain build needs no Node):
+
+```sh
+pnpm -C web install --frozen-lockfile && pnpm -C web build
+cargo build -p triad --features web
+triad serve
+```
+
+`serve` then prints `open http://127.0.0.1:7878/`; open it and paste the
+token. A page served this way on a loopback address needs no
+`--allow-origin`. Without the feature, `/` says the build has no web app.
+
+For working on the app, `scripts/web-dev.sh` starts `triad serve` with the
+mock bot and `--allow-origin http://localhost:5173`, prints where the token
+is, and runs the Vite dev server; open <http://localhost:5173>. The page
+keeps the token for the tab only, unless "remember on this device" is
+ticked. Node and pnpm are needed only for the app.
+
 ## Updates
 
 `triad` can update itself from a release published as static files, over
