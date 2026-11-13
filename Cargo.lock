@@ -5920,6 +5920,7 @@ dependencies = [
  "hyper-util",
  "p2panda",
  "ratatui",
+ "reqwest",
  "rmcp",
  "serde_json",
  "tempfile",

@@ -7,7 +7,10 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use triad_update::{Check, Outcome, Slot, TARGET, check, generate_key, load_signing_key, publish};
+use triad_update::{
+    Check, Outcome, Replace, Slot, TARGET, check, generate_key, is_slot_binary, load_signing_key,
+    publish, replace,
+};
 
 const FAR_FUTURE: u64 = 4_000_000_000;
 const NOW: u64 = 1_800_000_000;
@@ -147,6 +150,27 @@ impl Fixture {
     /// A check made by the binary the image shipped with.
     async fn check(&self) -> anyhow::Result<Outcome> {
         self.check_as(&self.tmp.path().join("factory"), true).await
+    }
+
+    /// A plain install of version `version`, at `<tmp>/bin/triad`.
+    fn installed(&self, version: &str) -> PathBuf {
+        let bin = self.tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("triad");
+        fs::copy(self.binary(version), &path).unwrap();
+        path
+    }
+
+    async fn replace(&self, running: &Path, version: &str) -> anyhow::Result<Outcome> {
+        replace(Replace {
+            client: &self.client,
+            url: &self.url,
+            keys: &self.keys,
+            running,
+            version,
+            now: NOW,
+        })
+        .await
     }
 
     fn read(&self, name: &str) -> Option<String> {
@@ -305,4 +329,74 @@ async fn a_binary_that_is_not_the_version_it_claims_is_not_installed() {
         Outcome::Current,
         "not downloaded again"
     );
+}
+
+/// Everything in the directory of `path` but `path` itself.
+fn others(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| Some(n.as_str()) != path.file_name().and_then(|f| f.to_str()))
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_plain_install_is_replaced_by_a_newer_release() {
+    let f = Fixture::new();
+    let triad = f.installed("0.1.0");
+    f.release(1, "0.2.0", FAR_FUTURE);
+
+    assert_eq!(
+        f.replace(&triad, "0.1.0").await.unwrap(),
+        Outcome::Installed {
+            version: "0.2.0".into()
+        }
+    );
+    assert!(fs::read_to_string(&triad).unwrap().contains("triad 0.2.0"));
+    assert_eq!(
+        others(&triad),
+        Vec::<String>::new(),
+        "nothing left beside it"
+    );
+
+    // Running the new binary, there is nothing to do.
+    assert_eq!(f.replace(&triad, "0.2.0").await.unwrap(), Outcome::Current);
+}
+
+#[tokio::test]
+async fn a_plain_install_is_never_taken_back_to_an_older_release() {
+    let f = Fixture::new();
+    let triad = f.installed("0.3.0");
+    f.release(5, "0.2.0", FAR_FUTURE);
+
+    assert_eq!(f.replace(&triad, "0.3.0").await.unwrap(), Outcome::Current);
+    assert!(fs::read_to_string(&triad).unwrap().contains("triad 0.3.0"));
+}
+
+#[tokio::test]
+async fn a_plain_install_keeps_its_binary_when_the_release_does_not_run() {
+    let f = Fixture::new();
+    let triad = f.installed("0.1.0");
+    f.release_of(1, "0.2.0", FAR_FUTURE, &f.binary("0.1.9"));
+
+    let err = f.replace(&triad, "0.1.0").await.unwrap_err();
+    assert!(format!("{err:#}").contains("does not run here"), "{err:#}");
+    assert!(fs::read_to_string(&triad).unwrap().contains("triad 0.1.0"));
+    assert_eq!(
+        others(&triad),
+        Vec::<String>::new(),
+        "the download is removed"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_binary_is_recognised() {
+    let f = Fixture::new();
+    f.release(1, "0.2.0", FAR_FUTURE);
+    assert!(!is_slot_binary(&f.tmp.path().join("factory")));
+    f.check().await.unwrap();
+    assert!(is_slot_binary(&f.slots().join("a")));
+    assert!(!is_slot_binary(&f.installed("0.1.0")));
 }

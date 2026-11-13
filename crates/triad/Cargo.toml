@@ -31,6 +31,7 @@ triad-core = { workspace = true }
 triad-probe = { workspace = true }
 triad-agent = { workspace = true }
 triad-update = { workspace = true }
+reqwest = { workspace = true }
 p2panda = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
