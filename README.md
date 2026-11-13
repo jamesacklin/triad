@@ -429,8 +429,9 @@ where `/` opens the command list. It talks only to `triad serve` over the
 WebSocket and holds no session logic. React, Vite, TypeScript, Tailwind and
 shadcn/ui.
 
-`triad` can serve it itself. Build the app, then `triad` with the `web`
-feature (not a default, so a plain build needs no Node):
+`triad` can serve it itself. Released builds (the ones `triad update`
+installs) always embed it. To build it yourself, build the app, then `triad`
+with the `web` feature (not a default, so a plain build needs no Node):
 
 ```sh
 pnpm -C web install --frozen-lockfile && pnpm -C web build
@@ -484,8 +485,9 @@ RELEASE_KEY=release.key TRIAD_UPDATE_URL=http://updates.example/triad \
   scripts/release.sh 0.2.0 1 ./site     # version, release counter, output directory
 ```
 
-`scripts/release.sh` builds for the machine it runs on, with the public key
-and the URL compiled in, and writes `./site`; upload `blobs/` first and
+`scripts/release.sh` builds the web app, then `triad` for the machine it
+runs on with the web app embedded (the `web` feature, so it needs Node and
+pnpm) and the public key and the URL compiled in, and writes `./site`; upload `blobs/` first and
 `manifest` last. A build with no key compiled in (`cargo install`, the tests)
 takes `TRIAD_UPDATE_KEYS` from the environment instead. Anyone who has the
 signing key can run code on every install that trusts it, and anyone who can
