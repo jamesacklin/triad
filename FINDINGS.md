@@ -1925,6 +1925,54 @@ under `crates/` changes"). `triad serve` built with the new cargo feature
   65,083,160 with it (+546,944: the 485,620 bytes of `web/dist` plus
   the table).
 
+### Follow-up 2: optimistic sends
+
+At the user's request (reversing "sent messages appear when the server's
+`message` event arrives"). A message sent from the tab shows at once,
+greyed out under the channel's lines, and is removed when its echo merges
+in as an ordinary message.
+
+- **Matching:** the API does not link a `send` to its `message`, so an echo
+  settles the oldest pending message in the same channel with `mine: true`,
+  `bot: false` (my bot's replies are also `mine`), the same text and the
+  same action flag. Two identical sends settle one each. A failed send
+  never matches. An echo whose `ts` is more than ten minutes before the
+  send cannot settle it (an old message of the same text in a history
+  page). The session stores the text exactly as sent (`send_body`; an
+  over-long message is refused, not cut), so text matching held in every
+  case tried; no client id was needed.
+- **States:** `sending`, then `sent` when `done` is ok (the echo can also
+  come first, which settles it at once; seen in the recorded frames, where
+  the `message` precedes its `done`); `failed` when `done` is `ok: false`,
+  with the session's error and Retry and Discard; `unconfirmed` after 30 s
+  without an echo, also with Retry and Discard. The session's `error` for a
+  failed send is not repeated as a notice or in the status bar: the pending
+  line carries it.
+- **Across a reconnect:** a send whose request the dropped socket cut off
+  becomes `unconfirmed` ("the connection dropped before the server
+  answered"), since it may or may not have gone out. It is kept: the resync
+  after the reconnect merges history pages through the same path, so if it
+  was published its echo arrives there and settles it; if not, it stays
+  with Retry. A send attempted while disconnected fails at once ("not
+  connected"). Pending messages are kept only in the tab: a reload or
+  Disconnect drops them.
+- **`/me`** now goes as a `send` with `action: true` (API.md's form), so
+  actions are optimistic too; it used to go as a `command`.
+- **Seen in a browser:** two identical sends, each passing
+  sending → sent → settled, two confirmed lines and nothing left pending;
+  a send into a channel still waiting to be let in (`#shed`, whose host was
+  offline), failed with the session's own error, then discarded; with
+  `serve` frozen (SIGSTOP), a send stayed `sending`, became "not confirmed"
+  at 30 s, and settled when `serve` was resumed (SIGCONT) and the echo
+  came. **Unit-tested only:** retry, the dropped-socket case and its
+  settling by a resync page, the ten-minute rule.
+- **Ambiguity left:** another client of the same session (a second tab)
+  sending the same text in the same channel at the same time can settle
+  this tab's pending message with its own echo. Harmless (one of the two
+  stays pending until its own echo), but only a client id echoed in the
+  `message` event would remove it; that is a protocol change and was not
+  made.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

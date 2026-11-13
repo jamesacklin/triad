@@ -208,6 +208,54 @@ describe('the store', () => {
     expect(s).toMatchObject({ bots: true, botsOff: null, botProvider: 'anthropic' })
   })
 
+  it('pending sends settle oldest first, one each, only on my own non-bot echo with the same text and action', () => {
+    const send = (s: State, id: number, text: string, action = false, now = 5000) =>
+      reducer(s, { type: 'pending', channel: 'garden', id, text, action, now })
+    let s = send(send(send(base, 1, 'same'), 2, 'same'), 3, 'waves', true)
+    const pend = (st: State) => chan(st, 'garden').pending.map((p) => p.id)
+    expect(pend(s)).toEqual([1, 2, 3])
+    // Not mine, my bot's, another text, or the action flag differing: no match.
+    s = play(s, [
+      ev(message('garden', 1, 3, { text: 'same', ts: 5000 })),
+      ev(message('garden', 2, 4, { text: 'same', mine: true, bot: true, ts: 5000 })),
+      ev(message('garden', 3, 5, { text: 'other', mine: true, ts: 5000 })),
+      ev(message('garden', 4, 6, { text: 'waves', mine: true, action: false, ts: 5000 })),
+    ])
+    expect(pend(s)).toEqual([1, 2, 3])
+    // Two identical sends: the first echo settles the first only.
+    s = play(s, [ev(message('garden', 5, 7, { text: 'same', mine: true, ts: 5000 }))])
+    expect(pend(s)).toEqual([2, 3])
+    s = play(s, [ev(message('garden', 6, 8, { text: 'same', mine: true, ts: 5000 }))])
+    expect(pend(s)).toEqual([3])
+    s = play(s, [ev(message('garden', 7, 9, { text: 'waves', mine: true, action: true, ts: 5000 }))])
+    expect(pend(s)).toEqual([])
+    // A message of the same text from long before the send is not its echo.
+    s = send(s, 4, 'same', false, 60 * 60_000)
+    s = reducer(s, { type: 'history', resync: true, ev: { event: 'history', seq: 10, channel: 'garden', messages: [msg('garden', 8, { text: 'same', mine: true, ts: 1000 })], more: false } })
+    expect(pend(s)).toEqual([4])
+    // A failed send never matches; a later identical one does.
+    s = reducer(s, { type: 'pendingDone', channel: 'garden', id: 4, ok: false, error: 'boom' })
+    s = send(s, 5, 'same', false, 60 * 60_000)
+    s = play(s, [ev(message('garden', 9, 11, { text: 'same', mine: true, ts: 60 * 60_000 }))])
+    expect(chan(s, 'garden').pending).toMatchObject([{ id: 4, state: 'failed', error: 'boom' }])
+  })
+
+  it('pending states: done, lost, stale, retry, discard', () => {
+    let s = reducer(base, { type: 'pending', channel: 'garden', id: 1, text: 'x', action: false, now: 0 })
+    const p = (st: State) => chan(st, 'garden').pending[0]
+    s = reducer(s, { type: 'pendingStale', channel: 'garden', id: 1 })
+    expect(p(s)).toMatchObject({ state: 'unconfirmed' })
+    s = reducer(s, { type: 'pendingRetry', channel: 'garden', id: 1, now: 9 })
+    expect(p(s)).toMatchObject({ state: 'sending', at: 9, error: null })
+    s = reducer(s, { type: 'pendingDone', channel: 'garden', id: 1, ok: false, error: 'connection lost', lost: true })
+    expect(p(s)).toMatchObject({ state: 'unconfirmed', error: 'the connection dropped before the server answered' })
+    s = reducer(s, { type: 'pendingDone', channel: 'garden', id: 1, ok: false, error: 'nope' })
+    expect(p(s)).toMatchObject({ state: 'failed', error: 'nope' })
+    expect(reducer(s, { type: 'pendingStale', channel: 'garden', id: 1 })).toBe(s) // failed stays failed
+    s = reducer(s, { type: 'pendingDiscard', channel: 'garden', id: 1 })
+    expect(chan(s, 'garden').pending).toEqual([])
+  })
+
   it('unknown events are kept as notices, so a new command shows before the app knows it', () => {
     const s = play(base, [ev({ event: 'brand_new', seq: 3, re: 4, x: 1 })])
     expect(notices(s, focused(s)!.name)).toEqual(['brand_new'])

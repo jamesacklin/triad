@@ -35,6 +35,35 @@ export interface Notice {
 
 export type Item = Msg | Notice
 
+/**
+ * A message this tab sent that the session has not yet echoed back as a
+ * `message` event. Shown greyed out after the channel's items.
+ *
+ * - `sending`: the `send` request is out.
+ * - `sent`: its `done` was ok; waiting for the `message` event.
+ * - `unconfirmed`: no echo within 30 s, or the socket dropped before
+ *   `done`. It may or may not have gone out; a later echo or history page
+ *   still settles it.
+ * - `failed`: `done` said `ok: false`; it was not published.
+ */
+export interface Pending {
+  id: number
+  text: string
+  action: boolean
+  /** When it was sent, by this tab's clock (ms since 1970). */
+  at: number
+  state: 'sending' | 'sent' | 'unconfirmed' | 'failed'
+  error: string | null
+}
+
+/** How long a pending message waits for its echo before showing as unconfirmed. */
+export const PENDING_TIMEOUT_MS = 30_000
+/**
+ * How much older than the send an echo may claim to be and still settle it
+ * (the `ts` is the sending node's clock, which may differ from the tab's).
+ */
+const SETTLE_SKEW_MS = 10 * 60_000
+
 export interface Bot {
   host: string | null
   provider: string | null
@@ -66,6 +95,8 @@ export interface Channel {
   atStart: boolean
   /** A page of history is being fetched. */
   paging: boolean
+  /** Messages sent from this tab, not yet echoed, oldest first. */
+  pending: Pending[]
   unread: number
   members: number | null
   bot: Bot | null
@@ -130,6 +161,17 @@ export type Action =
   | { type: 'history'; ev: EventOf<'history'>; before?: string; resync?: boolean }
   | { type: 'focus'; channel: string }
   | { type: 'paging'; channel: string; on: boolean }
+  /** A message was sent from this tab: show it at once, greyed out. */
+  | { type: 'pending'; channel: string; id: number; text: string; action: boolean; now: number }
+  /**
+   * Its `send` request ended: ok, failed with the session's error, or cut
+   * off by the socket (`lost`: it may or may not have gone out).
+   */
+  | { type: 'pendingDone'; channel: string; id: number; ok: boolean; error?: string; lost?: boolean }
+  /** {@link PENDING_TIMEOUT_MS} passed since it was sent. */
+  | { type: 'pendingStale'; channel: string; id: number }
+  | { type: 'pendingRetry'; channel: string; id: number; now: number }
+  | { type: 'pendingDiscard'; channel: string; id: number }
   | { type: 'local'; text: string; error?: boolean; channel?: string; now: number }
   | { type: 'answered'; channel: string; member: string }
   | { type: 'clearError' }
@@ -163,6 +205,7 @@ function newChannel(info: ChannelInfo): Channel {
     loaded: false,
     atStart: false,
     paging: false,
+    pending: [],
     unread: 0,
     members: null,
     bot: null,
@@ -226,16 +269,46 @@ function insertByTs(items: Item[], item: Item): Item[] {
   return [...items.slice(0, i), item, ...items.slice(i)]
 }
 
-/** Merges messages by `op`: any already held are dropped. */
+/**
+ * Settles the oldest pending message that `m` is the echo of. The API does
+ * not link a `send` to its `message`, so the match is on what both carry:
+ * this node's own authorship (not its bot's), the text and the action flag,
+ * in the same channel. Oldest first, so two identical sends settle one
+ * each. A failed send was not published, so it never matches.
+ */
+function settle(pending: Pending[], m: HistoryMessage): Pending[] {
+  if (!m.mine || m.bot) return pending
+  const i = pending.findIndex(
+    (p) => p.state !== 'failed' && p.text === m.text && p.action === m.action && m.ts >= p.at - SETTLE_SKEW_MS,
+  )
+  return i < 0 ? pending : [...pending.slice(0, i), ...pending.slice(i + 1)]
+}
+
+/** Merges messages by `op`: any already held are dropped. Each new one may settle a pending send. */
 function mergeMessages(c: Channel, msgs: HistoryMessage[]): Channel {
   let items = c.items
+  let pending = c.pending
   const ops = new Set(c.ops)
   for (const m of msgs) {
     if (ops.has(m.op)) continue
     ops.add(m.op)
     items = insertByTs(items, toMsg(m))
+    pending = settle(pending, m)
   }
-  return { ...c, items, ops }
+  return { ...c, items, ops, pending }
+}
+
+/** Applies `f` to one pending message (null removes it); the same state when nothing changes. */
+function updatePending(state: State, channel: string, id: number, f: (p: Pending) => Pending | null): State {
+  const c = state.channels.find((x) => x.name === channel)
+  const i = c ? c.pending.findIndex((p) => p.id === id) : -1
+  if (!c || i < 0) return state
+  const next = f(c.pending[i])
+  if (next === c.pending[i]) return state
+  const pending = [...c.pending]
+  if (next) pending[i] = next
+  else pending.splice(i, 1)
+  return updateChannel(state, channel, (x) => ({ ...x, pending }))
 }
 
 function addNotice(state: State, channel: string | undefined | null, ev: Notice['ev'], now: number): State {
@@ -424,6 +497,28 @@ export function reducer(state: State, action: Action): State {
     }
     case 'paging':
       return updateChannel(state, action.channel, (c) => (c.paging === action.on ? c : { ...c, paging: action.on }))
+    case 'pending': {
+      const p: Pending = { id: action.id, text: action.text, action: action.action, at: action.now, state: 'sending', error: null }
+      return updateChannel(state, action.channel, (c) => ({ ...c, pending: [...c.pending, p] }))
+    }
+    case 'pendingDone':
+      return updatePending(state, action.channel, action.id, (p) => {
+        if (action.ok) return p.state === 'sending' ? { ...p, state: 'sent' } : p
+        if (action.lost) {
+          return { ...p, state: 'unconfirmed', error: 'the connection dropped before the server answered' }
+        }
+        return { ...p, state: 'failed', error: action.error ?? 'not sent' }
+      })
+    case 'pendingStale':
+      return updatePending(state, action.channel, action.id, (p) =>
+        p.state === 'sending' || p.state === 'sent'
+          ? { ...p, state: 'unconfirmed', error: p.error ?? 'no answer within 30 seconds' }
+          : p,
+      )
+    case 'pendingRetry':
+      return updatePending(state, action.channel, action.id, (p) => ({ ...p, state: 'sending', error: null, at: action.now }))
+    case 'pendingDiscard':
+      return updatePending(state, action.channel, action.id, () => null)
     case 'local': {
       const s = action.error ? { ...state, lastError: action.text } : state
       return addNotice(s, action.channel, { event: 'local', text: action.text, error: action.error }, action.now)

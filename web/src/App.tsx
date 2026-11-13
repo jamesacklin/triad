@@ -75,6 +75,13 @@ function Chat({ triad }: { triad: Triad }) {
     if (!session) return false
     session.clearError()
     const trimmed = line.trim()
+    // `/me <action>` is a send with `action` (as API.md has it), so it shows
+    // at once like any other message.
+    const me = /^\/me\s+([\s\S]+)$/.exec(trimmed)
+    if (me && state.focus) {
+      void session.send(state.focus, me[1], true)
+      return true
+    }
     if (trimmed.startsWith('/')) {
       const target = switchTarget(trimmed)
       if (target !== null) {
@@ -95,7 +102,9 @@ function Chat({ triad }: { triad: Triad }) {
       localError('no channel to send to')
       return false
     }
-    return (await session.send(state.focus, line)) !== null
+    // Shown at once as pending; a failure stays in the pane with Retry.
+    void session.send(state.focus, line)
+    return true
   }
 
   function localError(text: string) {
@@ -133,7 +142,15 @@ function Chat({ triad }: { triad: Triad }) {
           )}
         </header>
         {channel ? (
-          <MessageList key={channel.name} ref={list} channel={channel} me={state.node} onOlder={onOlder} />
+          <MessageList
+            key={channel.name}
+            ref={list}
+            channel={channel}
+            me={state.node}
+            onOlder={onOlder}
+            onRetry={(id) => void session?.retry(channel.name, id)}
+            onDiscard={(id) => session?.discard(channel.name, id)}
+          />
         ) : (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
             {connected ? 'Create or join a channel to start.' : 'Waiting for triad serve…'}

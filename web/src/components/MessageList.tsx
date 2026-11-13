@@ -7,7 +7,7 @@ import { ArrowDownIcon } from 'lucide-react'
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { authorLabel, clock, dateTime } from '@/lib/format'
-import type { Channel, Msg } from '@/state/store'
+import type { Channel, Msg, Pending } from '@/state/store'
 import { ReplyBlock } from './ReplyBlock'
 
 export interface MessageListHandle {
@@ -19,6 +19,8 @@ interface Props {
   channel: Channel
   me: string | null
   onOlder: () => void
+  onRetry: (id: number) => void
+  onDiscard: (id: number) => void
 }
 
 /** How near the bottom counts as "at the bottom". */
@@ -57,8 +59,56 @@ function MessageLine({ m, dm }: { m: Msg; dm: boolean }) {
   )
 }
 
+const PENDING_NOTE: Record<Pending['state'], string> = {
+  sending: 'sending…',
+  sent: 'sent; waiting for it to come back',
+  unconfirmed: 'not confirmed',
+  failed: 'not sent',
+}
+
+/** A message sent from this tab, greyed out until the session echoes it. */
+function PendingLine({ p, onRetry, onDiscard }: { p: Pending; onRetry: () => void; onDiscard: () => void }) {
+  const bad = p.state === 'failed' || p.state === 'unconfirmed'
+  return (
+    <div className="flex gap-2 py-0.5 text-sm leading-relaxed" aria-label={`${PENDING_NOTE[p.state]}: ${p.text}`}>
+      <span className="hidden w-16 shrink-0 whitespace-nowrap pt-px text-right font-mono text-xs leading-relaxed text-muted-foreground/70 sm:block">
+        {clock(p.at)}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="whitespace-pre-wrap break-words opacity-50">
+          {p.action ? (
+            <>
+              <span className="font-semibold text-cyan-700 dark:text-cyan-400">* me</span> {p.text}
+            </>
+          ) : (
+            <>
+              <span className="font-semibold text-cyan-700 dark:text-cyan-400">me:</span> {p.text}
+            </>
+          )}
+        </p>
+        {bad ? (
+          <p role="alert" className={`flex flex-wrap items-center gap-2 text-xs ${p.state === 'failed' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400'}`}>
+            <span>
+              {PENDING_NOTE[p.state]}
+              {p.error ? `: ${p.error}` : ''}
+            </span>
+            <Button size="xs" variant="outline" onClick={onRetry}>
+              Retry
+            </Button>
+            <Button size="xs" variant="ghost" onClick={onDiscard}>
+              Discard
+            </Button>
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">{PENDING_NOTE[p.state]}</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export const MessageList = forwardRef<MessageListHandle, Props>(function MessageList(
-  { channel, me, onOlder },
+  { channel, me, onOlder, onRetry, onDiscard },
   handle,
 ) {
   const el = useRef<HTMLDivElement>(null)
@@ -82,7 +132,7 @@ export const MessageList = forwardRef<MessageListHandle, Props>(function Message
       d.scrollTop += d.scrollHeight - prev.height
     }
     before.current = { first, height: d.scrollHeight }
-  }, [channel.items, first])
+  }, [channel.items, channel.pending, first])
 
   const onScroll = useCallback(() => {
     const d = el.current
@@ -145,6 +195,9 @@ export const MessageList = forwardRef<MessageListHandle, Props>(function Message
             </div>
           ),
         )}
+        {channel.pending.map((p) => (
+          <PendingLine key={`p${p.id}`} p={p} onRetry={() => onRetry(p.id)} onDiscard={() => onDiscard(p.id)} />
+        ))}
       </div>
       {!atBottom && (
         <Button size="sm" variant="secondary" onClick={toBottom} className="absolute right-4 bottom-3 shadow">

@@ -104,8 +104,15 @@ src/
 - **Focus is the tab's own.** The API has no focus; `focused` in channel
   objects is ignored. Alt-Up and Alt-Down move between channels; unread
   counts are cleared when a channel is shown.
-- **Messages** appear when the session's `message` event arrives, not when
-  sent. They are plain text with line breaks; no Markdown.
+- **Sent messages show at once,** greyed out, and turn solid when the
+  session's `message` event for them arrives. The API does not link a
+  `send` to its `message`, so the echo is matched on channel, own
+  authorship (not the bot's), text and the action flag, oldest pending
+  first. A send whose `done` fails stays, red, with the error and Retry and
+  Discard; one with no echo after 30 s, or cut off by a dropped socket,
+  shows as "not confirmed" with the same buttons, and a later echo or
+  resync page still settles it. `/me <action>` is a `send` with `action`.
+  Messages are plain text with line breaks; no Markdown.
 - **The composer.** Enter sends, Shift-Enter adds a line, PgUp and PgDn
   scroll the pane. A line starting with `/` is a `command` with the shown
   channel; anything else a `send`. Typing `/` lists commands (Up and Down

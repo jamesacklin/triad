@@ -194,7 +194,88 @@ describe('Session', () => {
   it('a request when the socket is down fails with a note, not silently', async () => {
     const t = await connected()
     t.s().drop(1006)
-    expect(await t.session.send('garden', 'hi')).toBeNull()
+    expect(await t.session.command('garden', '/members')).toBeNull()
     expect(t.state().lastError).toBe('not connected')
+    // A message is kept, failed, with the reason, to retry or discard.
+    expect(await t.session.send('garden', 'hi')).toBe(false)
+    const g = t.state().channels.find((c) => c.name === 'garden')!
+    expect(g.pending).toMatchObject([{ text: 'hi', state: 'failed', error: 'not connected' }])
+  })
+
+  it('optimistic sends: pending at once, settled by the echo, failed with the error, stale after 30 s', async () => {
+    const t = await connected()
+    const pend = () => t.state().channels.find((c) => c.name === 'garden')!.pending
+    const me = { mine: true, author: hello().node, nickname: null }
+
+    // Sent: shown at once, then `sent` on done, then gone when echoed.
+    const p = t.session.send('garden', 'hello')
+    expect(pend()).toMatchObject([{ text: 'hello', state: 'sending', action: false }])
+    t.reply([])
+    expect(await p).toBe(true)
+    expect(pend()).toMatchObject([{ state: 'sent' }])
+    t.s().emit(message('garden', 20, 30, { ...me, text: 'hello', ts: 0 }))
+    expect(pend()).toEqual([])
+    expect(texts(t.state(), 'garden')).toEqual(['hello'])
+
+    // The echo may come before done: it still settles, and done is then a no-op.
+    void t.session.send('garden', 'quick')
+    t.s().emit(message('garden', 21, 31, { ...me, text: 'quick', ts: 0 }))
+    expect(pend()).toEqual([])
+    t.reply([])
+    await vi.advanceTimersByTimeAsync(0)
+    expect(pend()).toEqual([])
+
+    // Failed: the session's error, then retry (sent again) or discard.
+    const f = t.session.send('garden', 'nope')
+    t.fail('not in #garden yet; messages are disabled until a manager adds you')
+    expect(await f).toBe(false)
+    expect(pend()).toMatchObject([{ state: 'failed', error: 'not in #garden yet; messages are disabled until a manager adds you' }])
+    const id = pend()[0].id
+    void t.session.retry('garden', id)
+    expect(t.s().last()).toMatchObject({ op: 'send', channel: 'garden', text: 'nope' })
+    expect(pend()).toMatchObject([{ id, state: 'sending', error: null }])
+    t.fail('still not')
+    await vi.advanceTimersByTimeAsync(0)
+    t.session.discard('garden', id)
+    expect(pend()).toEqual([])
+
+    // No echo within 30 s: unconfirmed, not gone; a late echo still settles it.
+    void t.session.send('garden', 'slow')
+    t.reply([])
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(pend()).toMatchObject([{ state: 'sent' }])
+    await vi.advanceTimersByTimeAsync(1)
+    expect(pend()).toMatchObject([{ state: 'unconfirmed', error: 'no answer within 30 seconds' }])
+    t.s().emit(message('garden', 22, 32, { ...me, text: 'slow', ts: 0 }))
+    expect(pend()).toEqual([])
+  })
+
+  it('a send cut off by a dropped socket is unconfirmed, and a resync page that holds it settles it', async () => {
+    const t = await connected()
+    const pend = () => t.state().channels.find((c) => c.name === 'garden')!.pending
+    void t.session.show('garden')
+    t.reply([history('garden', [10], false)])
+    await vi.advanceTimersByTimeAsync(0)
+    t.reply([])
+    await vi.advanceTimersByTimeAsync(0)
+    t.reply([])
+    await vi.advanceTimersByTimeAsync(0)
+    const p = t.session.send('garden', 'in flight')
+    t.s().drop(1006)
+    expect(await p).toBe(false)
+    expect(pend()).toMatchObject([{ state: 'unconfirmed', error: 'the connection dropped before the server answered' }])
+    // Reconnect: garden is resynced, and the message turns out to have gone out.
+    await vi.advanceTimersByTimeAsync(1000)
+    t.s().open()
+    t.s().emit(hello())
+    t.s().emit(ready(['agent', 'garden']))
+    await vi.advanceTimersByTimeAsync(0)
+    t.reply([history('agent', [1, 2], false)])
+    await vi.advanceTimersByTimeAsync(0)
+    expect(t.s().last()).toMatchObject({ op: 'history', channel: 'garden' })
+    t.reply([{ ...history('garden', [10], false), messages: [msg('garden', 10), msg('garden', 11, { mine: true, text: 'in flight', ts: 2000 })] }])
+    await vi.advanceTimersByTimeAsync(0)
+    expect(pend()).toEqual([])
+    expect(texts(t.state(), 'garden')).toEqual(['m10', 'in flight'])
   })
 })

@@ -10,7 +10,7 @@ import {
   type Reply,
 } from '@/api/client'
 import type { EventOf, IncomingEvent, RequestBody } from '@/api/protocol'
-import { oldestOp, type Action, type State } from './store'
+import { oldestOp, PENDING_TIMEOUT_MS, type Action, type State } from './store'
 
 export const PAGE = 50
 
@@ -36,6 +36,9 @@ export class Session {
   /** Set by a reconnect, consumed by the next `ready`. (`serve` sends `ready` twice on connect, so counting them would not do.) */
   #resyncDue = false
   #syncing = false
+  #pendingId = 0
+  /** The 30-second timers of pending sends, cleared on close. */
+  #timers = new Set<ReturnType<typeof setTimeout>>()
 
   constructor(opts: SessionOptions) {
     this.#dispatch = opts.dispatch
@@ -56,6 +59,8 @@ export class Session {
   }
 
   close(): void {
+    for (const t of this.#timers) clearTimeout(t)
+    this.#timers.clear()
     this.client.close()
   }
 
@@ -208,9 +213,48 @@ export class Session {
     }
   }
 
-  /** Plain text to a channel. It appears when the session's `message` event arrives. */
-  send(channel: string, text: string, action = false): Promise<Reply | null> {
-    return this.ask(action ? { op: 'send', channel, text, action } : { op: 'send', channel, text }, channel)
+  /**
+   * Plain text (or a `/me` action) to a channel. It shows at once as
+   * pending, greyed out, and is settled by the session's `message` event
+   * for it (see `settle` in the store). Resolves when the request ends:
+   * true if the session took it.
+   */
+  send(channel: string, text: string, action = false): Promise<boolean> {
+    const id = ++this.#pendingId
+    this.#dispatch({ type: 'pending', channel, id, text, action, now: this.#now() })
+    return this.#deliver(channel, id, text, action)
+  }
+
+  /** Sends a failed or unconfirmed message again. */
+  retry(channel: string, id: number): Promise<boolean> {
+    const p = this.#state().channels.find((c) => c.name === channel)?.pending.find((x) => x.id === id)
+    if (!p) return Promise.resolve(false)
+    this.#dispatch({ type: 'pendingRetry', channel, id, now: this.#now() })
+    return this.#deliver(channel, id, p.text, p.action)
+  }
+
+  discard(channel: string, id: number): void {
+    this.#dispatch({ type: 'pendingDiscard', channel, id })
+  }
+
+  async #deliver(channel: string, id: number, text: string, action: boolean): Promise<boolean> {
+    const timer = setTimeout(() => {
+      this.#timers.delete(timer)
+      this.#dispatch({ type: 'pendingStale', channel, id })
+    }, PENDING_TIMEOUT_MS)
+    this.#timers.add(timer)
+    try {
+      await this.client.request(action ? { op: 'send', channel, text, action } : { op: 'send', channel, text })
+      this.#dispatch({ type: 'pendingDone', channel, id, ok: true })
+      return true
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e)
+      // Cut off after it went out: it may have been published. Never sent
+      // (no socket): plainly failed.
+      const lost = e instanceof RequestError && error === 'connection lost'
+      this.#dispatch({ type: 'pendingDone', channel, id, ok: false, error, lost })
+      return false
+    }
   }
 
   /** A `/command` line, run as if typed with `channel` focused. */

@@ -208,7 +208,8 @@ a `web/README.md`, a README section, and a FINDINGS.md section.
 - **A message's own `done` does not name its `message` event.** The app
   shows a sent message when its `message` event arrives, not optimistically,
   so there is no duplicate to reconcile. On a slow network it will feel
-  late.
+  late. (Reversed after F5: sends are optimistic, matched to their echo by
+  text; see below.)
 - **The token in the page.** Any script running on the page's origin can
   read it. No third-party scripts, no analytics, no CDN fonts; everything
   is bundled.
@@ -261,3 +262,7 @@ These reverse four decisions above; FINDINGS.md "Web app" has the results.
    address, never from `Host`. `index.html` carries a strict
    Content-Security-Policy.
 
+2. **Optimistic sends.** A sent message shows at once, greyed out, and is
+   settled by its `message` event, matched on channel, own authorship,
+   text and action flag, oldest first. A failed `done` keeps it with the
+   error, Retry and Discard; no echo in 30 s shows it as not confirmed.
