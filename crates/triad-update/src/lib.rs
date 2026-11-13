@@ -321,6 +321,9 @@ pub enum Outcome {
     Rejected { version: String },
     /// An earlier update is still on trial.
     Busy,
+    /// The release replaced the binary on disk ([`replace`]). The next start
+    /// runs it.
+    Installed { version: String },
 }
 
 /// Asks the source for its release once and, given a slot directory,
@@ -344,51 +347,18 @@ pub async fn check(c: Check<'_>) -> Result<Outcome> {
         }
     }
 
-    let mut request = c
-        .client
-        .get(format!("{}/manifest", c.url))
-        .timeout(MANIFEST_TIMEOUT);
-    if let Some(etag) = &state.etag {
-        request = request.header("If-None-Match", etag);
-    }
-    let mut response = request.send().await.context("fetching the manifest")?;
-    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+    let Some((manifest, etag)) =
+        fetch_manifest(c.client, c.url, c.keys, state.etag.as_deref(), c.now).await?
+    else {
         return Ok(Outcome::Current);
-    }
-    ensure!(
-        response.status().is_success(),
-        "fetching the manifest: HTTP {}",
-        response.status()
-    );
-    let etag = response
-        .headers()
-        .get("ETag")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.context("reading the manifest")? {
-        ensure!(
-            bytes.len() + chunk.len() <= MANIFEST_MAX,
-            "manifest is too large"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-
-    let manifest = Manifest::verify(&bytes, c.keys)?;
+    };
     ensure!(
         manifest.seq >= state.seq,
         "manifest is release {}, older than release {} already seen; refusing it",
         manifest.seq,
         state.seq
     );
-    ensure!(
-        c.now < manifest.expires,
-        "manifest expired; the update source is stale"
-    );
-    let blob = manifest
-        .targets
-        .get(TARGET)
-        .with_context(|| format!("release {} has no build for {TARGET}", manifest.version))?;
+    let blob = target_blob(&manifest)?;
     let version = manifest.version.clone();
 
     // From here the manifest is dealt with in full unless installing fails,
@@ -422,22 +392,12 @@ pub async fn check(c: Check<'_>) -> Result<Outcome> {
         .and_then(|s| Slot::parse(&s));
     let slot = live.map_or(Slot::A, Slot::other);
     let partial = dir.join(format!("{}.partial", slot.name()));
-    let fetched = download(
-        c.client,
-        &format!("{}/blobs/{}", c.url, blob.sha256),
-        &partial,
-        blob,
-    )
-    .await;
-    if let Err(e) = fetched {
-        let _ = fs::remove_file(&partial);
-        return Err(e.context(format!("downloading release {version}")));
-    }
-    if let Err(e) = self_test(&partial, &version) {
-        let _ = fs::remove_file(&partial);
-        state.bad_sha = Some(blob.sha256.clone());
-        settled(&mut state)?;
-        return Err(e.context(format!("release {version} does not run here")));
+    if let Err(e) = fetch_binary(c.client, c.url, blob, &version, &partial).await {
+        if e.is::<DoesNotRun>() {
+            state.bad_sha = Some(blob.sha256.clone());
+            settled(&mut state)?;
+        }
+        return Err(e);
     }
 
     fs::rename(&partial, dir.join(slot.name()))?;
@@ -452,6 +412,181 @@ pub async fn check(c: Check<'_>) -> Result<Outcome> {
     write_atomic(&dir.join(CURRENT), slot.name().as_bytes())?;
     sync_dir(dir);
     Ok(Outcome::Staged { version, slot })
+}
+
+/// What one [`replace`] needs.
+pub struct Replace<'a> {
+    pub client: &'a reqwest::Client,
+    /// The source, without a trailing slash.
+    pub url: &'a str,
+    pub keys: &'a [VerifyingKey],
+    /// The binary to replace: the running one.
+    pub running: &'a Path,
+    /// What the running binary prints for `--version`, after `triad `.
+    pub version: &'a str,
+    /// Unix seconds, for `expires`.
+    pub now: u64,
+}
+
+/// Updates a plain install, one not run from slots: asks the source for its
+/// release once and, if it is a newer version than the one running,
+/// downloads it next to `running`, checks it and moves it over `running`.
+/// The running process keeps its old binary; the next start runs the new
+/// one ([`Outcome::Installed`]). Only a newer version is installed, so a
+/// source that serves an older (still signed, unexpired) release cannot
+/// take an install back.
+pub async fn replace(c: Replace<'_>) -> Result<Outcome> {
+    let Some((manifest, _)) = fetch_manifest(c.client, c.url, c.keys, None, c.now).await? else {
+        return Ok(Outcome::Current);
+    };
+    let blob = target_blob(&manifest)?;
+    let version = manifest.version.clone();
+    if !is_newer(&version, c.version) {
+        return Ok(Outcome::Current);
+    }
+    let (running_sha, _) =
+        sha256_file(c.running).with_context(|| format!("reading {}", c.running.display()))?;
+    if running_sha == blob.sha256 {
+        return Ok(Outcome::Current);
+    }
+
+    let dir = c
+        .running
+        .parent()
+        .with_context(|| format!("{} has no directory", c.running.display()))?;
+    let name = c
+        .running
+        .file_name()
+        .with_context(|| format!("{} has no file name", c.running.display()))?
+        .to_string_lossy();
+    // In the binary's own directory, so the move is a rename on one disk.
+    let partial = dir.join(format!(".{name}.update-{}", std::process::id()));
+    fetch_binary(c.client, c.url, blob, &version, &partial).await?;
+    if let Err(e) = fs::rename(&partial, c.running) {
+        let _ = fs::remove_file(&partial);
+        return Err(anyhow::Error::new(e).context(format!("replacing {}", c.running.display())));
+    }
+    sync_dir(dir);
+    Ok(Outcome::Installed { version })
+}
+
+/// True when `path` is a binary in a slot directory, which only the slot
+/// updater and its supervisor may change.
+pub fn is_slot_binary(path: &Path) -> bool {
+    let named_slot = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| Slot::parse(n).is_some());
+    named_slot && path.parent().is_some_and(|d| d.join(CURRENT).is_file())
+}
+
+/// True when this binary was built as a release: with the keys it trusts and
+/// the source it updates from compiled in. Only such a build updates itself
+/// unasked; a build from source is left alone.
+pub fn is_release_build() -> bool {
+    let set = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    set(option_env!("TRIAD_UPDATE_KEYS")) && set(option_env!("TRIAD_UPDATE_URL"))
+}
+
+/// Whether version `a` is newer than `b`, comparing dot-separated numbers
+/// (`0.10.0` is newer than `0.9.1`). A version that is not plain numbers is
+/// never newer, so an odd manifest cannot replace a binary.
+pub fn is_newer(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Option<Vec<u64>> {
+        v.split('.').map(|part| part.parse().ok()).collect()
+    }
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// Fetches and verifies the manifest. `None` when the source answers that it
+/// has not changed since `etag`. Returns the manifest's ETag with it.
+async fn fetch_manifest(
+    client: &reqwest::Client,
+    url: &str,
+    keys: &[VerifyingKey],
+    etag: Option<&str>,
+    now: u64,
+) -> Result<Option<(Manifest, Option<String>)>> {
+    let mut request = client
+        .get(format!("{url}/manifest"))
+        .timeout(MANIFEST_TIMEOUT);
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let mut response = request.send().await.context("fetching the manifest")?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    ensure!(
+        response.status().is_success(),
+        "fetching the manifest: HTTP {}",
+        response.status()
+    );
+    let etag = response
+        .headers()
+        .get("ETag")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("reading the manifest")? {
+        ensure!(
+            bytes.len() + chunk.len() <= MANIFEST_MAX,
+            "manifest is too large"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    let manifest = Manifest::verify(&bytes, keys)?;
+    ensure!(
+        now < manifest.expires,
+        "manifest expired; the update source is stale"
+    );
+    Ok(Some((manifest, etag)))
+}
+
+fn target_blob(manifest: &Manifest) -> Result<&Blob> {
+    manifest
+        .targets
+        .get(TARGET)
+        .with_context(|| format!("release {} has no build for {TARGET}", manifest.version))
+}
+
+/// A downloaded binary that does not start here, or is not the version its
+/// manifest names.
+#[derive(Debug)]
+struct DoesNotRun;
+
+impl std::fmt::Display for DoesNotRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the downloaded binary failed its test run")
+    }
+}
+
+impl std::error::Error for DoesNotRun {}
+
+/// Downloads the release binary to `dest` and test-runs it. On any error
+/// `dest` is removed; an error that is [`DoesNotRun`] means the binary
+/// arrived intact and failed its test.
+async fn fetch_binary(
+    client: &reqwest::Client,
+    url: &str,
+    blob: &Blob,
+    version: &str,
+    dest: &Path,
+) -> Result<()> {
+    if let Err(e) = download(client, &format!("{url}/blobs/{}", blob.sha256), dest, blob).await {
+        let _ = fs::remove_file(dest);
+        return Err(e.context(format!("downloading release {version}")));
+    }
+    if let Err(e) = self_test(dest, version) {
+        let _ = fs::remove_file(dest);
+        return Err(anyhow::Error::new(DoesNotRun)
+            .context(format!("{e:#}"))
+            .context(format!("release {version} does not run here")));
+    }
+    Ok(())
 }
 
 /// Streams `url` into `dest`, never holding more than a chunk in memory, and
@@ -489,11 +624,23 @@ async fn download(client: &reqwest::Client, url: &str, dest: &Path, blob: &Blob)
 /// Runs the downloaded binary once: it must start on this machine and be
 /// the version the manifest names.
 fn self_test(binary: &Path, version: &str) -> Result<()> {
-    let output = std::process::Command::new(binary)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .context("running it with --version")?;
+    // Another thread that starts a process between our write and this run
+    // can hold the just-written file open for a moment ("text file busy"),
+    // so that is retried.
+    let mut tries = 0;
+    let output = loop {
+        let run = std::process::Command::new(binary)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output();
+        match run {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            run => break run.context("running it with --version")?,
+        }
+    };
     ensure!(
         output.status.success(),
         "--version exited with {}",
@@ -584,6 +731,18 @@ mod tests {
         let mut bad = manifest();
         bad.targets.get_mut(TARGET).unwrap().sha256 = format!("../{}", "a".repeat(61));
         assert!(bad.sign(&key).is_err());
+    }
+
+    #[test]
+    fn versions_compare_by_number() {
+        assert!(is_newer("0.1.3", "0.1.2"));
+        assert!(is_newer("0.10.0", "0.9.9"));
+        assert!(is_newer("1.0", "0.9.9"));
+        assert!(is_newer("0.1.2.1", "0.1.2"));
+        assert!(!is_newer("0.1.2", "0.1.2"));
+        assert!(!is_newer("0.1.1", "0.1.2"));
+        assert!(!is_newer("0.2.0-rc1", "0.1.0"));
+        assert!(!is_newer("0.2.0", "dev"));
     }
 
     #[test]

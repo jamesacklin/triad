@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use p2panda::node::AckPolicy;
 use p2panda::spaces::{PendingSpace, Space, SpaceSubscription};
@@ -211,11 +211,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProbeCmd,
     },
-    /// Ask the update source once whether there is a newer release. With
-    /// --slots, download it, check it against the signed manifest and
-    /// install it; the exit status is then 10 and triad should be restarted.
+    /// Update triad to the newest release: download it, check it against
+    /// the signed manifest and put it in place of this binary. Running
+    /// sessions keep the old version until they are restarted.
     Update {
-        /// Install into this A/B slot directory (see crates/triad-update).
+        /// Only report whether a newer release exists.
+        #[arg(long, conflicts_with = "slots")]
+        check: bool,
+        /// Install into this A/B slot directory instead (see
+        /// crates/triad-update); the exit status is then 10 and triad
+        /// should be restarted from the slot `current` names.
         #[arg(long, value_name = "DIR")]
         slots: Option<PathBuf>,
         /// The update source (default: TRIAD_UPDATE_URL).
@@ -406,25 +411,109 @@ fn unix_now() -> Result<u64> {
         .as_secs())
 }
 
+/// The file this process was started from. On Linux, once an update has
+/// replaced it, the kernel reports the old path with " (deleted)" after it.
+fn running_binary() -> Result<PathBuf> {
+    let path = std::env::current_exe().context("finding the running binary")?;
+    if !path.exists()
+        && let Some(live) = path.to_str().and_then(|p| p.strip_suffix(" (deleted)"))
+    {
+        return Ok(PathBuf::from(live));
+    }
+    Ok(path)
+}
+
+/// Replaces this binary with a newer release if there is one.
+async fn replace_binary(client: &reqwest::Client, url: &str) -> Result<triad_update::Outcome> {
+    let keys = triad_update::trusted_keys()?;
+    let running = running_binary()?;
+    ensure!(
+        !triad_update::is_slot_binary(&running),
+        "{} runs from an update slot; update it with --slots",
+        running.display()
+    );
+    triad_update::replace(triad_update::Replace {
+        client,
+        url,
+        keys: &keys,
+        running: &running,
+        version: VERSION,
+        now: unix_now()?,
+    })
+    .await
+}
+
+/// How often a running `triad serve` looks for a release.
+const AUTO_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// A release build keeps itself current: it looks for a newer release in the
+/// background when it starts, and `serve` again every few hours, and puts it
+/// in place of the binary for the next start. A build from source, a binary
+/// in an update slot (the VM supervisor updates those) and
+/// `TRIAD_NO_AUTO_UPDATE=1` are left alone. Results go to the log, and to
+/// stderr when `announce` (not under the terminal interface, which owns the
+/// screen).
+fn spawn_auto_update(rt: &tokio::runtime::Runtime, repeat: bool, announce: bool) {
+    if !triad_update::is_release_build()
+        || std::env::var_os("TRIAD_NO_AUTO_UPDATE").is_some_and(|v| !v.is_empty() && v != "0")
+        || running_binary().is_ok_and(|p| triad_update::is_slot_binary(&p))
+    {
+        return;
+    }
+    rt.spawn(async move {
+        let Ok((client, _)) = triad_agent::http::client() else {
+            return;
+        };
+        let Ok(url) = triad_update::source_url(None) else {
+            return;
+        };
+        loop {
+            match replace_binary(&client, &url).await {
+                Ok(triad_update::Outcome::Installed { version }) => {
+                    tracing::info!(%version, "auto-update installed a release");
+                    if announce {
+                        eprintln!("update: installed triad {version}; restart triad to use it");
+                    }
+                    // The next release is for the next start.
+                    return;
+                }
+                Ok(_) => tracing::debug!("auto-update: up to date"),
+                Err(e) => tracing::warn!("auto-update: {e:#}"),
+            }
+            if !repeat {
+                return;
+            }
+            tokio::time::sleep(AUTO_UPDATE_INTERVAL).await;
+        }
+    });
+}
+
 /// `triad update`. Needs no data directory and no identity.
-fn update(slots: Option<&Path>, url: Option<String>) -> Result<ExitCode> {
+fn update(check: bool, slots: Option<&Path>, url: Option<String>) -> Result<ExitCode> {
     use triad_update::Outcome;
     let url = triad_update::source_url(url)?;
-    let keys = triad_update::trusted_keys()?;
     let (client, _) = triad_agent::http::client().map_err(anyhow::Error::msg)?;
-    let running = std::env::current_exe().context("finding the running binary")?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let outcome = rt.block_on(triad_update::check(triad_update::Check {
-        client: &client,
-        url: &url,
-        keys: &keys,
-        running: &running,
-        slots,
-        now: unix_now()?,
-    }))?;
+    let outcome = if check || slots.is_some() {
+        let keys = triad_update::trusted_keys()?;
+        let running = running_binary()?;
+        rt.block_on(triad_update::check(triad_update::Check {
+            client: &client,
+            url: &url,
+            keys: &keys,
+            running: &running,
+            slots,
+            now: unix_now()?,
+        }))?
+    } else {
+        rt.block_on(replace_binary(&client, &url))?
+    };
     match outcome {
+        Outcome::Installed { version } => println!(
+            "update: installed triad {version} (was {VERSION}); restart any running triad to use it"
+        ),
         Outcome::Current => println!("update: triad {VERSION} is up to date"),
         Outcome::Available { version } => println!("update: triad {version} is available"),
         Outcome::Staged { version, slot } => {
@@ -506,7 +595,9 @@ fn release(cmd: &ReleaseCmd) -> Result<ExitCode> {
 
 fn run_cli(cli: Cli) -> Result<ExitCode> {
     match &cli.cmd {
-        Cmd::Update { slots, url } => return update(slots.as_deref(), url.clone()),
+        Cmd::Update { check, slots, url } => {
+            return update(*check, slots.as_deref(), url.clone());
+        }
         Cmd::Release { cmd } => return release(cmd),
         _ => {}
     }
@@ -554,6 +645,18 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         .as_deref()
         .map(|name| normalize_nickname(name).map(|name| name.unwrap_or_default().to_owned()))
         .transpose()?;
+    match &cli.cmd {
+        Cmd::Create { json, plain, .. }
+        | Cmd::Join { json, plain, .. }
+        | Cmd::Chat { json, plain, .. } => spawn_auto_update(
+            &rt,
+            false,
+            !matches!(Mode::select(*json, *plain), Mode::Tui),
+        ),
+        #[cfg(feature = "ws")]
+        Cmd::Serve { .. } => spawn_auto_update(&rt, true, true),
+        _ => {}
+    }
     match cli.cmd {
         Cmd::Whoami => println!("{}", Identity::load_or_create(&data_dir)?.node_hex()),
         Cmd::Reset { .. } | Cmd::Update { .. } | Cmd::Release { .. } => {

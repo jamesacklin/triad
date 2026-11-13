@@ -20,7 +20,8 @@ What is in it:
   [WebSocket API](#websocket-api) (`triad serve`), and a
   [web app](#web-app) that the binary can serve itself. `--plain` and
   `--json` remain for pipes and scripts.
-- **[Updates](#updates)**: signed releases installed into A/B slots, and a
+- **[Updates](#updates)**: signed releases that a release build installs
+  over itself in the background, A/B slots with rollback, and a
   [minimal VM guest](scripts/vm/README.md) that keeps `triad` running and
   updated.
 
@@ -152,7 +153,7 @@ always-on node.
 | `history [--channel <name>] [--limit N]` | Print stored messages, oldest first: one channel, or all in one timeline. |
 | `status` | Print role, join status and operation counts for every channel. |
 | `bot [memory \| schedules \| skills \| persona]` | See and change what your personal bot keeps ([below](#seeing-and-changing-what-the-bot-keeps)). |
-| `update [--url <url>] [--slots <dir>]` | Look for a newer signed release, and with `--slots` install it ([Updates](#updates)). |
+| `update [--check] [--url <url>] [--slots <dir>]` | Install the newest signed release over this binary; `--check` only looks, `--slots` installs into A/B slots ([Updates](#updates)). |
 | `reset [--yes] [--keep-bot-config]` | Delete everything in the data directory (channels, history, identity, bot settings and keys) and print a new node ID. Asks you to type `reset` unless `--yes`. `--keep-bot-config` keeps `agent.json`, `mcp.json` and `keys.json`. Refuses a directory with no triad files in it. Quit any session using the directory first. |
 | `inspect --grep <text>` | Scan the raw bytes of `p2panda.sqlite` for the text. Exit 0 if absent, 1 if found. |
 | `probe listen` | Start a raw iroh echo endpoint and print its address. |
@@ -521,8 +522,8 @@ ticked. Node and pnpm are needed only for the app.
 `triad` can update itself from a release published as static files, over
 plain HTTP. The source is not trusted: a release is accepted only if its
 manifest is signed by a key compiled into the running binary and the
-downloaded binary matches the manifest's size and SHA-256. An older manifest
-than one already seen is refused, and so is one past its expiry date.
+downloaded binary matches the manifest's size and SHA-256. A manifest past
+its expiry date is refused.
 
 ```
 <url>/manifest         a signature, then JSON: seq, version, expires, a hash per target
@@ -530,19 +531,36 @@ than one already seen is refused, and so is one past its expiry date.
 ```
 
 ```sh
-triad update --url http://updates.example/triad            # is there a newer release?
-triad update --url http://updates.example/triad --slots DIR  # download, check and install it
+triad update            # download the newest release, check it, put it in place of this binary
+triad update --check    # only say whether there is a newer one
 ```
 
-With `--slots` the release goes into the one of two slots (`DIR/a`,
+`triad update` puts a newer version next to the running binary, runs it
+once with `--version`, and renames it over the old one. Sessions already
+running keep the old version until they are restarted; the next `triad`
+started is the new one. Only a newer version number is installed, so a
+source serving an older signed release cannot take an install back. The
+source is the one the binary was built with, or `--url` /
+`TRIAD_UPDATE_URL`.
+
+A release build (one with the keys and the source compiled in, as
+`triad-release` and `scripts/release.sh` make) also does this by itself:
+`create`, `join` and `chat` look for a release in the background when they
+start, and `triad serve` when it starts and every six hours. A release found
+is installed for the next start, noted in `triad.log`, and announced on
+stderr except under the terminal interface. `TRIAD_NO_AUTO_UPDATE=1` turns
+this off. A build from source never updates itself unasked.
+
+With `--slots DIR` the release goes into the one of two slots (`DIR/a`,
 `DIR/b`) that is not running, `DIR/current` is switched to it, and the exit
 status is 10: restart `triad` from the slot `current` names. This is made
 for a supervisor, and the one that exists is the VM guest's init
 ([scripts/vm/init.c](scripts/vm/init.c)): it runs the updater every few
 hours as a short-lived process, restarts `triad` into a new release, and
-goes back to the previous slot if the new binary does not stay up. See
-[scripts/vm/README.md](scripts/vm/README.md). A `triad` installed with
-`cargo install` can look for a release but does not yet replace itself.
+goes back to the previous slot if the new binary does not stay up. Slots
+also remember the highest release seen and refuse an older manifest. See
+[scripts/vm/README.md](scripts/vm/README.md). A binary in a slot is never
+replaced in place, by `triad update` or by itself.
 
 To publish:
 
