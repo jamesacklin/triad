@@ -1344,6 +1344,13 @@ All existing tests pass unedited; `cargo fmt --check` and `cargo clippy
 
 ### W0: the upgrade path
 
+*This describes the first listener. Since the axum swap ("axum under the
+listener", below) hyper reads the request head, axum's WebSocket
+(tokio-tungstenite) does the handshake and the framing, and neither
+tokio-websockets nor `futures-sink` is named in triad's manifests. A head
+that does not arrive within 5 s is now closed with no response, not
+`408`.*
+
 `tokio-websockets` 0.13.3 is already in the build through `iroh-relay`
 1.4.1, which turns on `client`, `server`, `ring`, `getrandom`, `rand`,
 `sha1_smol` and `rustls-bring-your-own-connector`. Its server side
@@ -1353,28 +1360,30 @@ All existing tests pass unedited; `cargo fmt --check` and `cargo clippy
 accepted; refusing then means a WebSocket close, not an HTTP 401/403. The
 codec that does the parsing (`upgrade::client_request`) is `pub(crate)`.
 
-The plan's fallback was hyper. Instead the listener reads the request head
-itself (up to the blank line), checks the method, the path, `Origin` and any
-bearer token, and answers a refusal with a plain HTTP status. The read is
-bounded: a head over 8 KiB gets `431`, and the head shares the 5 s the
-token has to arrive in, so a head that is slow as a whole (even one sent a
-byte at a time, each byte prompt) gets `408`. `ws_auth`'s
-`ws_request_head_is_bounded` covers both, and that a 7 KiB head with the
-token is still accepted. The header parsing is a dozen lines (split on
-CRLF, then on the first colon); `httparse` was not needed. An accepted connection's bytes are
-replayed into `accept` through a small `AsyncRead` wrapper, so the
-handshake proper (key, `Sec-WebSocket-Accept`, version checks) is still
-tokio-websockets'. This needs no hyper in the normal build, no SHA-1 of our
-own, and no new crate.
+The plan's fallback was hyper. Instead the first listener read the request
+head itself (up to the blank line), checked the method, the path, `Origin`
+and any bearer token, and answered a refusal with a plain HTTP status. The
+read was bounded: a head over 8 KiB got `431`, and the head shared the 5 s
+the token has to arrive in, so a head that was slow as a whole (even one
+sent a byte at a time, each byte prompt) got `408`. `ws_auth`'s
+`ws_request_head_is_bounded` covered both, and that a 7 KiB head with the
+token is still accepted. The header parsing was a dozen lines (split on
+CRLF, then on the first colon); `httparse` was not needed. An accepted
+connection's bytes were replayed into `accept` through a small `AsyncRead`
+wrapper, so the handshake proper (key, `Sec-WebSocket-Accept`, version
+checks) was still tokio-websockets'. This needed no hyper in the normal
+build, no SHA-1 of our own, and no new crate. All of this was replaced by
+the axum swap.
 
-One deviation from the dependency rule: **`futures-sink` (=0.3.34) is named
-in the manifest beside tokio-websockets.** `WebSocketStream` sends only
-through the `futures_sink::Sink` trait, and no crate triad already depends
-on re-exports it, so it cannot be called without naming the trait's crate.
-It is already compiled into the binary (through flume, sqlx and others), and
-is pinned at that exact version in `[workspace.dependencies]`. The
-alternative was writing outgoing frames by hand beside the library's
-reader. The plan's author accepted it (see "Where the plan was wrong").
+One deviation from the dependency rule (since removed): **`futures-sink`
+(=0.3.34) was named in the manifest beside tokio-websockets.**
+`WebSocketStream` sends only through the `futures_sink::Sink` trait, and no
+crate triad already depended on re-exports it, so it could not be called
+without naming the trait's crate. It is compiled into the binary anyway
+(through flume, sqlx and others). The alternative was writing outgoing
+frames by hand beside the library's reader. The plan's author accepted it
+(see "Where the plan was wrong"). axum's `WebSocket` has its own `send`, so
+the axum swap took `futures-sink` out of both manifests.
 
 Release binary (`cargo build --release -p triad`, x86_64 Linux, not
 stripped):
@@ -1408,7 +1417,8 @@ The VM's static, stripped, size-optimised guest binary with `ws` is
 1. **Upgrade path and size.** The head is read by hand and replayed into
    tokio-websockets' `accept` (W0 above). The feature adds 452,952 bytes
    (0.7%) to the release binary; tokio-websockets itself was already linked for
-   iroh's relay client.
+   iroh's relay client. Superseded: the listener is now axum on hyper; see
+   "axum under the listener" for its cost.
 2. **How long `/join` and `/create` stall the loop.** Measured in
    `ws_requests` as the time a second client's `snapshot` takes while the
    first client's command runs (debug build, loopback, no peers):
@@ -1461,11 +1471,13 @@ The VM's static, stripped, size-optimised guest binary with `ws` is
   WebSocket library whose send side is a `futures_sink::Sink` cannot be
   driven without naming the trait's crate, and nothing in triad's tree
   re-exports it. `futures-sink` (trait only, already linked, pinned at the
-  lockfile's 0.3.34) is named too. The rule's intent, no new code in the
-  build, holds.
+  lockfile's 0.3.34) was named too. The rule's intent, no new code in the
+  build, held. No longer the case: the axum swap removed both
+  tokio-websockets and `futures-sink` from triad's manifests.
 - **"Confirm its server side exposes the request headers before the
   upgrade is accepted."** It exposes them only after writing the `101`.
-  The fallback the plan named (hyper) was not needed; see W0.
+  The fallback the plan named (hyper) was not needed then; see W0. It is
+  what the listener uses now, under axum.
 
 ### Other findings
 
@@ -1511,6 +1523,153 @@ x86_64 under KVM only; arm64 was not run.
 - A lock on the data directory, now that a second process is one command
   away.
 - A per-client `seq`, if clients want to detect loss without `lagged`.
+
+### axum under the listener (2026-11-13)
+
+The plan is `AXUM-PLAN.md`. `triad serve`'s listener no longer reads the
+request head by hand: each accepted TCP connection is served by hyper 1.12's
+HTTP/1 server (`http1::Builder` with `TokioTimer`, `header_read_timeout(5 s)`,
+`max_buf_size(8192)`, `keep_alive(false)`, `with_upgrades()`), running an
+axum 0.8.9 `Router` through `hyper_util::service::TowerToHyperService`. The
+router is built per connection, with the accept time in its state, so the
+5 s deadline still runs from TCP accept and covers the head and the first
+frame together. The router has `/v1` (`any`) and a fallback; the handler
+checks the method, `Origin` and bearer token in the old order before the
+`WebSocketUpgrade` extractor's own checks (taken as a `Result`, so a
+non-upgrade request with a wrong token still gets `401`, not `400`), and
+the fallback answers `405` for any non-GET, so `POST /other` is still `405`
+rather than `404`. The connection task and `run` port line for line onto
+`axum::extract::ws::WebSocket`. `hub.rs`, `proto.rs`, `requests.rs` and
+`main.rs` are unchanged; `axum` (features `http1`, `tokio`, `ws`), `hyper`
+(`server`, `http1`) and `hyper-util` (`tokio`, `service`) are pinned
+exactly in `[workspace.dependencies]` and optional behind `ws`;
+`tokio-websockets` and `futures-sink` are gone from both manifests.
+tokio-tungstenite is used only through axum and is not named anywhere.
+
+#### A0: four questions, answered with a throwaway listener
+
+Same settings as above, probed with raw sockets before any triad code
+changed.
+
+| Question | hyper / axum | Before | Same? |
+|---|---|---|---|
+| Head over 8 KiB (`max_buf_size(8192)`) | `431` at once, also for 20 KiB with no head end; a 7 KiB head with the token still gets `101` | `431`; 7 KiB accepted | yes |
+| `header_read_timeout` on expiry | connection closed, **no response**, at 5.0 s; a head dripped at 20 B/s is closed at 5.1 s (one timer for the whole head, not per read) | `408` | **no** |
+| Message over `max_message_size` | `recv` returns tungstenite's capacity error and nothing is sent; sending `Close(1009)` by hand after it reaches the client | `1009`, sent by hand | yes, with the hand-sent close |
+| `POST /v1`; plain `GET /v1` | `405`; `400` | `405`; `400` (API.md) | yes |
+
+The 408: hyper 1.12's `Server::on_error` (`proto/h1/role.rs`) maps only
+parse errors to automatic responses (`400`, `414`, `431`); `HeaderTimeout`
+maps to none, and no builder setting changes that. This stopped A0 under
+the plan's "Stop and ask" rule.
+
+#### Size and crates
+
+Release binary (`cargo build --release -p triad`, x86_64 Linux, not
+stripped), against this branch's base (`e1c773c`):
+
+| Build | Bytes |
+|---|---|
+| Before (tokio-websockets listener) | 63,941,688 |
+| After (axum listener) | 64,525,824 |
+| Difference | +584,136 (+0.9%) |
+
+`cargo tree -p triad -e normal`: 455 crates before, 462 after. Added:
+`axum` 0.8.9, `axum-core` 0.5.6, `matchit` 0.8.4, `tokio-tungstenite`
+0.29.0, `tungstenite` 0.29.0, `sha1` 0.10.7 and `rand` 0.9.5 (both
+tungstenite's). `rand` is now in the build at three versions (0.8.8, 0.9.5,
+0.10.3). The plan expected a duplicate `sha1`; the lockfile does hold 0.11.0
+too, but only for `sqlx-mysql`, which is in the lockfile and not in the
+build, so `sha1` has one version in the binary. Removed from the build: none. `tokio-websockets` stays
+through `iroh-relay` and `futures-sink` through many crates; they only left
+triad's manifests. hyper, hyper-util, http, tower and the rest were already
+locked at the versions axum wants; no existing pin changed.
+
+`ws/mod.rs`: 609 lines to 514; the diff deletes 238 and adds 143. Gone:
+`Head`, `read_head`, `HeadRead`, the hand-written `refuse`, `Replay`, the
+`Sink`-driving `send`, and the unit test `parses_a_request_head`.
+
+#### The VM run
+
+`VM_KERNEL=skip scripts/vm/build.sh x86_64` (kernel copied from an earlier
+build, same config), then `scripts/vm/serve-test.sh x86_64 <mem>` with this
+branch's release `triad` on the host. x86_64 under KVM only.
+
+| Guest RAM | Result | `MemAvailable` after | `VmHWM` | `RssAnon` |
+|---|---|---|---|---|
+| 128 MB | PASS, `TRIAD_EXIT=0` | 85 MB | 37.8 MB | 20.1 MB |
+| 64 MB | PASS, `TRIAD_EXIT=0` | 22 MB | 38.1 MB | 20.4 MB |
+
+Within half a megabyte of the first listener's run (36.6 to 38.0 MB
+`VmHWM`). The static, stripped, size-optimised guest binary is 25,480,216
+bytes, against 25,283,608 recorded for the first listener (that build was
+not of this branch's exact base, so the 196,608-byte difference is
+indicative only).
+
+#### Behaviour checked by hand (A2)
+
+All six `ws_*` test files pass, with `ws_auth` edited only for the 408 (see
+below). Checked by hand against a debug `serve`:
+
+- A client that never answers pings gets a ping at 30 s and 60 s and is
+  closed with `1001` "no answer to pings" at 90 s.
+- Every refusal closes the connection (`connection: close`; read to EOF):
+  `401`, `403`, `405` for `POST /v1`, `HEAD /v1` and `POST /other`, `404`,
+  `400` for a plain `GET /v1` and for garbage, `431`.
+- Order is unchanged: a plain `GET /v1` with a wrong token gets `401`, and
+  `HEAD /v1` with a wrong token gets `405`.
+
+New test file `ws_frames.rs` (cheap, so added): a message of exactly
+1 MiB is read and answered, one byte more closes with `1009` and the other
+client is unaffected; a client's ping is answered with a pong carrying its
+payload; a binary frame closes with `1003`. The 1009 test passed eight runs
+in a row.
+
+#### Answers to the plan's questions
+
+1. **The four A0 answers.** Three matched (431 and the 7 KiB head, 1009 with
+   a hand-sent close, 405/400). The header timeout did not: silent close
+   where the old listener sent `408`. Table above.
+2. **Cost.** +584,136 bytes (+0.9%) in the release binary, seven crates
+   added and none removed from the build, one of them a third version of
+   `rand`. `ws/mod.rs` lost 95 lines net (238 deleted, 143 added),
+   and the whole hand-written HTTP reader with them.
+3. **Observable changes, and who decided.**
+   - A request head that does not arrive within 5 s is closed with no
+     response instead of `408`. There is no hyper setting for it; the
+     options were accepting it or keeping a hand-written deadline in front of
+     hyper. The user chose "Silent close" when asked, relayed by the
+     planning session. `ws_auth`'s `ws_request_head_is_bounded` now asserts
+     an empty answer within the same time bounds (both the unfinished and
+     the dripped head), and API.md and openapi.json no longer list `408`.
+   - hyper's automatic `431` and `400` (unparseable request) have empty
+     bodies, and axum's `400` for a missing upgrade says "Connection header
+     did not include 'upgrade'"; the old ones had a line of text of ours. No
+     test or document promised the text; accepted by the planning session.
+   - Responses now carry hyper's `date` header and lowercase header names.
+   - Not covered by tests and not checked: tungstenite and tokio-websockets
+     may differ on fragmented messages, invalid UTF-8 in a text frame (the
+     error is logged and the connection dropped, as before, without a
+     `1007`), and the close handshake.
+4. **Simpler to review?** Yes. What is left in `ws/mod.rs` is triad's own
+   policy (which checks, in which order, which close codes); the HTTP
+   parsing, the head limits and the handshake are hyper's and axum's, which
+   are tested far beyond what `ws_auth` covers. The one place that is not
+   cleaner is `too_long`: axum hands back tungstenite's capacity error only
+   as an `axum::Error`, and tungstenite is not a named dependency, so the
+   1 MiB case is recognised by its message text ("Message too long").
+   `ws_frames` would catch a wording change on an upgrade.
+
+#### Where the plan was wrong
+
+- The axum example is `examples/serve-with-hyper` at tag `axum-v0.8.9`,
+  not `serve-with-hyper-util` (corrected in the plan). It is not in the
+  crates.io package; it was read from the tag on GitHub.
+- "Expect more" on size was right, but the cost was under half the 1.5 MB
+  line.
+- The plan's `GET /v1` route alone would have answered `POST /other` with
+  `404` and let the `WebSocketUpgrade` extractor run before the token check;
+  `any` plus a method check in the handler and fallback keeps the old order.
 
 ## Agent harness options (2026-11-11)
 
