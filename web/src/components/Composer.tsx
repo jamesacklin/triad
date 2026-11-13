@@ -140,6 +140,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       )}
       <div className="flex items-end gap-2">
         <Textarea
+          id="composer"
           ref={area}
           value={text}
           onChange={(e) => {

@@ -9,7 +9,6 @@ import { MessageList, type MessageListHandle } from '@/components/MessageList'
 import { StatusBar } from '@/components/StatusBar'
 import { Button } from '@/components/ui/button'
 import { SidebarInset, SidebarProvider, SidebarTrigger } from '@/components/ui/sidebar'
-import { Toaster } from '@/components/ui/sonner'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { switchTarget } from '@/lib/commands'
 import { loadCredentials } from '@/lib/credentials'
@@ -40,7 +39,6 @@ export default function App() {
     <TriadContext.Provider value={triad}>
       <TooltipProvider>
         <Chat triad={triad} />
-        <Toaster />
       </TooltipProvider>
     </TriadContext.Provider>
   )
@@ -106,6 +104,16 @@ function Chat({ triad }: { triad: Triad }) {
 
   return (
     <SidebarProvider className="h-svh">
+      <a
+        href="#composer"
+        onClick={(e) => {
+          e.preventDefault()
+          composer.current?.focus()
+        }}
+        className="sr-only z-50 rounded-md bg-background px-3 py-2 focus:not-sr-only focus:absolute focus:top-2 focus:left-2"
+      >
+        Skip to the message box
+      </a>
       <ChannelSidebar onNew={() => setDialog('new')} onJoin={() => setDialog('join')} onPick={show} />
       <SidebarInset className="flex h-svh min-w-0 flex-col">
         <header className="flex h-11 shrink-0 items-center gap-2 border-b px-2">

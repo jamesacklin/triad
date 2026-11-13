@@ -38,7 +38,7 @@ function MessageLine({ m, dm }: { m: Msg; dm: boolean }) {
       <time
         dateTime={new Date(m.ts).toISOString()}
         title={dateTime(m.ts)}
-        className="w-16 shrink-0 whitespace-nowrap pt-px text-right font-mono text-xs leading-relaxed text-muted-foreground/70"
+        className="hidden w-16 shrink-0 whitespace-nowrap sm:block pt-px text-right font-mono text-xs leading-relaxed text-muted-foreground/70"
       >
         {clock(m.ts)}
       </time>
@@ -140,7 +140,7 @@ export const MessageList = forwardRef<MessageListHandle, Props>(function Message
           i.kind === 'msg' ? (
             <MessageLine key={i.op} m={i} dm={channel.dm} />
           ) : (
-            <div key={i.key} className="py-0.5 pl-18">
+            <div key={i.key} className="py-0.5 sm:pl-18">
               <ReplyBlock notice={i} me={me} />
             </div>
           ),

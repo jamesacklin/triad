@@ -76,6 +76,11 @@ export class Session {
     if (ev.event === 'history') return // applied by the request that asked for it
     this.#dispatch({ type: 'event', ev, show: shown, target, now: this.#now() })
     if (ev.event === 'ready') void this.#afterReady()
+    // Let into a channel shown while it was pending: learn its bot now.
+    if (ev.event === 'joined' && ev.member === this.#state().node) {
+      const c = this.#state().channels.find((x) => x.name === ev.channel)
+      if (c?.loaded && !c.dm) void this.#quiet({ op: 'command', channel: c.name, line: '/bot' })
+    }
   }
 
   /** On every `ready`: load the focused channel; after a reconnect, resync every channel already shown. */

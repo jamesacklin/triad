@@ -134,6 +134,19 @@ describe('Session', () => {
     expect(t.s().requests().filter((r) => r.channel === 'garden')).toEqual([])
   })
 
+  it('when this node is let into a channel it was shown pending, asks quietly for its bot', async () => {
+    const t = await connected()
+    t.s().emit({ event: 'channel', seq: 5, channel: 'patio', group: 'dd'.padEnd(64, '0'), role: 'member', status: 'pending', invite: null, focused: false })
+    void t.session.show('patio')
+    t.reply([history('patio', [], false)])
+    await vi.advanceTimersByTimeAsync(0)
+    const n = t.s().requests().length // pending: no member or bot query
+    expect(t.s().last()).toMatchObject({ op: 'history', channel: 'patio' })
+    t.s().emit({ event: 'joined', seq: 6, channel: 'patio', member: hello().node, members: 2, access: 'write' })
+    expect(t.s().requests()).toHaveLength(n + 1)
+    expect(t.s().last()).toMatchObject({ op: 'command', channel: 'patio', line: '/bot' })
+  })
+
   it('a second ready on one connection (serve sends two at start) is not a reconnect', async () => {
     const t = await connected()
     t.s().emit(ready(['agent', 'garden'], 3))
