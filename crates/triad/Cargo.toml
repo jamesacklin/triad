@@ -23,6 +23,7 @@ clipboard = ["dep:arboard"]
 triad-core = { workspace = true }
 triad-probe = { workspace = true }
 triad-agent = { workspace = true }
+triad-update = { workspace = true }
 p2panda = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

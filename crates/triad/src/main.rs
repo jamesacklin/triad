@@ -51,10 +51,18 @@ use triad_core::state::{
     JoinStatus, Meta, Outcome, Role, State, StoredMessage, WaitingLong, channel_name, now_ms,
 };
 
+/// What `--version` prints: `TRIAD_VERSION` from the build's environment
+/// (a release sets it), else the crate version. An update is accepted only
+/// if the downloaded binary prints the version its manifest names.
+const VERSION: &str = match option_env!("TRIAD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
     name = "triad",
-    version,
+    version = VERSION,
     about = "triad chat on p2panda encrypted spaces"
 )]
 struct Cli {
@@ -173,6 +181,53 @@ enum Cmd {
     Probe {
         #[command(subcommand)]
         cmd: ProbeCmd,
+    },
+    /// Ask the update source once whether there is a newer release. With
+    /// --slots, download it, check it against the signed manifest and
+    /// install it; the exit status is then 10 and triad should be restarted.
+    Update {
+        /// Install into this A/B slot directory (see crates/triad-update).
+        #[arg(long, value_name = "DIR")]
+        slots: Option<PathBuf>,
+        /// The update source (default: TRIAD_UPDATE_URL).
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+    },
+    /// Make release keys and signed releases.
+    #[command(hide = true)]
+    Release {
+        #[command(subcommand)]
+        cmd: ReleaseCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Write a new signing key to FILE and print its public key.
+    Keygen { file: PathBuf },
+    /// Print the public key of the signing key in FILE.
+    Pubkey { file: PathBuf },
+    /// Write a release into a directory, ready to upload: the binaries
+    /// under blobs/ and the signed manifest.
+    Publish {
+        /// The signing key file from `release keygen`.
+        #[arg(long, value_name = "FILE")]
+        key: PathBuf,
+        /// The directory to write into.
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+        /// What the binaries print for --version, without "triad ".
+        #[arg(long, value_name = "VERSION")]
+        version: String,
+        /// The release counter; higher than every release before.
+        #[arg(long, value_name = "N")]
+        seq: u64,
+        /// Clients stop accepting this manifest after this many days.
+        #[arg(long, value_name = "DAYS", default_value_t = 30)]
+        expires_days: u64,
+        /// A binary and its target triple; repeat for each target.
+        #[arg(long = "binary", value_name = "TARGET=PATH", required = true)]
+        binaries: Vec<String>,
     },
 }
 
@@ -312,7 +367,117 @@ fn default_data_dir() -> Result<PathBuf> {
     })
 }
 
+fn unix_now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("the clock is before 1970")?
+        .as_secs())
+}
+
+/// `triad update`. Needs no data directory and no identity.
+fn update(slots: Option<&Path>, url: Option<String>) -> Result<ExitCode> {
+    use triad_update::Outcome;
+    let url = triad_update::source_url(url)?;
+    let keys = triad_update::trusted_keys()?;
+    let (client, _) = triad_agent::http::client().map_err(anyhow::Error::msg)?;
+    let running = std::env::current_exe().context("finding the running binary")?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let outcome = rt.block_on(triad_update::check(triad_update::Check {
+        client: &client,
+        url: &url,
+        keys: &keys,
+        running: &running,
+        slots,
+        now: unix_now()?,
+    }))?;
+    match outcome {
+        Outcome::Current => println!("update: triad {VERSION} is up to date"),
+        Outcome::Available { version } => println!("update: triad {version} is available"),
+        Outcome::Staged { version, slot } => {
+            println!(
+                "update: installed triad {version} in slot {}; restart to run it",
+                slot.name()
+            );
+            return Ok(ExitCode::from(triad_update::STAGED_EXIT));
+        }
+        Outcome::Rejected { version } => {
+            println!("update: triad {version} failed here before; not installing it")
+        }
+        Outcome::Busy => println!("update: an earlier update is still on trial"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `triad release`.
+fn release(cmd: &ReleaseCmd) -> Result<ExitCode> {
+    match cmd {
+        ReleaseCmd::Keygen { file } => {
+            use std::io::Write;
+            let (secret, public) = triad_update::generate_key();
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options
+                .open(file)
+                .with_context(|| {
+                    format!(
+                        "creating {} (an existing key is never overwritten)",
+                        file.display()
+                    )
+                })?
+                .write_all(format!("{secret}\n").as_bytes())?;
+            eprintln!("signing key written to {}; keep it offline", file.display());
+            println!("{public}");
+        }
+        ReleaseCmd::Pubkey { file } => {
+            let key = triad_update::load_signing_key(file)?;
+            println!("{}", key.verifying_key().to_hex());
+        }
+        ReleaseCmd::Publish {
+            key,
+            dir,
+            version,
+            seq,
+            expires_days,
+            binaries,
+        } => {
+            let key = triad_update::load_signing_key(key)?;
+            let binaries = binaries
+                .iter()
+                .map(|pair| {
+                    pair.split_once('=')
+                        .map(|(target, path)| (target.to_owned(), PathBuf::from(path)))
+                        .with_context(|| format!("--binary {pair:?} is not TARGET=PATH"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let expires = unix_now()? + expires_days * 24 * 60 * 60;
+            let manifest = triad_update::publish(dir, &key, version, *seq, expires, &binaries)?;
+            println!(
+                "release {} (triad {}) in {}",
+                manifest.seq,
+                manifest.version,
+                dir.display()
+            );
+            for (target, blob) in &manifest.targets {
+                println!("  {target}  blobs/{}  {} bytes", blob.sha256, blob.size);
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run_cli(cli: Cli) -> Result<ExitCode> {
+    match &cli.cmd {
+        Cmd::Update { slots, url } => return update(slots.as_deref(), url.clone()),
+        Cmd::Release { cmd } => return release(cmd),
+        _ => {}
+    }
     let data_dir = match cli.data_dir {
         Some(d) => d,
         None => default_data_dir()?,
@@ -359,7 +524,9 @@ fn run_cli(cli: Cli) -> Result<ExitCode> {
         .transpose()?;
     match cli.cmd {
         Cmd::Whoami => println!("{}", Identity::load_or_create(&data_dir)?.node_hex()),
-        Cmd::Reset { .. } => unreachable!("handled above"),
+        Cmd::Reset { .. } | Cmd::Update { .. } | Cmd::Release { .. } => {
+            unreachable!("handled above")
+        }
         Cmd::Create {
             name,
             relay,

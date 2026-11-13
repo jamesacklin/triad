@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad"]
+members = ["crates/triad-core", "crates/triad-probe", "crates/triad-agent", "crates/triad-update", "crates/triad"]
 
 [workspace.package]
 version = "0.1.0"
@@ -34,6 +34,9 @@ chacha20poly1305 = { version = "=0.10.1", default-features = false, features = [
 getrandom = "0.3"
 serde_bytes = "0.11"
 
+# Updates (crates/triad-update). Already in the build through p2panda.
+sha2 = "0.10"
+
 # Bots (HARNESS-PLAN.md). Pinned exactly. `rig-core` and `rig-reqwest` may
 # only be named in triad-agent's brain.rs and `rmcp` only in its mcp.rs.
 rig-core = { version = "=0.46.0", default-features = false }
@@ -52,3 +55,4 @@ ratatui = { version = "=0.30.2", default-features = false, features = ["crosster
 triad-core = { path = "crates/triad-core" }
 triad-probe = { path = "crates/triad-probe" }
 triad-agent = { path = "crates/triad-agent" }
+triad-update = { path = "crates/triad-update" }

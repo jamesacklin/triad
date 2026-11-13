@@ -394,6 +394,49 @@ triad --data-dir /tmp/bob --nickname bob join triad1-…
 Alice answers `y` to bob's join request. `TRIAD_AGENT_BRAIN=mock` gives
 alice a bot that echoes `@bot` asks with no model key.
 
+## Updates
+
+`triad` can update itself from a release published as static files, over
+plain HTTP. The source is not trusted: a release is accepted only if its
+manifest is signed by a key compiled into the running binary and the
+downloaded binary matches the manifest's size and SHA-256. An older manifest
+than one already seen is refused, and so is one past its expiry date.
+
+```
+<url>/manifest         a signature, then JSON: seq, version, expires, a hash per target
+<url>/blobs/<sha256>   the binaries
+```
+
+```sh
+triad update --url http://updates.example/triad            # is there a newer release?
+triad update --url http://updates.example/triad --slots DIR  # download, check and install it
+```
+
+With `--slots` the release goes into the one of two slots (`DIR/a`,
+`DIR/b`) that is not running, `DIR/current` is switched to it, and the exit
+status is 10: restart `triad` from the slot `current` names. This is made
+for a supervisor, and the one that exists is the VM guest's init
+([scripts/vm/init.c](scripts/vm/init.c)): it runs the updater every few
+hours as a short-lived process, restarts `triad` into a new release, and
+goes back to the previous slot if the new binary does not stay up. See
+[scripts/vm/README.md](scripts/vm/README.md). A `triad` installed with
+`cargo install` can look for a release but does not yet replace itself.
+
+To publish:
+
+```sh
+triad release keygen release.key        # once; prints the public key, keep the file offline
+RELEASE_KEY=release.key TRIAD_UPDATE_URL=http://updates.example/triad \
+  scripts/release.sh 0.2.0 1 ./site     # version, release counter, output directory
+```
+
+`scripts/release.sh` builds for the machine it runs on, with the public key
+and the URL compiled in, and writes `./site`; upload `blobs/` first and
+`manifest` last. A build with no key compiled in (`cargo install`, the tests)
+takes `TRIAD_UPDATE_KEYS` from the environment instead. Anyone who has the
+signing key can run code on every install that trusts it, and anyone who can
+reach the source can download the binary.
+
 ## Acceptance run (two machines)
 
 Put the machines on different networks, for example the Mac on home Wi-Fi and
@@ -485,4 +528,6 @@ Layout: `crates/triad` (the binary and its integration tests),
 `crates/triad-core` (message and invite formats, identity, `state.sqlite`),
 `crates/triad-probe` (raw iroh echo, the only crate that names iroh),
 `crates/triad-agent` (the bots' policy, context, brain and tools; the only
-crate that names `rig-core` and `rmcp`).
+crate that names `rig-core` and `rmcp`),
+`crates/triad-update` (signed releases: the manifest, the verified download,
+the A/B slots).
