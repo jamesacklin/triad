@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc", "vitest"],
+  "ignorePatterns": ["src/components/ui/**", "src/hooks/use-mobile.ts", "src/api/types.gen.ts", "dist/**"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/exhaustive-deps": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }],
+    "no-console": ["error", { "allow": ["warn", "error"] }]
+  }
+}
