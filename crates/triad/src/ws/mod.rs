@@ -1,12 +1,11 @@
 //! `triad serve`: a chat session with no terminal, on a WebSocket.
 //!
-//! The listener reads each connection's HTTP request head itself, so it
-//! can refuse a bad path, a foreign `Origin` or a wrong bearer token with
-//! an HTTP error before anything is upgraded; tokio-websockets' own
-//! `accept` writes `101 Switching Protocols` before it hands back the
-//! request. The bytes read are then replayed into `accept`, which does the
-//! handshake as usual. See API.md for the protocol and WEBSOCKET-PLAN.md
-//! for the design.
+//! Each connection is served by hyper's HTTP/1 server (head capped at
+//! 8 KiB and 5 s, no keep-alive) running an axum router with one route,
+//! `/v1`. Its handler refuses a bad method, a foreign `Origin` or a wrong
+//! bearer token with an HTTP error before anything is upgraded, then
+//! upgrades with axum's WebSocket. See API.md for the protocol,
+//! WEBSOCKET-PLAN.md for the design and AXUM-PLAN.md for the listener.
 
 mod hub;
 pub mod proto;
@@ -15,20 +14,24 @@ mod requests;
 use std::cell::RefCell;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use futures_sink::Sink as _;
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
-use tokio_stream::StreamExt;
-use tokio_websockets::{CloseCode, Limits, Message, ServerBuilder, WebSocketStream};
 use triad_core::identity::Identity;
 
 pub use hub::{Hub, HubMsg};
@@ -47,8 +50,8 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_EVERY: Duration = Duration::from_secs(30);
 /// The largest frame (message) a client may send.
 pub const MAX_FRAME: usize = 1024 * 1024;
-/// The largest HTTP request head the listener reads; a longer one is
-/// refused with 431.
+/// The largest HTTP request head the listener reads (hyper's read buffer);
+/// a longer one is refused with 431.
 pub const MAX_HEAD: usize = 8 * 1024;
 
 /// Close codes the server sends (API.md, "Close codes").
@@ -235,7 +238,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 let client = next;
                 tracing::debug!(client, %peer, "websocket connection");
                 let _ = tcp.set_nodelay(true);
-                tokio::spawn(connection(tcp, client, shared.clone()));
+                tokio::spawn(serve_connection(tcp, client, shared.clone()));
             }
             Err(e) => {
                 tracing::warn!("accepting a websocket connection: {e}");
@@ -245,140 +248,128 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-/// An HTTP request head, as far as the listener needs it.
-struct Head {
-    method: String,
-    path: String,
-    /// Names lowercased.
-    headers: Vec<(String, String)>,
+/// What one connection's handlers share.
+#[derive(Clone)]
+struct Conn {
+    shared: Arc<Shared>,
+    client: ClientId,
+    /// When the token must have arrived by: 5 s from the TCP accept,
+    /// covering the request head and the first frame together.
+    deadline: Instant,
 }
 
-impl Head {
-    fn parse(bytes: &[u8]) -> Option<Head> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.split("\r\n");
-        let mut first = lines.next()?.split(' ');
-        let method = first.next()?.to_owned();
-        let path = first.next()?.to_owned();
-        first.next().filter(|v| v.starts_with("HTTP/1."))?;
-        let mut headers = Vec::new();
-        for line in lines.take_while(|l| !l.is_empty()) {
-            let (name, value) = line.split_once(':')?;
-            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+/// Serves one TCP connection: hyper reads the request head (at most
+/// [`MAX_HEAD`] bytes, within [`AUTH_TIMEOUT`]) and the router answers it.
+/// HTTP/1.1 only, one request per connection.
+async fn serve_connection(tcp: TcpStream, client: ClientId, shared: Arc<Shared>) {
+    let conn = Conn {
+        shared,
+        client,
+        deadline: Instant::now() + AUTH_TIMEOUT,
+    };
+    let app = Router::new()
+        .route(PATH, any(upgrade))
+        .fallback(elsewhere)
+        .layer(axum::middleware::map_response(close_unless_upgraded))
+        .with_state(conn);
+    let served = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(AUTH_TIMEOUT)
+        .max_buf_size(MAX_HEAD)
+        .serve_connection(TokioIo::new(tcp), TowerToHyperService::new(app))
+        .with_upgrades()
+        .await;
+    if let Err(e) = served {
+        tracing::debug!(client, "websocket request: {e}");
+    }
+}
+
+/// One request per connection: every answer but the upgrade itself asks
+/// for the connection to be closed, and hyper then closes it. Turning
+/// keep-alive off on the builder would do the same but also adds `close`
+/// to the `101`'s `Connection` header, which strict clients (Node's
+/// built-in WebSocket) refuse.
+async fn close_unless_upgraded(mut response: Response) -> Response {
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+fn refuse(status: StatusCode, why: &'static str) -> Response {
+    (status, why).into_response()
+}
+
+/// Any path but [`PATH`].
+async fn elsewhere(method: Method) -> Response {
+    if method != Method::GET {
+        return refuse(StatusCode::METHOD_NOT_ALLOWED, "use GET\n");
+    }
+    refuse(StatusCode::NOT_FOUND, "the API is at /v1\n")
+}
+
+/// `/v1`: checks the method, `Origin` and bearer token, in that order,
+/// before the upgrade itself is checked and answered.
+async fn upgrade(
+    State(conn): State<Conn>,
+    method: Method,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let client = conn.client;
+    if method != Method::GET {
+        return refuse(StatusCode::METHOD_NOT_ALLOWED, "use GET\n");
+    }
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or_default();
+        if !origin_allowed(&conn.shared.origins, origin) {
+            tracing::info!(client, origin, "refused a websocket from a web page");
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "this origin is not allowed; start serve with --allow-origin\n",
+            );
         }
-        Some(Head {
-            method,
-            path,
-            headers,
-        })
     }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
-    }
-}
-
-/// What reading a request head found.
-enum HeadRead {
-    /// Every byte read, and where the head ends (there may be more after).
-    Head(Vec<u8>, usize),
-    /// No blank line within [`MAX_HEAD`] bytes.
-    TooLarge,
-    /// The client closed or the read failed.
-    Gone,
-}
-
-/// Reads up to and including the blank line that ends the request head,
-/// never more than [`MAX_HEAD`] bytes of head.
-async fn read_head(tcp: &mut TcpStream) -> HeadRead {
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 2048];
-    loop {
-        let n = match tcp.read(&mut chunk).await {
-            Ok(0) | Err(_) => return HeadRead::Gone,
-            Ok(n) => n,
-        };
-        buf.extend_from_slice(&chunk[..n]);
-        match buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(end) if end + 4 <= MAX_HEAD => return HeadRead::Head(buf, end + 4),
-            Some(_) => return HeadRead::TooLarge,
-            None if buf.len() >= MAX_HEAD => return HeadRead::TooLarge,
-            None => {}
-        }
-    }
-}
-
-async fn refuse(mut tcp: TcpStream, status: &str, why: &str) {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{why}",
-        why.len()
-    );
-    let _ = tcp.write_all(response.as_bytes()).await;
-    let _ = tcp.shutdown().await;
-}
-
-/// A stream that first returns bytes already read from it.
-struct Replay<S> {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: S,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for Replay<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.pos < this.prefix.len() {
-            let n = (this.prefix.len() - this.pos).min(buf.remaining());
-            buf.put_slice(&this.prefix[this.pos..this.pos + n]);
-            this.pos += n;
-            if this.pos == this.prefix.len() {
-                this.prefix = Vec::new();
-                this.pos = 0;
+    let mut authed = false;
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        match auth.to_str().ok().and_then(|a| a.strip_prefix("Bearer ")) {
+            Some(t) if same_token(t.trim().as_bytes(), conn.shared.token.as_bytes()) => {
+                authed = true
             }
-            return Poll::Ready(Ok(()));
+            _ => {
+                tracing::info!(client, "refused a websocket with a wrong token");
+                return refuse(StatusCode::UNAUTHORIZED, "wrong token\n");
+            }
         }
-        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+    match ws {
+        Ok(ws) => ws
+            .max_message_size(MAX_FRAME)
+            .max_frame_size(MAX_FRAME)
+            .on_upgrade(move |ws| connection(ws, conn, authed)),
+        Err(rejection) => rejection.into_response(),
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for Replay<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
+async fn send(ws: &mut WebSocket, text: String) -> Result<(), axum::Error> {
+    ws.send(Message::Text(text.into())).await
 }
 
-type Ws = WebSocketStream<Replay<TcpStream>>;
-
-/// Sends one message and flushes it.
-async fn send(ws: &mut Ws, message: Message) -> Result<(), tokio_websockets::Error> {
-    std::future::poll_fn(|cx| Pin::new(&mut *ws).poll_ready(cx)).await?;
-    Pin::new(&mut *ws).start_send(message)?;
-    std::future::poll_fn(|cx| Pin::new(&mut *ws).poll_flush(cx)).await
+async fn close(ws: &mut WebSocket, code: u16, reason: &'static str) {
+    let frame = CloseFrame {
+        code,
+        reason: reason.into(),
+    };
+    let _ = ws.send(Message::Close(Some(frame))).await;
 }
 
-async fn close(ws: &mut Ws, code: u16, reason: &str) {
-    let code = CloseCode::try_from(code).ok();
-    let _ = send(ws, Message::close(code, reason)).await;
+/// Whether a read failed because the message was over [`MAX_FRAME`].
+/// axum hands back tungstenite's capacity error only as text.
+fn too_long(e: &axum::Error) -> bool {
+    e.to_string().contains("Message too long")
 }
 
 /// Whether a client's `Origin` was allowed with `--allow-origin`.
@@ -388,81 +379,26 @@ fn origin_allowed(origins: &[String], origin: &str) -> bool {
         .any(|o| o.trim_end_matches('/').eq_ignore_ascii_case(origin))
 }
 
-/// One client, from the TCP connection to the close.
-async fn connection(mut tcp: TcpStream, client: ClientId, shared: Arc<Shared>) {
-    let deadline = Instant::now() + AUTH_TIMEOUT;
-    // The head shares the 5 s the token has to arrive in.
-    let (bytes, end) = match timeout_at(deadline, read_head(&mut tcp)).await {
-        Ok(HeadRead::Head(bytes, end)) => (bytes, end),
-        Ok(HeadRead::TooLarge) => {
-            return refuse(
-                tcp,
-                "431 Request Header Fields Too Large",
-                "the request head is limited to 8 KiB\n",
-            )
-            .await;
-        }
-        Ok(HeadRead::Gone) => return,
-        Err(_) => {
-            return refuse(tcp, "408 Request Timeout", "no request within 5 seconds\n").await;
-        }
-    };
-    let Some(head) = Head::parse(&bytes[..end]) else {
-        return refuse(tcp, "400 Bad Request", "not an HTTP request\n").await;
-    };
-    if head.method != "GET" {
-        return refuse(tcp, "405 Method Not Allowed", "use GET\n").await;
-    }
-    if head.path != PATH {
-        return refuse(tcp, "404 Not Found", "the API is at /v1\n").await;
-    }
-    if let Some(origin) = head.header("origin")
-        && !origin_allowed(&shared.origins, origin)
-    {
-        tracing::info!(client, origin, "refused a websocket from a web page");
-        return refuse(
-            tcp,
-            "403 Forbidden",
-            "this origin is not allowed; start serve with --allow-origin\n",
-        )
-        .await;
-    }
-    let mut authed = false;
-    if let Some(auth) = head.header("authorization") {
-        match auth.strip_prefix("Bearer ") {
-            Some(t) if same_token(t.trim().as_bytes(), shared.token.as_bytes()) => authed = true,
-            _ => {
-                tracing::info!(client, "refused a websocket with a wrong token");
-                return refuse(tcp, "401 Unauthorized", "wrong token\n").await;
-            }
-        }
-    }
-    let stream = Replay {
-        prefix: bytes,
-        pos: 0,
-        inner: tcp,
-    };
-    let builder = ServerBuilder::new().limits(Limits::default().max_payload_len(Some(MAX_FRAME)));
-    let mut ws = match timeout_at(deadline, builder.accept(stream)).await {
-        Ok(Ok((_, ws))) => ws,
-        Ok(Err(e)) => {
-            tracing::debug!(client, "websocket handshake failed: {e}");
-            return;
-        }
-        Err(_) => return,
-    };
+/// One client, from the upgrade to the close.
+async fn connection(mut ws: WebSocket, conn: Conn, authed: bool) {
+    let Conn {
+        shared,
+        client,
+        deadline,
+    } = conn;
     if !authed {
         loop {
-            match timeout_at(deadline, ws.next()).await {
+            match timeout_at(deadline, ws.recv()).await {
                 Err(_) => {
                     return close(&mut ws, CLOSE_AUTH_TIMEOUT, "no token within 5 seconds").await;
                 }
-                Ok(Some(Ok(m))) if m.is_ping() || m.is_pong() => continue,
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
                 Ok(Some(Ok(m))) => {
-                    let ok = m
-                        .as_text()
-                        .and_then(proto::auth_token)
-                        .is_some_and(|t| same_token(t.as_bytes(), shared.token.as_bytes()));
+                    let ok = match &m {
+                        Message::Text(t) => proto::auth_token(t.as_str())
+                            .is_some_and(|t| same_token(t.as_bytes(), shared.token.as_bytes())),
+                        _ => false,
+                    };
                     if ok {
                         break;
                     }
@@ -494,7 +430,7 @@ async fn connection(mut tcp: TcpStream, client: ClientId, shared: Arc<Shared>) {
 }
 
 async fn run(
-    ws: &mut Ws,
+    ws: &mut WebSocket,
     client: ClientId,
     shared: &Shared,
     frames: &mut mpsc::Receiver<String>,
@@ -505,35 +441,32 @@ async fn run(
     let mut lag_gone = false;
     loop {
         tokio::select! {
-            incoming = ws.next() => {
+            incoming = ws.recv() => {
                 heard = Instant::now();
                 match incoming {
-                    Some(Ok(m)) if m.is_text() => {
-                        let text = m.as_text().unwrap_or_default();
-                        match proto::parse(text) {
-                            Ok((id, op)) => {
-                                let request = Request { client, id, op };
-                                if shared.input.send(Input::Request(request)).await.is_err() {
-                                    return close(ws, 1001, "the session ended").await;
-                                }
-                            }
-                            Err(bad) => {
-                                let target = Target { client, re: bad.id };
-                                let _ = shared.hub.send(HubMsg::Event {
-                                    value: proto::done(Some(&bad.error)),
-                                    target: Some(target),
-                                });
+                    Some(Ok(Message::Text(text))) => match proto::parse(text.as_str()) {
+                        Ok((id, op)) => {
+                            let request = Request { client, id, op };
+                            if shared.input.send(Input::Request(request)).await.is_err() {
+                                return close(ws, 1001, "the session ended").await;
                             }
                         }
-                    }
-                    Some(Ok(m)) if m.is_binary() => {
+                        Err(bad) => {
+                            let target = Target { client, re: bad.id };
+                            let _ = shared.hub.send(HubMsg::Event {
+                                value: proto::done(Some(&bad.error)),
+                                target: Some(target),
+                            });
+                        }
+                    },
+                    Some(Ok(Message::Binary(_))) => {
                         return close(ws, 1003, "send text frames").await;
                     }
-                    Some(Ok(m)) if m.is_close() => return,
+                    Some(Ok(Message::Close(_))) => return,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
                         tracing::debug!(client, "websocket read failed: {e}");
-                        if matches!(e, tokio_websockets::Error::PayloadTooLong { .. }) {
+                        if too_long(&e) {
                             close(ws, 1009, "a frame is limited to 1 MiB").await;
                         }
                         return;
@@ -543,7 +476,7 @@ async fn run(
             }
             frame = frames.recv() => match frame {
                 Some(text) => {
-                    if send(ws, Message::text(text)).await.is_err() {
+                    if send(ws, text).await.is_err() {
                         return;
                     }
                 }
@@ -554,12 +487,12 @@ async fn run(
                 if let Ok(seq) = seq {
                     // Frames already queued are delivered first.
                     while let Ok(text) = frames.try_recv() {
-                        if send(ws, Message::text(text)).await.is_err() {
+                        if send(ws, text).await.is_err() {
                             return;
                         }
                     }
                     let note = json!({"event": "lagged", "seq": seq}).to_string();
-                    let _ = send(ws, Message::text(note)).await;
+                    let _ = send(ws, note).await;
                     return close(ws, CLOSE_LAGGED, "too far behind; resync").await;
                 }
             }
@@ -567,7 +500,7 @@ async fn run(
                 if heard.elapsed() > PING_EVERY * 3 {
                     return close(ws, 1001, "no answer to pings").await;
                 }
-                if send(ws, Message::ping("")).await.is_err() {
+                if ws.send(Message::Ping(Default::default())).await.is_err() {
                     return;
                 }
             }
@@ -578,19 +511,6 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_a_request_head() {
-        let head = Head::parse(
-            b"GET /v1 HTTP/1.1\r\nHost: x\r\nOrigin: http://a.test\r\nAuthorization: Bearer t\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(head.method, "GET");
-        assert_eq!(head.path, "/v1");
-        assert_eq!(head.header("origin"), Some("http://a.test"));
-        assert_eq!(head.header("authorization"), Some("Bearer t"));
-        assert!(Head::parse(b"garbage\r\n\r\n").is_none());
-    }
 
     #[test]
     fn compares_tokens() {

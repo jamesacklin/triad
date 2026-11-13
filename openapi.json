@@ -19,7 +19,7 @@
       "get": {
         "operationId": "connect",
         "summary": "Open the WebSocket.",
-        "description": "A WebSocket upgrade (RFC 6455). Send `Request` frames; receive `Event` frames, starting with `hello` then `ready`. Without an `Authorization` header, the first frame must be an `AuthRequest` within 5 seconds.",
+        "description": "A WebSocket upgrade (RFC 6455). Send `Request` frames; receive `Event` frames, starting with `hello` then `ready`. Without an `Authorization` header, the first frame must be an `AuthRequest` within 5 seconds. A request head that does not arrive within 5 seconds gets no response: the connection is closed.",
         "security": [
           {
             "bearer": []
@@ -72,9 +72,6 @@
           },
           "405": {
             "description": "Not GET."
-          },
-          "408": {
-            "description": "The request head did not arrive within 5 seconds."
           },
           "431": {
             "description": "The request head is over 8 KiB."

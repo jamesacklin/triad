@@ -2,6 +2,9 @@
 
 2026-11-13 · draft for review · written against `df35e76`
 
+The listener described here was later replaced by axum on hyper; see
+`AXUM-PLAN.md` and FINDINGS.md, "axum under the listener".
+
 ## Goal
 
 `triad serve` runs a chat session with no terminal and exposes it on a

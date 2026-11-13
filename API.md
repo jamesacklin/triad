@@ -246,8 +246,8 @@ default channel; not a client's focus).
 
 Refusals before the upgrade are HTTP responses: `401` (wrong bearer token),
 `403` (origin not allowed), `404` (not `/v1`), `405` (not GET), `400` (not a
-WebSocket upgrade), `408` (the request head did not arrive within 5
-seconds), `431` (a request head over 8 KiB).
+WebSocket upgrade), `431` (a request head over 8 KiB). A request head that
+does not arrive within 5 seconds gets no response; the connection is closed.
 
 ## Reconnecting
 
