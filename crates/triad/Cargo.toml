@@ -22,6 +22,8 @@ clipboard = ["dep:arboard"]
 ws = ["dep:axum", "dep:hyper", "dep:hyper-util"]
 # `triad serve` also serves the web app (web/) at `/`, embedded from
 # web/dist by build.rs. Not a default: it needs `pnpm -C web build` first.
+# Releases (scripts/release.sh, triad-release) always build with it, so the
+# web app ships inside the binary and with every update.
 web = ["ws"]
 
 [dependencies]

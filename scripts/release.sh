@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build triad for this machine's target and write a signed release into a
 # directory that any static HTTP server can host (see crates/triad-update).
+# The web app (web/) is built first and embedded in the binary (the `web`
+# feature), so it ships with every update; that needs Node and pnpm.
 #
 #   scripts/release.sh <version> <seq> <out-dir> [TARGET=PATH ...]
 #   scripts/release.sh 0.2.0 7 ./site
@@ -37,10 +39,14 @@ if [ -z "${TRIAD_UPDATE_KEYS:-}" ]; then
 fi
 export TRIAD_UPDATE_KEYS TRIAD_VERSION=$VERSION
 
+# The web app, built fresh so the binary cannot embed a stale web/dist.
+pnpm -C web install --frozen-lockfile
+pnpm -C web build
+
 case $TRIPLE in
   *-linux-gnu) export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" ;;
 esac
-cargo build --release --locked -p triad --target "$TRIPLE" \
+cargo build --release --locked -p triad --target "$TRIPLE" --features web \
   --config 'profile.release.strip=true' \
   --config 'profile.release.lto="fat"' \
   --config 'profile.release.codegen-units=1' \
