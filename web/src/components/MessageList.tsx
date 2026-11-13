@@ -8,6 +8,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffec
 import { Button } from '@/components/ui/button'
 import { authorLabel, clock, dateTime } from '@/lib/format'
 import type { Channel, Msg, Pending } from '@/state/store'
+import { MessageText } from './MessageText'
 import { ReplyBlock } from './ReplyBlock'
 
 export interface MessageListHandle {
@@ -44,17 +45,16 @@ function MessageLine({ m, dm }: { m: Msg; dm: boolean }) {
       >
         {clock(m.ts)}
       </time>
-      <p className="min-w-0 flex-1 whitespace-pre-wrap break-words">
-        {m.action ? (
-          <>
-            <span className={`font-semibold ${colour}`}>* {who}</span> {m.text}
-          </>
-        ) : (
-          <>
-            <span className={`font-semibold ${colour}`}>{who}:</span> {m.text}
-          </>
-        )}
-      </p>
+      {m.action ? (
+        // `/me` actions stay plain text.
+        <p className="min-w-0 flex-1 whitespace-pre-wrap break-words">
+          <span className={`font-semibold ${colour}`}>* {who}</span> {m.text}
+        </p>
+      ) : (
+        <div className="min-w-0 flex-1 break-words">
+          <span className={`font-semibold ${colour}`}>{who}:</span> <MessageText text={m.text} />
+        </div>
+      )}
     </div>
   )
 }
@@ -75,17 +75,15 @@ function PendingLine({ p, onRetry, onDiscard }: { p: Pending; onRetry: () => voi
         {clock(p.at)}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="whitespace-pre-wrap break-words opacity-50">
-          {p.action ? (
-            <>
-              <span className="font-semibold text-cyan-700 dark:text-cyan-400">* me</span> {p.text}
-            </>
-          ) : (
-            <>
-              <span className="font-semibold text-cyan-700 dark:text-cyan-400">me:</span> {p.text}
-            </>
-          )}
-        </p>
+        {p.action ? (
+          <p className="whitespace-pre-wrap break-words opacity-50">
+            <span className="font-semibold text-cyan-700 dark:text-cyan-400">* me</span> {p.text}
+          </p>
+        ) : (
+          <div className="break-words opacity-50">
+            <span className="font-semibold text-cyan-700 dark:text-cyan-400">me:</span> <MessageText text={p.text} />
+          </div>
+        )}
         {bad ? (
           <p role="alert" className={`flex flex-wrap items-center gap-2 text-xs ${p.state === 'failed' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400'}`}>
             <span>

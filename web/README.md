@@ -112,7 +112,13 @@ src/
   Discard; one with no echo after 30 s, or cut off by a dropped socket,
   shows as "not confirmed" with the same buttons, and a later echo or
   resync page still settles it. `/me <action>` is a `send` with `action`.
-  Messages are plain text with line breaks; no Markdown.
+- **Messages are Markdown** (people's and bots'; GFM: code blocks, inline
+  code, lists, tables, strikethrough, autolinks), through react-markdown,
+  which builds React elements: no `dangerouslySetInnerHTML`, raw HTML stays
+  text, links only to http, https and mailto (new tab, `noopener
+  noreferrer`), images shown as links and never loaded, no syntax
+  highlighting. Single line breaks are kept. `/me` actions, notices and
+  command replies stay plain text (`src/components/MessageText.tsx`).
 - **The composer.** Enter sends, Shift-Enter adds a line, PgUp and PgDn
   scroll the pane. A line starting with `/` is a `command` with the shown
   channel; anything else a `send`. Typing `/` lists commands (Up and Down
@@ -126,7 +132,7 @@ src/
 
 ## Not done
 
-No Markdown, attachments, notifications, search or message editing. No
+No attachments, notifications, search or message editing. No
 browser automation suite (a Playwright run against a real `serve` is the
 first follow-up). See "Web app" in [FINDINGS.md](../FINDINGS.md) for what
 the protocol does not give the app.

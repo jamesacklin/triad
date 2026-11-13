@@ -1973,6 +1973,57 @@ in as an ordinary message.
   `message` event would remove it; that is a protocol change and was not
   made.
 
+### Follow-up 3: Markdown in messages
+
+At the user's request (reversing "messages are plain text"). People's and
+bots' messages render Markdown; `/me` actions, notices and command replies
+stay plain (`web/src/components/MessageText.tsx`).
+
+- **Library:** react-markdown 10.1.0 with remark-gfm 4.0.1, pinned. It
+  builds React elements from the syntax tree, so there is no HTML string
+  and no `dangerouslySetInnerHTML`; raw HTML in a message becomes a text
+  node by default (read in its source: `raw` nodes are replaced with
+  `text` unless `rehype-raw` is added, which it is not). It is the
+  unified collective's maintained React renderer; its last release is
+  from March 2025, stable rather than abandoned. The string renderers
+  (markdown-it, marked) were ruled out because they produce HTML that would
+  have to be injected.
+- **Narrowed further than its defaults:** an allow-list of elements
+  (paragraphs, emphasis, strikethrough, code, pre, links, lists, quotes,
+  rules, tables, headings drawn as bold lines), others unwrapped to their
+  text, so task-list checkboxes and footnote markup drop out; a URL filter
+  allowing only absolute `http`, `https` and `mailto` (react-markdown's
+  default also passes relative URLs, `irc`, `ircs` and `xmpp`), and a link
+  without an allowed target is shown as its text; links open with
+  `target="_blank" rel="noopener noreferrer"`; images are drawn as a link
+  `[image: alt]` to their address and never fetched. No highlighting.
+  Single line breaks are kept (`white-space: pre-wrap` on paragraphs), as
+  in plain text.
+- **Tests** (`MessageText.test.tsx`, rendered with `renderToStaticMarkup`):
+  script tags, an `<img onerror>`, an `onclick` attribute and an HTML
+  block with an iframe stay text with no element or `on*` attribute;
+  `javascript:` (any case, with a leading space), `data:`, `vbscript:`,
+  `file:`, relative, fragment and `irc:` targets give no link; an image is
+  a link and never an `<img>`; a link title and a reference definition
+  cannot add attributes; the GFM basics render.
+- **Seen in a browser:** bold, emphasis, strikethrough, inline code, an
+  autolink, a fenced code block, a list and a table from the composer; a
+  bot reply rendered the same way; `/me **waves**` left literal. A message
+  with `[js](javascript:…)`, `[data](data:…)`, an image, an inline
+  `<img onerror>` and `<b onclick>`: the two hostile links as plain text,
+  the image as a link with no request made for it, the HTML as text; no
+  `<img>`, no `on*` attribute in the pane and the trapped `alert` never
+  called. One CommonMark detail showed up: a line that starts with
+  `<script>` is an HTML block to the end of the line, so Markdown after it
+  on that line is not parsed (it stays text, which is safe).
+- **Cost:** the JavaScript grew from 416 kB to 583 kB (134 kB to 184 kB
+  gzipped), past Vite's 500 kB warning, which `vite.config.ts` now sets at
+  600 kB with a comment. Runtime packages went from 86 to 186 and the
+  lockfile from 218 to 317 (the unified, micromark and mdast/hast
+  packages); direct runtime dependencies from 7 to 9. A `--features web`
+  binary carries `web/dist`, so it grows by about the same 170 kB over the
+  size measured in follow-up 1.
+
 ## Agent harness options (2026-11-11)
 
 Desk research on giving an AI agent access to a triad group. Nothing here was

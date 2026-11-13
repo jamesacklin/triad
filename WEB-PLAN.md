@@ -92,6 +92,7 @@ notices or small tables in the focused channel. Anything else is shown as
 formatted JSON, so a new command works before the app knows it.
 
 **Messages are plain text,** with line breaks kept. No Markdown rendering.
+(Reversed after F5: messages render Markdown; see below.)
 
 **Development runs two processes.** `triad serve --allow-origin
 http://localhost:5173` and `pnpm dev`. A script starts both. ~~Serving the
@@ -223,7 +224,7 @@ a `web/README.md`, a README section, and a FINDINGS.md section.
 - ~~No server-side code, no route added to `triad serve`, no bundled
   hosting.~~ Reversed: `triad serve` serves the app (below).
 - No accounts or multiple identities in one tab; one tab, one session.
-- No Markdown, attachments, notifications, search or message editing.
+- No ~~Markdown,~~ attachments, notifications, search or message editing.
 - No mobile app. The layout works on a narrow window; that is all.
 - No change to the protocol. Anything the app wants from it goes in
   FINDINGS.md as a follow-up.
@@ -266,3 +267,8 @@ These reverse four decisions above; FINDINGS.md "Web app" has the results.
    settled by its `message` event, matched on channel, own authorship,
    text and action flag, oldest first. A failed `done` keeps it with the
    error, Retry and Discard; no echo in 30 s shows it as not confirmed.
+3. **Markdown in messages.** People's and bots' messages render GFM
+   Markdown through react-markdown and remark-gfm, safe by default: raw
+   HTML stays text, links only http, https and mailto (new tab, `noopener
+   noreferrer`), images shown as links, no highlighting. `/me` actions,
+   notices and replies stay plain.
